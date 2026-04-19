@@ -1,0 +1,24 @@
+[project]
+name = "stock-llm"
+version = "0.1.0"
+description = "A Multi-Task Transformer Model for Stock Trading with Risk-Aware Loss"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "pandas>=2.0.0",
+    "pandas-ta>=0.3.14b",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.2.0",
+    "requests>=2.28.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+managed = true
+package = true
