@@ -231,23 +231,50 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features['vol_atr_ratio'] = df['volume_ratio'] / (df['ATR_pct'] + 0.0001)
     return pd.concat([df, new_features], axis=1)
 
-def add_target_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """Add classification labels based on risk/reward and minimum return."""
-    df['direction_label'] = 1
-    min_return = 0.8
-    risk_reward_ratio = 1.0
-
-    if 'upside_pct' in df.columns and 'downside_pct' in df.columns:
-        buy_condition = (
-            (df['upside_pct'] > abs(df['downside_pct']) * risk_reward_ratio) &
-            (df['upside_pct'] >= min_return)
-        )
-        sell_condition = (
-            (abs(df['downside_pct']) > df['upside_pct'] * risk_reward_ratio) &
-            (abs(df['downside_pct']) >= min_return)
-        )
-        df.loc[buy_condition, 'direction_label'] = 0
-        df.loc[sell_condition, 'direction_label'] = 2
+def add_target_labels(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
+    """
+    Add classification labels using 'First-Hit' logic.
+    Label 0 (BUY): Hits Target BEFORE Stop Loss
+    Label 2 (SELL): Hits -Target BEFORE +Stop Loss
+    Label 1 (NEUTRAL): No target hit or Stop Loss hit first
+    """
+    target = 2.0  # 2% Profit Target
+    stop = 1.0    # 1% Stop Loss
+    
+    df['direction_label'] = 1  # Default to Neutral
+    
+    # We need to look ahead for each row
+    close_prices = df['Close'].values
+    high_prices = df['High'].values
+    low_prices = df['Low'].values
+    
+    labels = np.ones(len(df))
+    
+    for i in range(len(df) - lookahead):
+        entry_price = close_prices[i]
+        tp_price = entry_price * (1 + target / 100)
+        sl_price = entry_price * (1 - stop / 100)
+        
+        # Bullish Check
+        for j in range(1, lookahead + 1):
+            if low_prices[i + j] <= sl_price:
+                break # Hit SL first, neutral
+            if high_prices[i + j] >= tp_price:
+                labels[i] = 0 # Hit TP first
+                break
+                
+        # Bearish Check (only if not already labelled as Buy)
+        if labels[i] == 1:
+            tp_sell = entry_price * (1 - target / 100)
+            sl_sell = entry_price * (1 + stop / 100)
+            for j in range(1, lookahead + 1):
+                if high_prices[i + j] >= sl_sell:
+                    break # Hit SL first
+                if low_prices[i + j] <= tp_sell:
+                    labels[i] = 2 # Hit TP first
+                    break
+                    
+    df['direction_label'] = labels
     return df
 
 def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
