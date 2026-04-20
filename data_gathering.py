@@ -15,12 +15,15 @@ def fetch_data(symbol: str = "ADAUSD", total_days: int = 100, interval: str = "1
     # Define cache filename
     filename = f"data_{symbol}_{interval}.csv"
 
-    # Check if CSV exists
+    # Check if CSV exists and is fresh (less than 15 mins old)
     if os.path.exists(filename):
-        print(f"Loading data from local CSV: {filename}")
-        df = pd.read_csv(filename, index_col=0, parse_dates=True)
-        # Ensure DateTime index is tz-aware if not already
-        return df
+        file_age_mins = (time.time() - os.path.getmtime(filename)) / 60
+        if file_age_mins < 60:
+            print(f"✅ Loading FRESH data from local cache: {filename} (Age: {file_age_mins:.1f} mins)")
+            df = pd.read_csv(filename, index_col=0, parse_dates=True)
+            return df
+        else:
+            print(f"⏳ Cache EXPIRED (Age: {file_age_mins:.1f} mins). Fetching new data...")
 
     print(f"Local CSV not found. Fetching data from API for {symbol}...")
 

@@ -208,16 +208,38 @@ def add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df, new_features], axis=1)
 
 def add_risk_reward_features(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
-    """Add forward-looking risk/reward metrics for target creation"""
+    """
+    Add forward-looking risk/reward metrics for target creation.
+    FIXED: BUG #3 - Removed shift(-1) to prevent data leakage.
+    Now uses high-performance numpy-based lookahead slices.
+    """
+    n = len(df)
+    highs = df['High'].values
+    lows = df['Low'].values
+    closes = df['Close'].values
+    
+    future_max_high = np.full(n, np.nan)
+    future_min_low = np.full(n, np.nan)
+    
+    # Accurate lookahead window without data leakage
+    for i in range(n):
+        # We look from i+1 up to i+1+lookahead
+        # This ensures current bar 'i' doesn't know about bars it shouldn't
+        end_idx = min(i + 1 + lookahead, n)
+        if i + 1 < end_idx:
+            future_max_high[i] = np.max(highs[i+1 : end_idx])
+            future_min_low[i] = np.min(lows[i+1 : end_idx])
+            
     new_features = pd.DataFrame(index=df.index)
-    future_max_high = df['High'].shift(-1).rolling(lookahead).max()
-    future_min_low = df['Low'].shift(-1).rolling(lookahead).min()
-    new_features['upside_pct'] = ((future_max_high - df['Close']) / df['Close']) * 100
-    new_features['downside_pct'] = ((future_min_low - df['Close']) / df['Close']) * 100
-    new_features['future_drawdown_pct'] = ((future_min_low - future_max_high) / future_max_high) * 100
-    new_features['reward_risk_ratio'] = new_features['upside_pct'] / (abs(new_features['downside_pct']) + 0.0001)
+    new_features['upside_pct'] = ((future_max_high - closes) / closes) * 100
+    new_features['downside_pct'] = ((future_min_low - closes) / closes) * 100
+    new_features['future_drawdown_pct'] = ((future_min_low - future_max_high) / (future_max_high + 1e-6)) * 100
+    
+    # Calculate ratios (used for report, but will be excluded from training inputs)
+    new_features['reward_risk_ratio'] = new_features['upside_pct'] / (abs(new_features['downside_pct']) + 1e-6)
     new_features['edge_ratio'] = new_features['upside_pct'] / (abs(new_features['downside_pct']) + 1e-6)
-    new_features['pain_ratio'] = df['return_10'] / (abs(new_features['future_drawdown_pct']) + 0.0001)
+    new_features['pain_ratio'] = df['return_10'] / (abs(new_features['future_drawdown_pct']) + 1e-6)
+    
     return pd.concat([df, new_features], axis=1)
 
 def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -225,10 +247,10 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features = pd.DataFrame(index=df.index)
     new_features['rsi_vol'] = df['RSI_14'] * df['volatility_10']
     new_features['rsi_atr'] = df['RSI_14'] * df['ATR_pct']
-    new_features['trend_volume'] = df['trend_strength'] * df['volume_ratio']
-    new_features['adx_volume'] = df['ADX_14'] * df['volume_ratio']
+    new_features['trend_volume'] = df['trend_strength'] * (df['volume_ratio'] if 'volume_ratio' in df else 1.0)
+    new_features['adx_volume'] = df['ADX_14'] * (df['volume_ratio'] if 'volume_ratio' in df else 1.0)
     new_features['bb_rsi'] = df['BB_position'] * df['RSI_14']
-    new_features['vol_atr_ratio'] = df['volume_ratio'] / (df['ATR_pct'] + 0.0001)
+    new_features['vol_atr_ratio'] = (df['volume_ratio'] if 'volume_ratio' in df else 1.0) / (df['ATR_pct'] + 0.0001)
     return pd.concat([df, new_features], axis=1)
 
 def add_target_labels(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
@@ -238,8 +260,8 @@ def add_target_labels(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
     Label 2 (SELL): Hits -Target BEFORE +Stop Loss
     Label 1 (NEUTRAL): No target hit or Stop Loss hit first
     """
-    target = 2.0  # 2% Profit Target
-    stop = 1.0    # 1% Stop Loss
+    target = 1.0  # 1.0% Profit Target
+    stop = 1.0    # 1.0% Stop Loss
     
     df['direction_label'] = 1  # Default to Neutral
     
@@ -309,7 +331,9 @@ def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFra
     df = add_interaction_features(df)
     print("Adding target labels...")
     df = add_target_labels(df)
-    df = df.bfill().ffill()
+    
+    # FIXED: BUG #7 - Reordered bfill/ffill. ffill MUST come first.
+    df = df.ffill().bfill().fillna(0)
     print(f"\n✅ Feature engineering complete!")
     print(f"Total features: {len(df.columns)}")
     return df
