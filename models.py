@@ -1,180 +1,173 @@
 # -*- coding: utf-8 -*-
+"""
+Transformer encoder for causal sequence modeling on scaled OHLCV-derived features.
+
+Uses PyTorch's nn.TransformerEncoder with a causal attention mask so each timestep
+only attends to past and current bars (no lookahead inside the window).
+"""
+import math
+from typing import Dict
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-import math
+from config import config
+
 
 class PositionalEncoding(nn.Module):
-    """
-    Fixed: Bug #8 - Added positional info so Transformer knows the order of bars.
-    """
-    def __init__(self, d_model: int, max_len: int = 64):
+    """Sinusoidal positions so the model can distinguish order within the window."""
+
+    def __init__(self, d_model: int, max_len: int = 256):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
 
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+    def forward(self, token_sequence: torch.Tensor) -> torch.Tensor:
+        sequence_length = token_sequence.size(1)
+        return token_sequence + self.pe[:, :sequence_length, :]
 
-class MultiHeadAttention(nn.Module):
-    """
-    Self-attention mechanism to learn temporal patterns.
-    Fixed: Bug #2 - Added causal mask to prevent future data leakage.
-    """
-    def __init__(self, d_model, num_heads=4):
-        super().__init__()
-        self.num_heads = num_heads
-        self.d_model = d_model
-        self.head_dim = d_model // num_heads
-        self.qkv = nn.Linear(d_model, d_model * 3)
-        self.fc_out = nn.Linear(d_model, d_model)
-
-    def forward(self, x):
-        batch_size, seq_len, _ = x.shape
-        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        
-        # [Batch, Heads, Seq, Seq]
-        energy = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        
-        # 🛡️ FIXED: BUG #2 - CAUSAL MASK (Prevent looking ahead)
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
-        energy = energy.masked_fill(mask, float('-inf'))
-        
-        attention = F.softmax(energy, dim=-1)
-        out = torch.matmul(attention, v)
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.d_model)
-        return self.fc_out(out)
-
-class TradingTransformerBlock(nn.Module):
-    """A single Transformer block"""
-    def __init__(self, d_model, num_heads, dropout=0.1):
-        super().__init__()
-        self.attention = MultiHeadAttention(d_model, num_heads)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        attended = self.attention(x)
-        x = self.norm1(x + attended)
-        forwarded = self.ffn(x)
-        x = self.norm2(x + forwarded)
-        return x
 
 class MultiHeadTradingModel(nn.Module):
     """
-    Multi-task transformer model for trading.
-    FIXED: BUG #1 - Now handles 3D sequences [Batch, Seq, Features].
+    Causal Transformer over a fixed-length window, last timestep pooled for heads.
+
+    Outputs: regression (upside/downside %), risk, confidence, and direction logits.
     """
-    def __init__(self, input_dim, hidden_dim=64, num_heads=4, num_layers=2, dropout=0.2):
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int | None = None,
+        num_heads: int | None = None,
+        num_layers: int | None = None,
+        dropout: float | None = None,
+        max_sequence_len: int = 256,
+    ):
         super().__init__()
-        # FIXED: Bug #1 - Architecture properly projects sequence steps
+        hidden_dim = hidden_dim or config.model.HIDDEN_DIM
+        num_heads = num_heads or config.model.NUM_HEADS
+        num_layers = num_layers or config.model.NUM_LAYERS
+        dropout = dropout if dropout is not None else config.model.DROPOUT
+
         self.input_projection = nn.Linear(input_dim, hidden_dim)
-        self.pos_encoding = PositionalEncoding(hidden_dim)
-        
-        self.transformer_blocks = nn.ModuleList([
-            TradingTransformerBlock(hidden_dim, num_heads, dropout)
-            for _ in range(num_layers)
-        ])
-        
+        self.positional_encoding = PositionalEncoding(hidden_dim, max_len=max_sequence_len)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self._sequence_max_len = max_sequence_len
+
         self.shared_layer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
-        
-        # Reduced complexity for stability
         self.confidence_head = nn.Linear(hidden_dim, 1)
         self.upside_head = nn.Linear(hidden_dim, 1)
         self.downside_head = nn.Linear(hidden_dim, 1)
         self.risk_head = nn.Linear(hidden_dim, 1)
-        self.direction_head = nn.Linear(hidden_dim, 3) 
+        self.direction_head = nn.Linear(hidden_dim, 3)
 
-    def forward(self, x):
-        # x: [Batch, Seq, Features]
-        x = self.input_projection(x)
-        x = self.pos_encoding(x)
-        
-        for transformer in self.transformer_blocks:
-            x = transformer(x)
-            
-        # 🎯 FIXED: BUG #1 - Take only the LAST bar for prediction
-        x = x[:, -1, :]
-        
-        shared = self.shared_layer(x)
+    def forward(self, window_features: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # window_features: [batch, seq_len, features]
+        if window_features.size(1) > self._sequence_max_len:
+            raise ValueError(
+                f"Sequence length {window_features.size(1)} exceeds positional encoding max {self._sequence_max_len}"
+            )
+        projected = self.input_projection(window_features)
+        encoded_positions = self.positional_encoding(projected)
+        # Causal attention: upper triangle masked so timestep i cannot attend to j > i.
+        sequence_length = encoded_positions.size(1)
+        causal_mask = torch.nn.Transformer.generate_square_subsequent_mask(
+            sequence_length, device=encoded_positions.device
+        )
+        encoded_sequence = self.encoder(encoded_positions, mask=causal_mask)
+        last_step = encoded_sequence[:, -1, :]
+        shared = self.shared_layer(last_step)
         return {
-            'confidence': torch.sigmoid(self.confidence_head(shared)),
-            'upside': self.upside_head(shared),
-            'downside': self.downside_head(shared),
-            'risk': torch.sigmoid(self.risk_head(shared)),
-            'direction': self.direction_head(shared)
+            "confidence": torch.sigmoid(self.confidence_head(shared)),
+            "upside": self.upside_head(shared),
+            "downside": self.downside_head(shared),
+            "risk": torch.sigmoid(self.risk_head(shared)),
+            "direction": self.direction_head(shared),
         }
+
 
 class RiskAwareLoss(nn.Module):
     """
-    Custom loss for risk-aware training with label balancing.
-    FIXED: BUG #5 & BUG #9 - Balanced weights and grounded confidence targets.
+    Multi-task loss: direction (CE) plus regression on upside, downside, risk, confidence.
+
+    Confidence targets are derived only from ground-truth targets (no feedback from predicted
+    confidence into regression loss — that would let the model game the loss).
     """
-    def __init__(self, confidence_weight=0.5, upside_weight=1.5, downside_weight=1.5, risk_weight=0.5, dir_weight=1.0):
+
+    def __init__(
+        self,
+        confidence_weight: float = 0.5,
+        upside_weight: float = 1.5,
+        downside_weight: float = 1.5,
+        risk_weight: float = 0.5,
+        direction_weight: float = 1.0,
+    ):
         super().__init__()
         self.confidence_weight = confidence_weight
         self.upside_weight = upside_weight
         self.downside_weight = downside_weight
         self.risk_weight = risk_weight
-        self.dir_weight = dir_weight
-        self.mse_loss = nn.MSELoss(reduction='none')
-        self.ce_loss = nn.CrossEntropyLoss()
+        self.direction_weight = direction_weight
+        self.regression_loss = nn.SmoothL1Loss(reduction="mean")
+        self.confidence_loss = nn.MSELoss(reduction="mean")
+        self.direction_loss_fn = nn.CrossEntropyLoss()
 
-    def forward(self, predictions, targets):
-        # 📈 Regression Losses
-        upside_loss = self.mse_loss(predictions['upside'].squeeze(), targets['upside'])
-        confidence_weight = 1 + predictions['confidence'].squeeze()
-        upside_loss = (upside_loss * confidence_weight).mean()
+    def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        upside = predictions["upside"].squeeze(-1)
+        downside = predictions["downside"].squeeze(-1)
+        confidence = predictions["confidence"].squeeze(-1)
 
-        downside_loss = self.mse_loss(predictions['downside'].squeeze(), targets['downside'])
-        downside_loss = (downside_loss * confidence_weight).mean()
+        upside_targets = targets["upside"]
+        downside_targets = targets["downside"]
 
-        # 🚦 Classification Loss
-        direction_loss = self.ce_loss(predictions['direction'], targets['direction'].long())
+        upside_term = self.regression_loss(upside, upside_targets)
+        downside_term = self.regression_loss(downside, downside_targets)
 
-        # 🧠 FIXED: BUG #5 - CONFIDENCE TARGET (Grounded in Ground Truth, not predictions)
-        # Confidence target: True move > 1.2% profit target
-        sig_move = torch.max(targets['upside'], torch.abs(targets['downside'])) > 1.0
-        strong_bull = targets['upside'] > torch.abs(targets['downside']) * 1.5
-        strong_bear = torch.abs(targets['downside']) > targets['upside'] * 1.5
-        confidence_target = (sig_move & (strong_bull | strong_bear)).float()
-        
-        confidence_loss = self.mse_loss(predictions['confidence'].squeeze(), confidence_target).mean()
+        direction_term = self.direction_loss_fn(predictions["direction"], targets["direction"].long())
 
-        risk_target = torch.clamp(torch.abs(targets['future_drawdown']) / 20.0, 0, 1)
-        risk_loss = self.mse_loss(predictions['risk'].squeeze(), risk_target).mean()
+        significant_move = torch.maximum(
+            upside_targets, torch.abs(downside_targets)
+        ) > 1.0
+        strong_bull = upside_targets > torch.abs(downside_targets) * 1.5
+        strong_bear = torch.abs(downside_targets) > upside_targets * 1.5
+        confidence_target = (significant_move & (strong_bull | strong_bear)).float()
+        confidence_term = self.confidence_loss(confidence, confidence_target)
+
+        risk_target = torch.clamp(torch.abs(targets["future_drawdown"]) / 20.0, 0.0, 1.0)
+        risk_term = self.regression_loss(predictions["risk"].squeeze(-1), risk_target)
 
         total_loss = (
-            self.confidence_weight * confidence_loss +
-            self.upside_weight * upside_loss +
-            self.downside_weight * downside_loss +
-            self.risk_weight * risk_loss +
-            self.dir_weight * direction_loss
+            self.confidence_weight * confidence_term
+            + self.upside_weight * upside_term
+            + self.downside_weight * downside_term
+            + self.risk_weight * risk_term
+            + self.direction_weight * direction_term
         )
         return {
-            'total': total_loss, 
-            'confidence': confidence_loss, 
-            'upside': upside_loss, 
-            'downside': downside_loss, 
-            'risk': risk_loss,
-            'direction': direction_loss
+            "total": total_loss,
+            "confidence": confidence_term,
+            "upside": upside_term,
+            "downside": downside_term,
+            "risk": risk_term,
+            "direction": direction_term,
         }

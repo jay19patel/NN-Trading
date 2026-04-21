@@ -1,199 +1,248 @@
 # -*- coding: utf-8 -*-
-import torch
-import numpy as np
-import pandas as pd
-import warnings
-import os
 import time
-from datetime import datetime
+import os
+import warnings
 
-# Local imports
+import pandas as pd
+
+from config import config
 from data_gathering import fetch_data
 from features import create_full_feature_set
-from visualisation import plot_trading_analysis, print_signal_insights
-from training_utils import prepare_data, train_model, get_ai_predictions
+from training_utils import (
+    prepare_multi_symbol_data,
+    train_model,
+    run_inference_with_confidence_filter,
+)
+from evaluation_metrics import sequence_count_for_split
+from ui_utils import console, print_banner, Table
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-def evaluate_ai_verdicts(df: pd.DataFrame, target: float = 2.0, stop: float = 1.0, lookahead: int = 10) -> pd.DataFrame:
-    """Check if AI signals actually hit TP or SL first."""
-    df = df.copy()
-    df['ai_outcome'] = 'NONE'
-    
-    close = df['Close'].values
-    high = df['High'].values
-    low = df['Low'].values
-    verdicts = df['ai_verdict'].values
-    
-    outcomes = ['NONE'] * len(df)
-    
-    for i in range(len(df) - lookahead):
-        if verdicts[i] == 1: continue
-        
-        entry = close[i]
-        tp = entry * (1 + target/100) if verdicts[i] == 0 else entry * (1 - target/100)
-        sl = entry * (1 - stop/100) if verdicts[i] == 0 else entry * (1 + stop/100)
-        
-        # Check future path
-        hit = 'TIMEOUT'
-        for j in range(1, lookahead + 1):
-            curr_high, curr_low = high[i + j], low[i + j]
-            
-            # For Buy Signal
-            if verdicts[i] == 0:
-                if curr_low <= sl: hit = 'FAILED'; break
-                if curr_high >= tp: hit = 'SUCCESS'; break
-            # For Sell Signal
-            elif verdicts[i] == 2:
-                if curr_high >= sl: hit = 'FAILED'; break
-                if curr_low <= tp: hit = 'SUCCESS'; break
-        
-        outcomes[i] = hit
-        
-    df['ai_outcome'] = outcomes
-    return df
 
-def main():
-    # 0. Hardware Acceleration Setup
-    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
-    print(f"🚀 Using device: {device}")
+def _bars_per_15m_day() -> int:
+    return (24 * 60) // 15
 
-    # 1. Fetch & Prepare Data (365 days for better context)
-    symbol = "ADAUSD"
-    interval = "15m"
-    df = fetch_data(symbol=symbol, total_days=365, interval=interval)
-    if df.empty:
-        print("No data fetched. Exiting.")
+
+def evaluate_ai_verdicts(
+    dataframe: pd.DataFrame, target_pct: float, stop_pct: float, lookahead_bars: int
+) -> pd.DataFrame:
+    """Label each signal row as SUCCESS / FAILED / TIMEOUT for TP vs SL path (next `lookahead_bars` bars)."""
+    dataframe = dataframe.copy()
+    dataframe["ai_outcome"] = "NONE"
+
+    close_prices = dataframe["Close"].values
+    high_prices = dataframe["High"].values
+    low_prices = dataframe["Low"].values
+    verdict_values = dataframe["ai_verdict"].values
+
+    row_count = len(dataframe)
+    outcomes = ["NONE"] * row_count
+
+    for row_index in range(row_count - lookahead_bars):
+        if verdict_values[row_index] == 1:
+            continue
+
+        entry_price = close_prices[row_index]
+        take_profit = (
+            entry_price * (1 + target_pct / 100)
+            if verdict_values[row_index] == 0
+            else entry_price * (1 - target_pct / 100)
+        )
+        stop_level = (
+            entry_price * (1 - stop_pct / 100)
+            if verdict_values[row_index] == 0
+            else entry_price * (1 + stop_pct / 100)
+        )
+
+        path_outcome = "TIMEOUT"
+        for step in range(1, lookahead_bars + 1):
+            bar_high = high_prices[row_index + step]
+            bar_low = low_prices[row_index + step]
+
+            if verdict_values[row_index] == 0:
+                if bar_low <= stop_level:
+                    path_outcome = "FAILED"
+                    break
+                if bar_high >= take_profit:
+                    path_outcome = "SUCCESS"
+                    break
+            elif verdict_values[row_index] == 2:
+                if bar_high >= stop_level:
+                    path_outcome = "FAILED"
+                    break
+                if bar_low <= take_profit:
+                    path_outcome = "SUCCESS"
+                    break
+
+        outcomes[row_index] = path_outcome
+
+    dataframe["ai_outcome"] = outcomes
+    return dataframe
+
+
+def main() -> None:
+    device = config.DEVICE
+    symbols = config.data.SYMBOLS
+    interval = config.data.INTERVAL
+
+    print_banner(
+        "GLOBAL AI TRADING SYSTEM",
+        f"Symbols: {', '.join(symbols)} | Device: {device}",
+    )
+
+    symbol_frames: dict[str, pd.DataFrame] = {}
+    for symbol in symbols:
+        console.print(f"[info]Fetching data for [bold]{symbol}[/bold]...[/info]")
+        market_frame = fetch_data(
+            symbol=symbol, total_days=config.data.TOTAL_DAYS, interval=interval
+        )
+        if market_frame.empty:
+            console.print(f"[error]No data for {symbol}. Skipping.[/error]")
+            continue
+
+        cache_name = f"features_cache_{symbol}_{interval}.csv"
+        lookahead = config.features.LOOKAHEAD_BARS
+        if os.path.exists(cache_name):
+            cache_age_minutes = (time.time() - os.path.getmtime(cache_name)) / 60
+            if cache_age_minutes < config.data.CACHE_VALID_MINS:
+                console.print(f"  Using cache for {symbol}")
+                features_frame = pd.read_csv(cache_name, index_col=0, parse_dates=True)
+            else:
+                console.print(f"  Rebuilding features for {symbol}...")
+                features_frame = create_full_feature_set(market_frame, lookahead=lookahead)
+                features_frame.to_csv(cache_name)
+        else:
+            features_frame = create_full_feature_set(market_frame, lookahead=lookahead)
+            features_frame.to_csv(cache_name)
+
+        symbol_frames[symbol] = features_frame
+
+    if not symbol_frames:
+        console.print("[error]No symbol data available. Exiting.[/error]")
         return
 
-    # 2. Feature Engineering with Dual-Layer Caching (FIXED: Improved Caching)
-    cache_file = f"features_cache_{symbol}_{interval}.csv"
-    lookahead = 20
-    
-    if os.path.exists(cache_file):
-        cache_age_mins = (time.time() - os.path.getmtime(cache_file)) / 60
-        if cache_age_mins < 120: # 2 hour cache for ADA
-            print(f"⚡ Loading PRE-CALCULATED features from cache: {cache_file}")
-            df_with_features = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-        else:
-            print("⏳ Feature cache expired. Re-calculating all indicators...")
-            df_with_features = create_full_feature_set(df, lookahead=lookahead)
-            df_with_features.to_csv(cache_file)
-    else:
-        print("🛠️ Calculating 135+ indicators (First run)...")
-        df_with_features = create_full_feature_set(df, lookahead=lookahead)
-        df_with_features.to_csv(cache_file)
-
-    # 3. Analytics & Automated Feature Selection
-    from analytics import FeatureAnalyzer
-    from training_utils import create_sequences # Import the new sequence helper
-    
-    analyzer = FeatureAnalyzer(df_with_features)
-    
-    dist = df_with_features['direction_label'].value_counts().to_dict()
-    print("\n" + "📊 TARGET LABEL DISTRIBUTION".center(40, "-"))
-    print(f"BUY (0): {dist.get(0, 0)} signals")
-    print(f"NEUTRAL (1): {dist.get(1, 0)} signals") # Handled both float/int keys
-    print(f"SELL (2): {dist.get(2, 0)} signals")
-    print("-" * 40)
-
-    analyzer.print_health_report()
-    
-    weak_features = analyzer.prune_weak_features(threshold=0.01)
-    if weak_features:
-        print(f"✂️ Pruning {len(weak_features)} noise indicators for better focus...")
-        df_with_features = df_with_features.drop(columns=weak_features)
-
-    # 4. Prepare for AI Pattern Learning (Sequence Based)
-    X_train_raw, y_train_raw, X_test_raw, y_test_raw, features, scaler = prepare_data(df_with_features, test_days=10)
-    
-    # 🔄 TRANSFORM TO SEQUENCES (Bug #1 Fix)
-    seq_len = 32
-    print(f"🔄 Creating temporal sequences (Window size: {seq_len} bars)...")
-    X_train, y_train = create_sequences(X_train_raw, y_train_raw, seq_len=seq_len)
-    X_test, y_test = create_sequences(X_test_raw, y_test_raw, seq_len=seq_len)
-    
-    print("\n" + "="*50)
-    print("🤖 AI SYSTEM SUMMARY")
-    print("="*50)
-    print(f"Sequence Length: {seq_len} bars (~8 hours)")
-    print(f"Training Period: {len(X_train)} sequences")
-    print(f"Testing Period: {len(X_test)} sequences (Last 10 Days)")
-    print(f"Feature Vector Size: {len(features)}")
-    print("="*50)
-
-    # 5. Model Training (Now Sequence-Aware)
-    input_dim = len(features)
-    model = train_model(
-        X_train, y_train, device, input_dim, 
-        X_val=X_test, y_val=y_test, 
-        epochs=100
+    (
+        train_X,
+        train_y,
+        val_X,
+        val_y,
+        test_X,
+        test_y,
+        feature_names,
+        _,
+    ) = prepare_multi_symbol_data(
+        symbol_frames,
+        test_days=config.training.TEST_DAYS,
+        val_days=config.training.VAL_DAYS,
     )
-    
-    # 6. AI Inference (Verdict Check)
-    print("\n🔍 Running AI Verdict Check on temporal sequences...")
-    ai_test_results = get_ai_predictions(model, X_test, device)
-    
-    # 7. Merge Results (Aligned with sequence window)
-    # The last len(ai_test_results) bars from df_with_features correspond to the sequence targets
-    test_portion = df_with_features.iloc[-len(ai_test_results):].copy()
-    test_portion = test_portion.reset_index()
-    for col in ai_test_results.columns:
-        test_portion[col] = ai_test_results.iloc[:, ai_test_results.columns.get_loc(col)].values
-    test_portion = test_portion.set_index('time')
-    
-    # 8. Evaluate Trade Outcomes (User Strategy: 1% TP, 1% SL, 20 bars Timeout)
-    test_portion = evaluate_ai_verdicts(test_portion, target=1.0, stop=1.0, lookahead=20)
-    
-    # 9. Detailed Performance Report (Rich Console Output)
-    print("\n" + "📈 AI TRADE PERFORMANCE REPORT (Last 10 Days)".center(60, "="))
-    
-    # Filter subsets
-    buys = test_portion[test_portion['ai_verdict'] == 0]
-    sells = test_portion[test_portion['ai_verdict'] == 2]
-    
-    # Buy Stats
-    buy_wins = (buys['ai_outcome'] == 'SUCCESS').sum()
-    buy_losses = (buys['ai_outcome'] == 'FAILED').sum()
-    buy_timeouts = (buys['ai_outcome'] == 'TIMEOUT').sum()
-    
-    # Sell Stats
-    sell_wins = (sells['ai_outcome'] == 'SUCCESS').sum()
-    sell_losses = (sells['ai_outcome'] == 'FAILED').sum()
-    sell_timeouts = (sells['ai_outcome'] == 'TIMEOUT').sum()
-    
-    # Aggregated Stats
-    total_signals = len(buys) + len(sells)
-    total_wins = buy_wins + sell_wins
-    total_losses = buy_losses + sell_losses
-    total_timeouts = buy_timeouts + sell_timeouts
-    
-    print(f"Total AI Signals Generated: {total_signals}")
-    print(f"Target: 1.0% | Stoploss: 1.0% | Timeout: 20 bars\n")
-    
-    print(f"🟢 BUY SIGNALS: {len(buys)}")
-    print(f"   - Wins: {buy_wins} | Losses: {buy_losses} | Timeouts: {buy_timeouts}")
-    
-    print(f"🔴 SELL SIGNALS: {len(sells)}")
-    print(f"   - Wins: {sell_wins} | Losses: {sell_losses} | Timeouts: {sell_timeouts}")
-    
-    print("-" * 60)
-    print(f"🏆 TOTAL WINS   : {total_wins}")
-    print(f"💀 TOTAL LOSSES : {total_losses}")
-    print(f"⏳ TOTAL TIMEOUT: {total_timeouts}")
-    
-    if total_signals > 0:
-        win_rate = (total_wins / total_signals) * 100
-        print(f"\n🔥 AI OVERALL WIN RATE: {win_rate:.1f}%")
-        
-        if len(buys) > 0:
-            buy_win_rate = (buy_wins / len(buys)) * 100
-            print(f"📈 Buy Win Rate: {buy_win_rate:.1f}%")
-        if len(sells) > 0:
-            sell_win_rate = (sell_wins / len(sells)) * 100
-            print(f"📉 Sell Win Rate: {sell_win_rate:.1f}%")
 
-    print("=" * 60)
+    console.print(
+        f"\n[highlight]Train/Val/Test tensors: {len(train_X)} / {len(val_X)} / {len(test_X)} windows[/highlight]"
+    )
+    console.print(f"[info]{len(feature_names)} input features | seq_len={config.model.SEQ_LEN}[/info]")
+
+    trained_model, test_metrics = train_model(
+        train_X,
+        train_y,
+        device,
+        len(feature_names),
+        val_features=val_X,
+        val_targets=val_y,
+        test_features=test_X,
+        test_targets=test_y,
+        epochs=config.training.EPOCHS,
+    )
+
+    if test_metrics:
+        console.print("\n[highlight]Held-out test metrics (direction + regression)[/highlight]")
+        for metric_key, metric_value in test_metrics.items():
+            if metric_key == "classification_report_text":
+                console.print(metric_value)
+            elif metric_key == "confusion_matrix_3x3":
+                console.print(f"Confusion matrix [Buy, Neut, Sell]: {metric_value}")
+            else:
+                console.print(f"  {metric_key}: {metric_value}")
+
+    console.print("\n[highlight]Per-symbol trading outcomes on last test window[/highlight]")
+    predictions_frame = run_inference_with_confidence_filter(trained_model, test_X, device)
+
+    bars_per_day = _bars_per_15m_day()
+    test_row_count = config.training.TEST_DAYS * bars_per_day
+    sequences_per_symbol = sequence_count_for_split(test_row_count, config.model.SEQ_LEN)
+
+    summary_table = Table(
+        title="Global model — summary",
+        show_header=True,
+        header_style="bold cyan",
+    )
+    summary_table.add_column("Symbol", justify="left", style="bold")
+    summary_table.add_column("Signals", justify="right")
+    summary_table.add_column("Win rate (TP first)", justify="right")
+    summary_table.add_column("W / L", justify="right")
+
+    sequence_offset = 0
+    for symbol in symbols:
+        if symbol not in symbol_frames:
+            continue
+
+        symbol_predictions = predictions_frame.iloc[
+            sequence_offset : sequence_offset + sequences_per_symbol
+        ]
+        symbol_panel = symbol_frames[symbol].iloc[-sequences_per_symbol:].copy()
+        sequence_offset += sequences_per_symbol
+
+        symbol_panel["ai_verdict"] = symbol_predictions["ai_verdict"].values
+        symbol_panel["ai_confidence"] = symbol_predictions["ai_confidence"].values
+
+        symbol_panel = evaluate_ai_verdicts(
+            symbol_panel,
+            target_pct=config.strategy.TARGET_PROFIT_PCT,
+            stop_pct=config.strategy.STOP_LOSS_PCT,
+            lookahead_bars=config.features.LOOKAHEAD_BARS,
+        )
+
+        buy_rows = symbol_panel[symbol_panel["ai_verdict"] == 0]
+        sell_rows = symbol_panel[symbol_panel["ai_verdict"] == 2]
+        signal_rows = pd.concat([buy_rows, sell_rows])
+        resolved = signal_rows[signal_rows["ai_outcome"].isin(["SUCCESS", "FAILED"])]
+        wins = int((resolved["ai_outcome"] == "SUCCESS").sum())
+        losses = int((resolved["ai_outcome"] == "FAILED").sum())
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0.0
+
+        summary_table.add_row(
+            symbol,
+            str(len(signal_rows)),
+            f"{win_rate:.1f}%",
+            f"{wins} / {losses}",
+        )
+
+        detail_table = Table(
+            title=f"{symbol} — last {config.training.TEST_DAYS} days (strategy filter)",
+            show_header=True,
+            header_style="bold magenta",
+        )
+        detail_table.add_column("Metric", justify="left")
+        detail_table.add_column("Buy", justify="right", style="buy")
+        detail_table.add_column("Sell", justify="right", style="sell")
+        detail_table.add_column("Total", justify="right", style="bold")
+
+        buy_wins = int((buy_rows["ai_outcome"] == "SUCCESS").sum())
+        buy_losses = int((buy_rows["ai_outcome"] == "FAILED").sum())
+        sell_wins = int((sell_rows["ai_outcome"] == "SUCCESS").sum())
+        sell_losses = int((sell_rows["ai_outcome"] == "FAILED").sum())
+
+        detail_table.add_row("Signals", str(len(buy_rows)), str(len(sell_rows)), str(len(signal_rows)))
+        detail_table.add_row("Wins", str(buy_wins), str(sell_wins), str(wins))
+        detail_table.add_row("Losses", str(buy_losses), str(sell_losses), str(losses))
+        console.print(detail_table)
+        console.print("")
+
+    console.print(summary_table)
+    console.print(
+        f"\n[info]TP={config.strategy.TARGET_PROFIT_PCT}% | SL={config.strategy.STOP_LOSS_PCT}% "
+        f"| lookahead={config.features.LOOKAHEAD_BARS} bars[/info]\n"
+    )
+
 
 if __name__ == "__main__":
     main()

@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 from scipy import stats
+from config import config
+from ui_utils import console, get_progress
 
 def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add fundamental price and volume based features"""
@@ -207,7 +209,7 @@ def add_microstructure_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features['amihud_illiquidity'] = abs(df['return_1']) / (df['Volume'] + 1)
     return pd.concat([df, new_features], axis=1)
 
-def add_risk_reward_features(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
+def add_risk_reward_features(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
     """
     Add forward-looking risk/reward metrics for target creation.
     FIXED: BUG #3 - Removed shift(-1) to prevent data leakage.
@@ -253,15 +255,15 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features['vol_atr_ratio'] = (df['volume_ratio'] if 'volume_ratio' in df else 1.0) / (df['ATR_pct'] + 0.0001)
     return pd.concat([df, new_features], axis=1)
 
-def add_target_labels(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
+def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
     """
     Add classification labels using 'First-Hit' logic.
     Label 0 (BUY): Hits Target BEFORE Stop Loss
     Label 2 (SELL): Hits -Target BEFORE +Stop Loss
     Label 1 (NEUTRAL): No target hit or Stop Loss hit first
     """
-    target = 1.0  # 1.0% Profit Target
-    stop = 1.0    # 1.0% Stop Loss
+    target = config.strategy.TARGET_PROFIT_PCT
+    stop = config.strategy.STOP_LOSS_PCT
     
     df['direction_label'] = 1  # Default to Neutral
     
@@ -300,40 +302,35 @@ def add_target_labels(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
     return df
 
 def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:
-    """Complete feature engineering pipeline"""
-    print("Adding basic features...")
-    df = add_basic_features(df)
-    print("Adding moving averages...")
-    df = add_moving_averages(df)
-    print("Adding momentum indicators...")
-    df = add_momentum_indicators(df)
-    print("Adding volatility indicators...")
-    df = add_volatility_indicators(df)
-    print("Adding trend indicators...")
-    df = add_trend_indicators(df)
-    print("Adding volume indicators...")
-    df = add_volume_indicators(df)
-    print("Adding candle features...")
-    df = add_candle_features(df)
-    print("Adding statistical features...")
-    df = add_statistical_features(df)
-    print("⭐ Adding advanced volatility features...")
-    df = add_advanced_volatility_features(df)
-    print("⭐ Adding advanced trend features...")
-    df = add_advanced_trend_features(df)
-    print("⭐ Adding information theory features...")
-    df = add_information_theory_features(df)
-    print("⭐ Adding microstructure features...")
-    df = add_microstructure_features(df)
-    print("⭐ Adding risk-reward features...")
-    df = add_risk_reward_features(df, lookahead)
-    print("Adding interaction features...")
-    df = add_interaction_features(df)
-    print("Adding target labels...")
-    df = add_target_labels(df)
+    """Complete feature engineering pipeline with progress tracking"""
     
-    # FIXED: BUG #7 - Reordered bfill/ffill. ffill MUST come first.
+    steps = [
+        ("Basic Attributes", add_basic_features),
+        ("Moving Averages", add_moving_averages),
+        ("Momentum Indicators", add_momentum_indicators),
+        ("Volatility Measures", add_volatility_indicators),
+        ("Trend Strength", add_trend_indicators),
+        ("Volume Analysis", add_volume_indicators),
+        ("Candle Patterns", add_candle_features),
+        ("Statistical Features", add_statistical_features),
+        ("Adv. Volatility", add_advanced_volatility_features),
+        ("Adv. Trend", add_advanced_trend_features),
+        ("Entropy/Info Theory", add_information_theory_features),
+        ("Microstructure", add_microstructure_features),
+        ("Risk-Reward Profile", lambda d: add_risk_reward_features(d, lookahead)),
+        ("Interactions", add_interaction_features),
+        ("Target Labeling", add_target_labels)
+    ]
+    
+    with get_progress() as progress:
+        task = progress.add_task("[highlight]Feature Engineering Pipeline...[/highlight]", total=len(steps))
+        
+        for name, func in steps:
+            progress.update(task, description=f"Adding {name}...")
+            df = func(df)
+            progress.update(task, advance=1)
+
+    # Clean up NaNs
     df = df.ffill().bfill().fillna(0)
-    print(f"\n✅ Feature engineering complete!")
-    print(f"Total features: {len(df.columns)}")
+    console.print(f"[success]✅ Feature engineering complete![/success] Total features: [bold]{len(df.columns)}[/bold]")
     return df
