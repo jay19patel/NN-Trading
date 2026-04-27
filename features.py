@@ -258,9 +258,7 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
     """
     First-hit direction labels plus per-bar TP/SL percentages used for those paths.
-
-    When USE_DYNAMIC_TP_SL_LABELS is True, TP% and SL% scale with ATR% (volatility-aware).
-    Regression targets label_take_profit_pct / label_stop_loss_pct match the same levels.
+    Also calculates 'actual_pnl_pct' and a synthetic 'label_qty_ratio' for the FRD RL architecture.
     """
     strategy = config.strategy
     row_count = len(df)
@@ -285,6 +283,7 @@ def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
         stop_loss_pct_per_row = np.full(row_count, strategy.STOP_LOSS_PCT, dtype=np.float64)
 
     labels = np.ones(row_count)
+    actual_pnl_pct_arr = np.zeros(row_count, dtype=np.float64)
 
     for row_index in range(row_count - lookahead):
         entry_price = close_prices[row_index]
@@ -294,20 +293,29 @@ def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
         take_profit_price_long = entry_price * (1 + take_profit_pct / 100)
         stop_loss_price_long = entry_price * (1 - stop_loss_pct / 100)
 
+        # Baseline: timeout PnL
+        final_close = close_prices[row_index + lookahead]
+
+        # Try long
+        long_failed = False
         for step_index in range(1, lookahead + 1):
             bar_low = low_prices[row_index + step_index]
             bar_high = high_prices[row_index + step_index]
             hit_stop_first = bar_low <= stop_loss_price_long
             hit_target_first = bar_high >= take_profit_price_long
             if hit_stop_first and hit_target_first:
+                long_failed = True
                 break
             if hit_stop_first:
+                long_failed = True
                 break
             if hit_target_first:
                 labels[row_index] = 0
+                actual_pnl_pct_arr[row_index] = take_profit_pct
                 break
 
         if labels[row_index] == 1:
+            # Try short
             take_profit_price_short = entry_price * (1 - take_profit_pct / 100)
             stop_loss_price_short = entry_price * (1 + stop_loss_pct / 100)
             for step_index in range(1, lookahead + 1):
@@ -316,16 +324,34 @@ def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
                 hit_stop_first = bar_high >= stop_loss_price_short
                 hit_target_first = bar_low <= take_profit_price_short
                 if hit_stop_first and hit_target_first:
+                    actual_pnl_pct_arr[row_index] = -stop_loss_pct
                     break
                 if hit_stop_first:
+                    actual_pnl_pct_arr[row_index] = -stop_loss_pct
                     break
                 if hit_target_first:
                     labels[row_index] = 2
+                    actual_pnl_pct_arr[row_index] = take_profit_pct
                     break
+                    
+            if labels[row_index] == 1:
+                # Still Hold
+                actual_pnl_pct_arr[row_index] = 0.0
 
     df["label_take_profit_pct"] = take_profit_pct_per_row
     df["label_stop_loss_pct"] = stop_loss_pct_per_row
     df["direction_label"] = labels
+    df["actual_pnl_pct"] = actual_pnl_pct_arr
+    
+    # Synthetic qty ratio: 1.0 for confident targets, 0.5 for others
+    qty_ratio_arr = np.full(row_count, 0.5)
+    qty_ratio_arr[labels != 1] = 0.8 # Higher base quantity for clear setups
+    if 'trend_strength' in df.columns:
+        trend_proxy = df['trend_strength'].fillna(0).values
+        norm_trend = np.clip(trend_proxy * 5, 0, 0.2)
+        qty_ratio_arr = np.clip(qty_ratio_arr + norm_trend, 0.1, 1.0)
+    df["label_qty_ratio"] = qty_ratio_arr
+    
     return df
 
 def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:

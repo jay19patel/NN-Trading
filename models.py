@@ -76,13 +76,22 @@ class MultiHeadTradingModel(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.confidence_head = nn.Linear(hidden_dim, 1)
-        self.upside_head = nn.Linear(hidden_dim, 1)
-        self.downside_head = nn.Linear(hidden_dim, 1)
-        self.risk_head = nn.Linear(hidden_dim, 1)
-        self.direction_head = nn.Linear(hidden_dim, 3)
-        self.take_profit_pct_head = nn.Linear(hidden_dim, 1)
-        self.stop_loss_pct_head = nn.Linear(hidden_dim, 1)
+        # HEAD 1: Signal prediction (Buy=1, Sell=2, Hold=0)
+        self.signal_head = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 3)
+        )
+        
+        # HEAD 2: Position sizing (qty, target, sl)
+        self.sizing_head = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 3),
+            nn.Sigmoid()
+        )
 
     def forward(self, window_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         # window_features: [batch, seq_len, features]
@@ -100,109 +109,81 @@ class MultiHeadTradingModel(nn.Module):
         encoded_sequence = self.encoder(encoded_positions, mask=causal_mask)
         last_step = encoded_sequence[:, -1, :]
         shared = self.shared_layer(last_step)
-        take_profit_positive = functional.softplus(self.take_profit_pct_head(shared)) + 0.05
-        stop_loss_positive = functional.softplus(self.stop_loss_pct_head(shared)) + 0.05
-        strategy = config.strategy
-        take_profit_pct = torch.clamp(
-            take_profit_positive,
-            min=strategy.LABEL_TP_PCT_MIN,
-            max=strategy.LABEL_TP_PCT_MAX,
-        )
-        stop_loss_pct = torch.clamp(
-            stop_loss_positive,
-            min=strategy.LABEL_SL_PCT_MIN,
-            max=strategy.LABEL_SL_PCT_MAX,
-        )
+        
+        signal_logits = self.signal_head(shared)
+        sizing = self.sizing_head(shared)
+        
+        # Output bounds mapping applied at inference/loss time
         return {
-            "confidence": torch.sigmoid(self.confidence_head(shared)),
-            "upside": self.upside_head(shared),
-            "downside": self.downside_head(shared),
-            "risk": torch.sigmoid(self.risk_head(shared)),
-            "direction": self.direction_head(shared),
-            "take_profit_pct": take_profit_pct,
-            "stop_loss_pct": stop_loss_pct,
+            "direction": signal_logits,
+            "sizing": sizing, # [qty_ratio, target_pct_raw, sl_pct_raw]
         }
 
 
-class RiskAwareLoss(nn.Module):
+class TradingLoss(nn.Module):
     """
-    Multi-task loss: direction (CE) plus regression on upside, downside, risk, confidence.
-
-    Confidence targets are derived only from ground-truth targets (no feedback from predicted
-    confidence into regression loss — that would let the model game the loss).
+    Combined loss that learns from:
+    1. Signal correctness (was direction right?)
+    2. Sizing accuracy (was qty/target/sl good?)
+    3. Actual PnL (what did the trade actually do?)
     """
-
-    def __init__(
-        self,
-        confidence_weight: float = 0.5,
-        upside_weight: float = 1.5,
-        downside_weight: float = 1.5,
-        risk_weight: float = 0.5,
-        direction_weight: float = 1.0,
-        take_profit_weight: float = 1.0,
-        stop_loss_weight: float = 1.0,
-    ):
+    def __init__(self, alpha=1.0, beta=0.5, gamma=0.3):
         super().__init__()
-        self.confidence_weight = confidence_weight
-        self.upside_weight = upside_weight
-        self.downside_weight = downside_weight
-        self.risk_weight = risk_weight
-        self.direction_weight = direction_weight
-        self.take_profit_weight = take_profit_weight
-        self.stop_loss_weight = stop_loss_weight
-        self.regression_loss = nn.SmoothL1Loss(reduction="mean")
-        self.confidence_loss = nn.MSELoss(reduction="mean")
-        self.direction_loss_fn = nn.CrossEntropyLoss()
+        self.alpha = alpha     # Signal loss weight
+        self.beta = beta       # Sizing loss weight
+        self.gamma = gamma     # PnL penalty weight
+        
+        self.ce = nn.CrossEntropyLoss()
+        self.mse = nn.MSELoss()
 
     def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        upside = predictions["upside"].squeeze(-1)
-        downside = predictions["downside"].squeeze(-1)
-        confidence = predictions["confidence"].squeeze(-1)
-
-        upside_targets = targets["upside"]
-        downside_targets = targets["downside"]
-
-        upside_term = self.regression_loss(upside, upside_targets)
-        downside_term = self.regression_loss(downside, downside_targets)
-
-        direction_term = self.direction_loss_fn(predictions["direction"], targets["direction"].long())
-
-        significant_move = torch.maximum(
-            upside_targets, torch.abs(downside_targets)
-        ) > 1.0
-        strong_bull = upside_targets > torch.abs(downside_targets) * 1.5
-        strong_bear = torch.abs(downside_targets) > upside_targets * 1.5
-        confidence_target = (significant_move & (strong_bull | strong_bear)).float()
-        confidence_term = self.confidence_loss(confidence, confidence_target)
-
-        risk_target = torch.clamp(torch.abs(targets["future_drawdown"]) / 20.0, 0.0, 1.0)
-        risk_term = self.regression_loss(predictions["risk"].squeeze(-1), risk_target)
-
-        take_profit_targets = targets["take_profit_pct"]
-        stop_loss_targets = targets["stop_loss_pct"]
-        take_profit_term = self.regression_loss(
-            predictions["take_profit_pct"].squeeze(-1), take_profit_targets
+        signal_logits = predictions["direction"]
+        sizing_out = predictions["sizing"]
+        
+        true_signal = targets["direction"].long()
+        
+        # Build true sizing tensor [qty, target_scaled, sl_scaled]
+        # target and sl need to be scaled to 0-1 for MSE against Sigmoid output
+        strategy = config.strategy
+        max_tp = strategy.LABEL_TP_PCT_MAX
+        max_sl = strategy.LABEL_SL_PCT_MAX
+        
+        true_qty = targets["qty_ratio"]
+        true_tp = targets["take_profit_pct"] / max_tp
+        true_sl = targets["stop_loss_pct"] / max_sl
+        
+        true_sizing = torch.stack([true_qty, true_tp, true_sl], dim=1)
+        
+        # Loss 1: Signal correctness
+        signal_loss = self.ce(signal_logits, true_signal)
+        
+        # Loss 2: Sizing accuracy
+        sizing_loss = self.mse(sizing_out, true_sizing)
+        
+        # Loss 3: PnL-based consequence learning
+        # We use the actual_pnl_pct from targets to penalize/reward
+        actual_pnl = targets["actual_pnl_pct"]
+        pred_qty = sizing_out[:, 0]
+        
+        is_loss = (actual_pnl < 0).float()
+        is_profit = (actual_pnl > 0).float()
+        
+        # Penalty: lose money + high qty = big penalty
+        # Reward: make money = incentive to be confident
+        pnl_effect = (
+            is_loss * actual_pnl.abs() * pred_qty
+            - is_profit * actual_pnl.abs() * (1 - pred_qty)
+        ).mean()
+        
+        total = (
+            self.alpha * signal_loss 
+            + self.beta * sizing_loss 
+            + self.gamma * pnl_effect
         )
-        stop_loss_term = self.regression_loss(
-            predictions["stop_loss_pct"].squeeze(-1), stop_loss_targets
-        )
-
-        total_loss = (
-            self.confidence_weight * confidence_term
-            + self.upside_weight * upside_term
-            + self.downside_weight * downside_term
-            + self.risk_weight * risk_term
-            + self.direction_weight * direction_term
-            + self.take_profit_weight * take_profit_term
-            + self.stop_loss_weight * stop_loss_term
-        )
+        
         return {
-            "total": total_loss,
-            "confidence": confidence_term,
-            "upside": upside_term,
-            "downside": downside_term,
-            "risk": risk_term,
-            "direction": direction_term,
-            "take_profit_pct": take_profit_term,
-            "stop_loss_pct": stop_loss_term,
+            "total": total,
+            "signal_loss": signal_loss,
+            "sizing_loss": sizing_loss,
+            "pnl_effect": pnl_effect
         }

@@ -31,20 +31,17 @@ def sequence_count_for_split(raw_bar_count: int, sequence_length: int) -> int:
 
 
 def regression_metrics_numpy(
-    predicted_upside: np.ndarray,
-    predicted_downside: np.ndarray,
-    true_upside: np.ndarray,
-    true_downside: np.ndarray,
+    predicted_qty: np.ndarray,
+    predicted_tp: np.ndarray,
+    predicted_sl: np.ndarray,
+    true_qty: np.ndarray,
+    true_tp: np.ndarray,
+    true_sl: np.ndarray,
 ) -> Dict[str, float]:
-    mae_up = mean_absolute_error(true_upside, predicted_upside)
-    mae_dn = mean_absolute_error(true_downside, predicted_downside)
-    rmse_up = float(np.sqrt(mean_squared_error(true_upside, predicted_upside)))
-    rmse_dn = float(np.sqrt(mean_squared_error(true_downside, predicted_downside)))
     return {
-        "mae_upside_pct": float(mae_up),
-        "mae_downside_pct": float(mae_dn),
-        "rmse_upside_pct": float(rmse_up),
-        "rmse_downside_pct": float(rmse_dn),
+        "mae_qty_ratio": float(mean_absolute_error(true_qty, predicted_qty)),
+        "mae_take_profit_pct": float(mean_absolute_error(true_tp, predicted_tp)),
+        "mae_stop_loss_pct": float(mean_absolute_error(true_sl, predicted_sl)),
     }
 
 
@@ -108,24 +105,27 @@ def evaluate_model_on_split(
     batch_tensor = torch.FloatTensor(features).to(device)
     predictions = model(batch_tensor)
     pred_dir = torch.argmax(predictions["direction"], dim=1).cpu().numpy()
-    pred_up = predictions["upside"].cpu().numpy().reshape(-1)
-    pred_dn = predictions["downside"].cpu().numpy().reshape(-1)
     targets_direction = targets["direction"]
-    targets_upside = targets["upside"]
-    targets_downside = targets["downside"]
+
+    # Decode sizing head [qty_ratio, tp_raw, sl_raw]
+    sizing = predictions["sizing"].cpu().numpy()
+    pred_qty = sizing[:, 0]
+    
+    # Needs config for scaling, so we'll import it
+    from config import config
+    pred_tp = sizing[:, 1] * config.strategy.LABEL_TP_PCT_MAX
+    pred_sl = sizing[:, 2] * config.strategy.LABEL_SL_PCT_MAX
+    
+    true_qty = targets["qty_ratio"]
+    true_tp = targets["take_profit_pct"]
+    true_sl = targets["stop_loss_pct"]
 
     metrics: Dict[str, float | str] = {}
     metrics.update(
-        regression_metrics_numpy(pred_up, pred_dn, targets_upside, targets_downside)
+        regression_metrics_numpy(pred_qty, pred_tp, pred_sl, true_qty, true_tp, true_sl)
     )
     metrics.update(directional_accuracy_numpy(pred_dir, targets_direction))
     metrics.update(directional_accuracy_non_neutral_numpy(pred_dir, targets_direction))
     metrics.update(classification_metrics_numpy(pred_dir, targets_direction))
 
-    pred_tp = predictions["take_profit_pct"].cpu().numpy().reshape(-1)
-    pred_sl = predictions["stop_loss_pct"].cpu().numpy().reshape(-1)
-    true_tp = targets["take_profit_pct"]
-    true_sl = targets["stop_loss_pct"]
-    metrics["mae_take_profit_pct"] = float(mean_absolute_error(true_tp, pred_tp))
-    metrics["mae_stop_loss_pct"] = float(mean_absolute_error(true_sl, pred_sl))
     return metrics

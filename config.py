@@ -30,14 +30,21 @@ class ModelConfig:
 class TrainingConfig:
     """Settings for the AI training process"""
     # Chronological holdouts: train -> val -> test (oldest -> newest). Critical for time series.
-    VAL_DAYS: int = 2                 # Validation window before the test window (tune early stopping / LR)
+    VAL_DAYS: int = 4                 # Validation window before the test window (tune early stopping / LR)
     TEST_DAYS: int = 10               # Last kitne dino ka data final evaluation ke liye alag rakna he
     EPOCHS: int = 100                  # Kitni baar model pura data repeat karke sikhega
+    RL_FINE_TUNE_EPOCHS: int = 20      # Extra epochs for phase 2 RL fine tuning
     EARLY_STOP_PATIENCE: int = 30      # Stop if validation loss does not improve for this many epochs
     BATCH_SIZE: int = 64              # Ek baar me kitne samples process honge
     LEARNING_RATE: float = 0.001      # Weights update karne ki speed
+    RL_LEARNING_RATE: float = 0.0001  # Lower LR for RL phase
     WEIGHT_DECAY: float = 0.01        # Weight regularization taaki pattern stable rahe
     USE_WEIGHTED_SAMPLER: bool = True # Balance direction classes during training (can distort train metrics vs live distribution)
+    
+    # Loss weights
+    LOSS_ALPHA: float = 1.0           # Signal loss weight
+    LOSS_BETA: float = 0.5            # Sizing loss weight
+    LOSS_GAMMA: float = 0.3           # PnL penalty weight (used heavily in phase 2)
 
 @dataclass
 class StrategyConfig:

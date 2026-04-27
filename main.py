@@ -2,9 +2,12 @@
 import time
 import os
 import warnings
+import torch
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 
 from config import config
 from data_gathering import fetch_data
@@ -142,7 +145,9 @@ def main() -> None:
             console.print(f"[error]No data for {symbol}. Skipping.[/error]")
             continue
 
-        cache_name = f"features_cache_{symbol}_{interval}.csv"
+        data_dir = "data"
+        os.makedirs(data_dir, exist_ok=True)
+        cache_name = os.path.join(data_dir, f"features_cache_{symbol}_{interval}.csv")
         lookahead = config.features.LOOKAHEAD_BARS
         if os.path.exists(cache_name):
             cache_age_minutes = (time.time() - os.path.getmtime(cache_name)) / 60
@@ -200,6 +205,13 @@ def main() -> None:
         test_targets=test_y,
         epochs=config.training.EPOCHS,
     )
+    
+    # Save the trained model
+    models_dir = "saved_models"
+    os.makedirs(models_dir, exist_ok=True)
+    model_path = os.path.join(models_dir, "trading_model_v1.pt")
+    torch.save(trained_model.state_dict(), model_path)
+    console.print(f"\n[bold green]💾 Model weights saved successfully to {model_path}[/bold green]")
 
     if test_metrics:
         console.print("\n[highlight]Held-out test metrics (direction + regression)[/highlight]")
@@ -229,7 +241,25 @@ def main() -> None:
     summary_table.add_column("W / L", justify="right")
     summary_table.add_column("Paper $", justify="right")
 
+    # Create results directory
+    results_dir = "backtest_results"
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Global tracking
+    global_initial_capital = 0.0
+    global_final_capital = 0.0
+    global_total_fees = 0.0
+    global_total_trades = 0
+    global_total_wins = 0
+    global_total_losses = 0
+
     sequence_offset = 0
+    all_trade_records = []
+    
+    # For plotting
+    equity_curves = {}
+    symbol_panels_data = {} # To store panels for detailed plotting
+    
     for symbol in symbols:
         if symbol not in symbol_frames:
             continue
@@ -242,6 +272,7 @@ def main() -> None:
 
         symbol_panel["ai_verdict"] = symbol_predictions["ai_verdict"].values
         symbol_panel["ai_confidence"] = symbol_predictions["ai_confidence"].values
+        symbol_panel["ai_qty_ratio"] = symbol_predictions["ai_qty_ratio"].values
         symbol_panel["ai_take_profit_pct"] = symbol_predictions["ai_take_profit_pct"].values
         symbol_panel["ai_stop_loss_pct"] = symbol_predictions["ai_stop_loss_pct"].values
 
@@ -250,13 +281,15 @@ def main() -> None:
             lookahead_bars=config.features.LOOKAHEAD_BARS,
         )
 
-        _, _, paper_summary = run_paper_portfolio_on_signals(
+        symbol_panel, trade_records, paper_summary = run_paper_portfolio_on_signals(
             symbol_panel,
+            symbol=symbol,
             initial_capital_usd=config.strategy.INITIAL_CAPITAL_USD,
             risk_per_trade_pct_of_equity=config.strategy.RISK_PER_TRADE_PCT_OF_EQUITY,
             max_notional_pct_of_equity=config.strategy.MAX_POSITION_NOTIONAL_PCT_OF_EQUITY,
             round_trip_fee_pct=config.strategy.ROUND_TRIP_FEE_PCT,
         )
+        all_trade_records.extend(trade_records)
 
         buy_rows = symbol_panel[symbol_panel["ai_verdict"] == 0]
         sell_rows = symbol_panel[symbol_panel["ai_verdict"] == 2]
@@ -298,6 +331,30 @@ def main() -> None:
             "—",
             f"{paper_summary['final_equity_usd']:.2f}",
         )
+        initial_cap = config.strategy.INITIAL_CAPITAL_USD
+        final_cap = paper_summary['final_equity_usd']
+        net_pnl_pct = ((final_cap - initial_cap) / initial_cap) * 100
+        total_fees = paper_summary.get('total_fees_usd', 0)
+        fees_pct = (total_fees / initial_cap) * 100
+
+        detail_table.add_row(
+            "Total Trades",
+            "—",
+            "—",
+            str(paper_summary['trade_count']),
+        )
+        detail_table.add_row(
+            "Net PnL %",
+            "—",
+            "—",
+            f"{net_pnl_pct:.2f}%",
+        )
+        detail_table.add_row(
+            "Total Fees %",
+            "—",
+            "—",
+            f"{fees_pct:.2f}%",
+        )
         detail_table.add_row(
             "Loss→next win",
             "—",
@@ -311,10 +368,117 @@ def main() -> None:
             f"net PnL≈${paper_summary.get('total_pnl_net_usd', 0):.2f}[/info]"
         )
         console.print("")
+        
+        # Track for global
+        global_initial_capital += config.strategy.INITIAL_CAPITAL_USD
+        global_final_capital += paper_summary['final_equity_usd']
+        global_total_fees += paper_summary.get('total_fees_usd', 0)
+        global_total_trades += paper_summary['trade_count']
+        global_total_wins += wins
+        global_total_losses += losses
+        
+        # Track for plotting
+        equity_curves[symbol] = {
+            "dates": symbol_panel.index if isinstance(symbol_panel.index, pd.DatetimeIndex) else list(range(len(symbol_panel))),
+            "equity": symbol_panel["paper_equity_curve"].values
+        }
+        symbol_panels_data[symbol] = symbol_panel.copy()
 
+    # Add global row
+    global_win_rate = (global_total_wins / (global_total_wins + global_total_losses) * 100) if (global_total_wins + global_total_losses) > 0 else 0.0
+    global_net_pnl_pct = ((global_final_capital - global_initial_capital) / global_initial_capital * 100) if global_initial_capital > 0 else 0.0
+    global_fees_pct = (global_total_fees / global_initial_capital * 100) if global_initial_capital > 0 else 0.0
+    
+    summary_table.add_row(
+        "GLOBAL TOTAL",
+        str(global_total_trades),
+        f"{global_win_rate:.1f}%",
+        f"{global_total_wins} / {global_total_losses}",
+        f"${global_final_capital:.2f}",
+        style="bold yellow"
+    )
+    
     console.print(summary_table)
+    
+    global_stats_table = Table(title="Global Portfolio Performance", show_header=True, header_style="bold green")
+    global_stats_table.add_column("Metric", justify="left")
+    global_stats_table.add_column("Value", justify="right", style="bold")
+    
+    global_stats_table.add_row("Total Initial Capital", f"${global_initial_capital:.2f}")
+    global_stats_table.add_row("Total Final Capital", f"${global_final_capital:.2f}")
+    global_stats_table.add_row("Global Net PnL %", f"{global_net_pnl_pct:.2f}%")
+    global_stats_table.add_row("Total Fees Paid", f"${global_total_fees:.2f}")
+    global_stats_table.add_row("Fees as % of Capital", f"{global_fees_pct:.2f}%")
+    global_stats_table.add_row("Total Trades Taken", str(global_total_trades))
+    
+    console.print(global_stats_table)
+
+    if all_trade_records:
+        df_trades = pd.DataFrame([vars(t) for t in all_trade_records])
+        trades_csv_path = os.path.join(results_dir, "paper_trading_results.csv")
+        df_trades.to_csv(trades_csv_path, index=False)
+        console.print(f"\n[bold green]✅ Saved detailed trade analysis to {trades_csv_path} ({len(df_trades)} trades)[/bold green]")
+        
+    # Generate Advanced Visualizations
+    from plotly.subplots import make_subplots
+    
+    # 1. Portfolio Equity Curve (Individual + Global Total)
+    fig_equity = go.Figure()
+    
+    # Calculate Global Total Equity Curve
+    first_sym = symbols[0]
+    if first_sym in equity_curves:
+        total_equity_curve = np.zeros_like(equity_curves[first_sym]["equity"])
+        dates = equity_curves[first_sym]["dates"]
+        
+        for sym, data in equity_curves.items():
+            fig_equity.add_trace(go.Scatter(x=data["dates"], y=data["equity"], mode='lines', name=f"{sym} Equity", line=dict(width=1.5, dash='dot')))
+            # Add to total if shapes match
+            if len(data["equity"]) == len(total_equity_curve):
+                total_equity_curve += data["equity"]
+        
+        # Add the BOLD Global Total line
+        fig_equity.add_trace(go.Scatter(x=dates, y=total_equity_curve, mode='lines', name="TOTAL PORTFOLIO", line=dict(color='gold', width=4)))
+
+    fig_equity.update_layout(
+        title="Portfolio Capital Growth (Individual & Global Total)",
+        xaxis_title="Date/Time", yaxis_title="Account Equity (USD)",
+        template="plotly_dark", hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    fig_equity.write_html(os.path.join(results_dir, "portfolio_equity_curve.html"))
+
+    # 2. Detailed Trade Visualizer (Price + Markers)
+    for sym, panel in symbol_panels_data.items():
+        fig_trades = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                   vertical_spacing=0.03, subplot_titles=(f"{sym} Price & Trades", "Equity Growth"),
+                                   row_width=[0.3, 0.7])
+        
+        # Price Trace
+        fig_trades.add_trace(go.Scatter(x=panel.index, y=panel['Close'], name='Price', line=dict(color='gray', width=1)), row=1, col=1)
+        
+        # Add Trade Markers
+        buys = panel[panel['ai_verdict'] == 0]
+        sells = panel[panel['ai_verdict'] == 2]
+        
+        fig_trades.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers', name='Buy Signal',
+                                        marker=dict(symbol='triangle-up', size=10, color='green')), row=1, col=1)
+        fig_trades.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers', name='Sell Signal',
+                                        marker=dict(symbol='triangle-down', size=10, color='red')), row=1, col=1)
+        
+        # Equity Trace on Subplot 2
+        fig_trades.add_trace(go.Scatter(x=panel.index, y=panel['paper_equity_curve'], name='Equity', line=dict(color='cyan')), row=2, col=1)
+        
+        fig_trades.update_layout(height=800, title_text=f"{sym} Detailed Trade Analytics", template="plotly_dark")
+        fig_trades.write_html(os.path.join(results_dir, f"{sym}_detailed_analytics.html"))
+
+    console.print(f"\n[bold cyan]📊 All visualizations saved to the '{results_dir}' folder:[/bold cyan]")
+    console.print(f"  - portfolio_equity_curve.html (Individual + TOTAL)")
+    for sym in symbols:
+        console.print(f"  - {sym}_detailed_analytics.html (Price + Buy/Sell Markers)")
+        
     console.print(
-        f"\n[info]Path test uses model TP/SL % per bar | lookahead={config.features.LOOKAHEAD_BARS} bars | "
+        f"\n[info]Model evaluation completed on {config.training.TEST_DAYS} held-out days. | lookahead={config.features.LOOKAHEAD_BARS} bars | "
         f"paper start=${config.strategy.INITIAL_CAPITAL_USD:.0f} "
         f"(risk {config.strategy.RISK_PER_TRADE_PCT_OF_EQUITY}% equity / trade)[/info]"
     )

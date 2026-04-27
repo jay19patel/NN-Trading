@@ -16,6 +16,8 @@ from config import config
 class PaperTradeRecord:
     """One closed or timed-out paper trade for audit and feedback stats."""
 
+    symbol: str
+    entry_datetime: str
     entry_index: int
     side: str
     entry_price: float
@@ -23,11 +25,14 @@ class PaperTradeRecord:
     notional_usd: float
     take_profit_pct: float
     stop_loss_pct: float
+    ai_confidence: float
+    ai_qty_ratio: float
     outcome: str
     return_fraction: float
     pnl_before_fees_usd: float
     fees_usd: float
     pnl_net_usd: float
+    capital_before_usd: float
     equity_after_usd: float
 
 
@@ -37,9 +42,11 @@ def compute_position_size_for_risk_budget(
     stop_loss_pct: float,
     risk_budget_fraction_of_equity: float,
     max_notional_fraction_of_equity: float,
+    qty_ratio: float = 1.0,
 ) -> tuple[float, float]:
     """
-    Size like a discretionary trader: risk a fixed fraction of equity to the stop distance.
+    Size like a discretionary trader: risk a fixed fraction of equity to the stop distance,
+    then scale by the AI's confidence-based qty_ratio.
 
     Returns (quantity, notional_usd). Quantity is in coin units; notional is entry_price * quantity.
     """
@@ -48,7 +55,10 @@ def compute_position_size_for_risk_budget(
     stop_distance_fraction = max(float(stop_loss_pct) / 100.0, 1e-5)
     dollars_at_risk_per_unit = entry_price * stop_distance_fraction
     risk_budget_usd = equity_usd * risk_budget_fraction_of_equity
-    quantity = risk_budget_usd / dollars_at_risk_per_unit
+    
+    # Scale initial budget by AI's requested quantity ratio
+    quantity = (risk_budget_usd / dollars_at_risk_per_unit) * qty_ratio
+    
     notional_usd = quantity * entry_price
     max_notional_usd = equity_usd * max_notional_fraction_of_equity
     if notional_usd > max_notional_usd and max_notional_usd > 0:
@@ -60,6 +70,7 @@ def compute_position_size_for_risk_budget(
 
 def run_paper_portfolio_on_signals(
     panel: pd.DataFrame,
+    symbol: str,
     initial_capital_usd: float,
     risk_per_trade_pct_of_equity: float,
     max_notional_pct_of_equity: float,
@@ -89,7 +100,15 @@ def run_paper_portfolio_on_signals(
                 entry_price = float(row["Close"])
                 stop_loss_pct = float(row["ai_stop_loss_pct"])
                 take_profit_pct = float(row["ai_take_profit_pct"])
+                qty_ratio = float(row.get("ai_qty_ratio", 1.0))
+                confidence = float(row.get("ai_confidence", 0.0))
                 return_fraction = float(row.get("ai_return_fraction", 0.0))
+                
+                entry_datetime = str(row.name)
+                if "Date" in row:
+                    entry_datetime = str(row["Date"])
+
+                capital_before = equity_usd
 
                 quantity, notional_usd = compute_position_size_for_risk_budget(
                     equity_usd=equity_usd,
@@ -97,6 +116,7 @@ def run_paper_portfolio_on_signals(
                     stop_loss_pct=stop_loss_pct,
                     risk_budget_fraction_of_equity=risk_fraction,
                     max_notional_fraction_of_equity=max_notional_fraction,
+                    qty_ratio=qty_ratio,
                 )
                 if quantity > 0 and notional_usd > 0:
                     pnl_before_fees = notional_usd * return_fraction
@@ -107,6 +127,8 @@ def run_paper_portfolio_on_signals(
                     side = "LONG" if verdict == 0 else "SHORT"
                     trade_records.append(
                         PaperTradeRecord(
+                            symbol=symbol,
+                            entry_datetime=entry_datetime,
                             entry_index=row_position,
                             side=side,
                             entry_price=entry_price,
@@ -114,11 +136,14 @@ def run_paper_portfolio_on_signals(
                             notional_usd=notional_usd,
                             take_profit_pct=take_profit_pct,
                             stop_loss_pct=stop_loss_pct,
+                            ai_confidence=confidence,
+                            ai_qty_ratio=qty_ratio,
                             outcome=outcome,
                             return_fraction=return_fraction,
                             pnl_before_fees_usd=pnl_before_fees,
                             fees_usd=fees_usd,
                             pnl_net_usd=pnl_net,
+                            capital_before_usd=capital_before,
                             equity_after_usd=equity_usd,
                         )
                     )

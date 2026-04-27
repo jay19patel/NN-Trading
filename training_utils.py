@@ -12,7 +12,7 @@ from ui_utils import console
 from rich.live import Live
 from rich.table import Table
 
-from models import MultiHeadTradingModel, RiskAwareLoss
+from models import MultiHeadTradingModel, TradingLoss
 from evaluation_metrics import evaluate_model_on_split
 
 
@@ -90,6 +90,8 @@ def build_target_arrays(dataframe: pd.DataFrame) -> Dict[str, np.ndarray]:
         "label_take_profit_pct",
         "label_stop_loss_pct",
         "direction_label",
+        "actual_pnl_pct",
+        "label_qty_ratio"
     )
     missing_columns = [column for column in required_label_columns if column not in dataframe.columns]
     if missing_columns:
@@ -104,6 +106,8 @@ def build_target_arrays(dataframe: pd.DataFrame) -> Dict[str, np.ndarray]:
         "take_profit_pct": dataframe["label_take_profit_pct"].values,
         "stop_loss_pct": dataframe["label_stop_loss_pct"].values,
         "direction": dataframe["direction_label"].values,
+        "actual_pnl_pct": dataframe["actual_pnl_pct"].values,
+        "qty_ratio": dataframe["label_qty_ratio"].values,
     }
 
 
@@ -236,7 +240,13 @@ def train_model(
         f"[info]Model: inputs={input_dim}, parameters={parameter_count:,}, device={device}[/info]"
     )
 
-    loss_fn = RiskAwareLoss().to(device)
+    # Phase 1: Supervised Pre-training (Low Gamma)
+    loss_fn = TradingLoss(
+        alpha=config.training.LOSS_ALPHA, 
+        beta=config.training.LOSS_BETA, 
+        gamma=0.0 # No PnL penalty initially
+    ).to(device)
+    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.training.LEARNING_RATE,
@@ -327,6 +337,8 @@ def train_model(
                                 val_targets["stop_loss_pct"][start:end]
                             ).to(device),
                             "direction": batch_y_dir,
+                            "actual_pnl_pct": torch.FloatTensor(val_targets["actual_pnl_pct"][start:end]).to(device),
+                            "qty_ratio": torch.FloatTensor(val_targets["qty_ratio"][start:end]).to(device),
                         }
                         batch_loss = loss_fn(val_outputs, val_chunk_targets)["total"]
                         val_loss_sum += batch_loss.item()
@@ -345,11 +357,110 @@ def train_model(
                 else:
                     patience_left -= 1
 
-            status = "🚀"
+            status = "Phase 1"
             if patience_left <= 0 and val_features is not None:
                 status = "early-stop"
             metrics_table.add_row(
                 f"{epoch + 1}/{epochs}",
+                f"{average_train_loss:.5f}",
+                f"{val_loss_value:.5f}" if val_features is not None else "—",
+                f"{val_direction_accuracy:.1f}%" if val_features is not None else "—",
+                status,
+            )
+
+            if val_features is not None and patience_left <= 0:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    console.print("\n[highlight]Phase 2: Reinforcement Learning (PnL Penalty)[/highlight]")
+    
+    # Phase 2: RL Fine Tuning
+    loss_fn = TradingLoss(
+        alpha=config.training.LOSS_ALPHA, 
+        beta=config.training.LOSS_BETA, 
+        gamma=config.training.LOSS_GAMMA # Enable PnL penalty
+    ).to(device)
+    
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.training.RL_LEARNING_RATE,
+        weight_decay=config.training.WEIGHT_DECAY,
+    )
+    
+    best_val_loss = float("inf")
+    patience_left = config.training.EARLY_STOP_PATIENCE
+    
+    with Live(metrics_table, console=console, refresh_per_second=4):
+        rl_epochs = config.training.RL_FINE_TUNE_EPOCHS
+        for epoch in range(rl_epochs):
+            model.train()
+            running_loss = 0.0
+            batch_count = 0
+            for batch_features, batch_targets in train_loader:
+                batch_features = batch_features.to(device)
+                batch_targets = {name: tensor.to(device) for name, tensor in batch_targets.items()}
+                optimizer.zero_grad(set_to_none=True)
+                outputs = model(batch_features)
+                loss_dict = loss_fn(outputs, batch_targets)
+                loss = loss_dict["total"]
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                running_loss += loss.item()
+                batch_count += 1
+
+            average_train_loss = running_loss / max(batch_count, 1)
+
+            val_loss_value = float("nan")
+            val_direction_accuracy = float("nan")
+            if val_features is not None and val_targets is not None:
+                model.eval()
+                val_loss_sum = 0.0
+                val_batches = 0
+                correct_direction = 0
+                total_direction = 0
+                with torch.no_grad():
+                    val_tensor = torch.FloatTensor(val_features).to(device)
+                    direction_actual = torch.LongTensor(val_targets["direction"]).to(device)
+                    chunk_size = 2048
+                    for start in range(0, val_tensor.size(0), chunk_size):
+                        end = min(start + chunk_size, val_tensor.size(0))
+                        batch_X = val_tensor[start:end]
+                        batch_y_dir = direction_actual[start:end]
+                        val_outputs = model(batch_X)
+                        val_chunk_targets = {
+                            "upside": torch.FloatTensor(val_targets["upside"][start:end]).to(device),
+                            "downside": torch.FloatTensor(val_targets["downside"][start:end]).to(device),
+                            "future_drawdown": torch.FloatTensor(val_targets["drawdown"][start:end]).to(device),
+                            "take_profit_pct": torch.FloatTensor(val_targets["take_profit_pct"][start:end]).to(device),
+                            "stop_loss_pct": torch.FloatTensor(val_targets["stop_loss_pct"][start:end]).to(device),
+                            "direction": batch_y_dir,
+                            "actual_pnl_pct": torch.FloatTensor(val_targets["actual_pnl_pct"][start:end]).to(device),
+                            "qty_ratio": torch.FloatTensor(val_targets["qty_ratio"][start:end]).to(device),
+                        }
+                        batch_loss = loss_fn(val_outputs, val_chunk_targets)["total"]
+                        val_loss_sum += batch_loss.item()
+                        val_batches += 1
+                        predicted_direction = torch.argmax(val_outputs["direction"], dim=1)
+                        correct_direction += (predicted_direction == batch_y_dir).sum().item()
+                        total_direction += batch_X.size(0)
+                val_loss_value = val_loss_sum / max(val_batches, 1)
+                val_direction_accuracy = (correct_direction / max(total_direction, 1)) * 100.0
+
+                if val_loss_value < best_val_loss - 1e-6:
+                    best_val_loss = val_loss_value
+                    best_state = {name: tensor.cpu().clone() for name, tensor in model.state_dict().items()}
+                    patience_left = config.training.EARLY_STOP_PATIENCE
+                else:
+                    patience_left -= 1
+
+            status = "Phase 2 (RL)"
+            if patience_left <= 0 and val_features is not None:
+                status = "early-stop"
+            metrics_table.add_row(
+                f"RL {epoch + 1}/{rl_epochs}",
                 f"{average_train_loss:.5f}",
                 f"{val_loss_value:.5f}" if val_features is not None else "—",
                 f"{val_direction_accuracy:.1f}%" if val_features is not None else "—",
@@ -376,22 +487,27 @@ def run_inference_with_confidence_filter(
     input_tensor = torch.FloatTensor(feature_windows).to(device)
     with torch.no_grad():
         raw_outputs = model(input_tensor)
+    
     direction_probabilities = torch.softmax(raw_outputs["direction"], dim=1)
     verdict_indices = torch.argmax(direction_probabilities, dim=1).cpu().numpy()
-    predicted_upside = raw_outputs["upside"].cpu().numpy().reshape(-1)
-    predicted_downside = raw_outputs["downside"].cpu().numpy().reshape(-1)
-    confidence_scores = raw_outputs["confidence"].cpu().numpy().reshape(-1)
-    take_profit_pct = raw_outputs["take_profit_pct"].cpu().numpy().reshape(-1)
-    stop_loss_pct = raw_outputs["stop_loss_pct"].cpu().numpy().reshape(-1)
+    
+    # Sigmoid sizing output decoding
+    sizing = raw_outputs["sizing"].cpu().numpy()
+    qty_ratios = sizing[:, 0]
+    take_profit_pct = sizing[:, 1] * config.strategy.LABEL_TP_PCT_MAX
+    stop_loss_pct = sizing[:, 2] * config.strategy.LABEL_SL_PCT_MAX
+    
     buy_probability = direction_probabilities[:, 0].cpu().numpy()
     neutral_probability = direction_probabilities[:, 1].cpu().numpy()
     sell_probability = direction_probabilities[:, 2].cpu().numpy()
+    
+    # Re-calculate confidence based on max probability (since confidence_head was removed)
+    confidence_scores = np.max(direction_probabilities.cpu().numpy(), axis=1)
 
     result_frame = pd.DataFrame(
         {
-            "ai_upside": predicted_upside,
-            "ai_downside": predicted_downside,
             "ai_confidence": confidence_scores,
+            "ai_qty_ratio": qty_ratios,
             "ai_verdict": verdict_indices,
             "ai_take_profit_pct": take_profit_pct,
             "ai_stop_loss_pct": stop_loss_pct,
@@ -407,14 +523,22 @@ def run_inference_with_confidence_filter(
         f"[info]Raw direction signals: Buy={raw_buy_signals}, Sell={raw_sell_signals}[/info]"
     )
 
+    # FRD Risk Rules
     confidence_floor = config.strategy.AI_CONFIDENCE_THRESHOLD
     low_confidence_mask = result_frame["ai_confidence"] < confidence_floor
-    suppressed = int((low_confidence_mask & (result_frame["ai_verdict"] != 1)).sum())
-    if suppressed > 0:
-        console.print(
-            f"[warning]Confidence filter: forced neutral on {suppressed} low-confidence rows (< {confidence_floor})[/warning]"
-        )
+    suppressed_conf = int((low_confidence_mask & (result_frame["ai_verdict"] != 1)).sum())
+    if suppressed_conf > 0:
+        console.print(f"[warning]Risk Rule 1: forced neutral on {suppressed_conf} low-confidence rows (< {confidence_floor})[/warning]")
     result_frame.loc[low_confidence_mask, "ai_verdict"] = 1
+    
+    # R:R Rule >= 1.5
+    rr_ratios = result_frame["ai_take_profit_pct"] / (result_frame["ai_stop_loss_pct"] + 1e-6)
+    poor_rr_mask = rr_ratios < 1.5
+    suppressed_rr = int((poor_rr_mask & (result_frame["ai_verdict"] != 1)).sum())
+    if suppressed_rr > 0:
+        console.print(f"[warning]Risk Rule 2: forced neutral on {suppressed_rr} poor R:R rows (< 1.5)[/warning]")
+    result_frame.loc[poor_rr_mask, "ai_verdict"] = 1
+
     return result_frame
 
 
@@ -433,16 +557,26 @@ def predict_model_outputs_for_single_window(
         outputs = model(batch)
     direction_probabilities = torch.softmax(outputs["direction"], dim=1)[0]
     verdict_index = int(torch.argmax(direction_probabilities).item())
+    
+    sizing = outputs["sizing"][0]
+    qty_ratio = float(sizing[0].item())
+    tp_pct = float(sizing[1].item() * config.strategy.LABEL_TP_PCT_MAX)
+    sl_pct = float(sizing[2].item() * config.strategy.LABEL_SL_PCT_MAX)
+    
+    confidence = float(torch.max(direction_probabilities).item())
+    
+    # Apply rules
+    if confidence < config.strategy.AI_CONFIDENCE_THRESHOLD or (tp_pct / (sl_pct + 1e-6)) < 1.5:
+        verdict_index = 1
+    
     return {
         "direction_verdict_code": verdict_index,
         "direction_verdict_label": verdict_names[verdict_index],
         "prob_buy": float(direction_probabilities[0].item()),
         "prob_neutral": float(direction_probabilities[1].item()),
         "prob_sell": float(direction_probabilities[2].item()),
-        "confidence": float(outputs["confidence"][0, 0].item()),
-        "regression_upside_pct": float(outputs["upside"][0, 0].item()),
-        "regression_downside_pct": float(outputs["downside"][0, 0].item()),
-        "risk_score": float(outputs["risk"][0, 0].item()),
-        "take_profit_pct": float(outputs["take_profit_pct"][0, 0].item()),
-        "stop_loss_pct": float(outputs["stop_loss_pct"][0, 0].item()),
+        "confidence": confidence,
+        "qty_ratio": qty_ratio,
+        "take_profit_pct": tp_pct,
+        "stop_loss_pct": sl_pct,
     }

@@ -13,8 +13,10 @@ def fetch_data(symbol: str = "ADAUSD", total_days: int = 100, interval: str = "1
     Otherwise, fetch from API, save to CSV, and return.
     """
 
-    # Define cache filename
-    filename = f"data_{symbol}_{interval}.csv"
+    # Define cache filename and directory
+    data_dir = "data"
+    os.makedirs(data_dir, exist_ok=True)
+    filename = os.path.join(data_dir, f"data_{symbol}_{interval}.csv")
 
     # Check if CSV exists and is fresh (less than 15 mins old)
     if os.path.exists(filename):
