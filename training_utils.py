@@ -66,15 +66,25 @@ def create_sequences(
 def get_feature_cols(dataframe: pd.DataFrame) -> List[str]:
     """Columns safe to use as inputs (excludes targets and forward-looking label helpers)."""
     excluded_targets = {
+        # Forward-looking features (future data — never use as model inputs)
         "upside_pct",
         "downside_pct",
         "future_drawdown_pct",
         "reward_risk_ratio",
         "edge_ratio",
         "pain_ratio",
+        # Oracle label-only columns (derived from future price — leakage if included)
+        "oracle_tp_pct",
+        "oracle_sl_pct",
+        "oracle_rr_ratio",
+        "oracle_capacity_score",
+        # Training targets (labels — never use as model inputs)
         "direction_label",
         "label_take_profit_pct",
         "label_stop_loss_pct",
+        "actual_pnl_pct",
+        "label_qty_ratio",
+        # Index / meta columns
         "time",
         "label",
         "index",

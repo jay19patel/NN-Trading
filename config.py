@@ -54,13 +54,30 @@ class StrategyConfig:
     AI_CONFIDENCE_THRESHOLD: float = 0.3
 
     # ATR-scaled dynamic TP/SL for labels, regression targets, and path simulation
-    USE_DYNAMIC_TP_SL_LABELS: bool = True
+    USE_DYNAMIC_TP_SL_LABELS: bool = False  # Disabled when USE_ORACLE_LABELS=True
     TP_ATR_MULTIPLIER: float = 1.25
     SL_ATR_MULTIPLIER: float = 0.65
     LABEL_TP_PCT_MIN: float = 0.25
     LABEL_TP_PCT_MAX: float = 12.0
     LABEL_SL_PCT_MIN: float = 0.15
     LABEL_SL_PCT_MAX: float = 6.0
+
+    # -----------------------------------------------------------------------
+    # Oracle Labeling — uses ACTUAL future price data from historical backtest
+    # Har candle ke aage N bars ka actual max high aur min low dekh ke
+    # TP = 70% of max possible move, SL = 50% of adverse move
+    # Yeh labels ATR se zyada accurate hain kyunki real price data use hota hai
+    # -----------------------------------------------------------------------
+    USE_ORACLE_LABELS: bool = True           # Master switch for oracle mode
+    ORACLE_TP_CAPTURE_RATIO: float = 0.70   # 70% of future max high used as TP target
+    ORACLE_SL_CAPTURE_RATIO: float = 0.50   # 50% of future min low used as SL
+    ORACLE_MIN_TP_PCT: float = 0.30         # Noise filter: ignore tiny moves as TP
+    ORACLE_MAX_TP_PCT: float = 12.0         # Cap TP to prevent outlier labels
+    ORACLE_MIN_SL_PCT: float = 0.20         # Minimum SL (very tight stops excluded)
+    ORACLE_MAX_SL_PCT: float = 6.0          # Cap SL
+    ORACLE_MIN_RR: float = 1.5             # Minimum Reward:Risk to assign a signal label
+    ORACLE_MIN_UPSIDE_PCT: float = 0.50    # Market must have at least 0.5% upside for LONG
+    ORACLE_MIN_DOWNSIDE_PCT: float = 0.50  # Market must have at least 0.5% downside for SHORT
 
     INITIAL_CAPITAL_USD: float = 1000.0
     RISK_PER_TRADE_PCT_OF_EQUITY: float = 1.0

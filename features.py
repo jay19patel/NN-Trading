@@ -255,6 +255,142 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features['vol_atr_ratio'] = (df['volume_ratio'] if 'volume_ratio' in df else 1.0) / (df['ATR_pct'] + 0.0001)
     return pd.concat([df, new_features], axis=1)
 
+def add_oracle_target_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Oracle Labeling Engine — uses ACTUAL future price data to derive per-bar TP and SL.
+
+    Strategy (as approved):
+      - Look N bars ahead (done already in add_risk_reward_features)
+      - upside_pct  = (future_max_high - close) / close * 100
+      - downside_pct = (future_min_low  - close) / close * 100  [negative number]
+
+      - LONG  TP = upside_pct    * ORACLE_TP_CAPTURE_RATIO  (e.g. 70% of max high)
+      - LONG  SL = abs_down_pct  * ORACLE_SL_CAPTURE_RATIO  (e.g. 50% of min low)
+      - SHORT TP = abs_down_pct  * ORACLE_TP_CAPTURE_RATIO
+      - SHORT SL = upside_pct    * ORACLE_SL_CAPTURE_RATIO
+
+      Direction:
+        LONG  if upside > abs_downside AND long_rr  >= ORACLE_MIN_RR AND upside >= MIN_UPSIDE
+        SHORT if abs_down > upside     AND short_rr >= ORACLE_MIN_RR AND abs_down >= MIN_DOWN
+        NEUTRAL otherwise
+
+    Requires: upside_pct, downside_pct columns (from add_risk_reward_features).
+    NOTE: These columns are excluded from model inputs to prevent data leakage.
+    """
+    if "upside_pct" not in df.columns or "downside_pct" not in df.columns:
+        raise ValueError(
+            "Oracle labeling requires 'upside_pct' and 'downside_pct'. "
+            "Run add_risk_reward_features() first."
+        )
+
+    strategy = config.strategy
+    row_count = len(df)
+
+    upside_pct   = df["upside_pct"].values.astype(np.float64)   # positive: max future high %
+    downside_pct = df["downside_pct"].values.astype(np.float64)  # negative: min future low %
+    abs_down_pct = np.abs(downside_pct)
+
+    # ------------------------------------------------------------------
+    # LONG oracle levels
+    # ------------------------------------------------------------------
+    oracle_tp_long = np.clip(
+        upside_pct * strategy.ORACLE_TP_CAPTURE_RATIO,
+        strategy.ORACLE_MIN_TP_PCT,
+        strategy.ORACLE_MAX_TP_PCT,
+    )
+    oracle_sl_long = np.clip(
+        abs_down_pct * strategy.ORACLE_SL_CAPTURE_RATIO,
+        strategy.ORACLE_MIN_SL_PCT,
+        strategy.ORACLE_MAX_SL_PCT,
+    )
+    oracle_rr_long = oracle_tp_long / (oracle_sl_long + 1e-6)
+
+    # ------------------------------------------------------------------
+    # SHORT oracle levels (symmetric: profit from falling, risk from rising)
+    # ------------------------------------------------------------------
+    oracle_tp_short = np.clip(
+        abs_down_pct * strategy.ORACLE_TP_CAPTURE_RATIO,
+        strategy.ORACLE_MIN_TP_PCT,
+        strategy.ORACLE_MAX_TP_PCT,
+    )
+    oracle_sl_short = np.clip(
+        upside_pct * strategy.ORACLE_SL_CAPTURE_RATIO,
+        strategy.ORACLE_MIN_SL_PCT,
+        strategy.ORACLE_MAX_SL_PCT,
+    )
+    oracle_rr_short = oracle_tp_short / (oracle_sl_short + 1e-6)
+
+    # ------------------------------------------------------------------
+    # Direction labeling
+    # LONG  wins when upside capacity is greater
+    # SHORT wins when downside capacity is greater
+    # Both need their R:R to be >= ORACLE_MIN_RR
+    # ------------------------------------------------------------------
+    long_mask = (
+        (upside_pct >= strategy.ORACLE_MIN_UPSIDE_PCT)
+        & (oracle_rr_long >= strategy.ORACLE_MIN_RR)
+        & (upside_pct > abs_down_pct)
+    )
+    short_mask = (
+        (abs_down_pct >= strategy.ORACLE_MIN_DOWNSIDE_PCT)
+        & (oracle_rr_short >= strategy.ORACLE_MIN_RR)
+        & (abs_down_pct > upside_pct)
+        & ~long_mask  # Prevent double-labeling
+    )
+
+    labels = np.ones(row_count, dtype=np.float64)       # 1 = NEUTRAL (default)
+    labels[long_mask]  = 0.0                            # 0 = LONG
+    labels[short_mask] = 2.0                            # 2 = SHORT
+
+    # Set per-row TP/SL from the winning direction
+    label_tp_pct = np.where(labels == 0, oracle_tp_long,
+                   np.where(labels == 2, oracle_tp_short,
+                            strategy.ORACLE_MIN_TP_PCT))
+    label_sl_pct = np.where(labels == 0, oracle_sl_long,
+                   np.where(labels == 2, oracle_sl_short,
+                            strategy.ORACLE_MIN_SL_PCT))
+
+    # Actual PnL stored for the RL loss (positive = profitable outcome)
+    actual_pnl_pct_arr = np.zeros(row_count, dtype=np.float64)
+    actual_pnl_pct_arr[labels == 0] =  oracle_tp_long[labels == 0]
+    actual_pnl_pct_arr[labels == 2] =  oracle_tp_short[labels == 2]
+
+    # ------------------------------------------------------------------
+    # Capacity score — how much "room" exists in the winning direction
+    # Normalized 0-1; model uses this to learn position sizing
+    # ------------------------------------------------------------------
+    best_capacity = np.where(labels == 0, upside_pct,
+                    np.where(labels == 2, abs_down_pct, 0.0))
+    oracle_capacity_score = np.clip(best_capacity / strategy.ORACLE_MAX_TP_PCT, 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # qty_ratio — composite sizing signal for the sizing_head target
+    # Higher R:R + bigger capacity = larger sizing confidence
+    # ------------------------------------------------------------------
+    winning_rr = np.where(labels == 0, oracle_rr_long,
+                 np.where(labels == 2, oracle_rr_short, 1.0))
+    rr_bonus       = np.clip((winning_rr - strategy.ORACLE_MIN_RR) * 0.10, 0.0, 0.30)
+    capacity_bonus = np.clip(oracle_capacity_score * 0.20, 0.0, 0.20)
+    qty_ratio_arr  = np.clip(0.50 + rr_bonus + capacity_bonus, 0.10, 1.0)
+    qty_ratio_arr[labels == 1] = 0.30   # Neutral signals: minimal sizing
+
+    # ------------------------------------------------------------------
+    # Write outputs
+    # oracle_* columns are label-only; excluded from model inputs (get_feature_cols)
+    # label_* columns feed build_target_arrays() for training targets
+    # ------------------------------------------------------------------
+    df["oracle_tp_pct"]        = label_tp_pct
+    df["oracle_sl_pct"]        = label_sl_pct
+    df["oracle_rr_ratio"]      = winning_rr
+    df["oracle_capacity_score"] = oracle_capacity_score
+    df["label_take_profit_pct"] = label_tp_pct
+    df["label_stop_loss_pct"]   = label_sl_pct
+    df["direction_label"]       = labels
+    df["actual_pnl_pct"]        = actual_pnl_pct_arr
+    df["label_qty_ratio"]       = qty_ratio_arr
+    return df
+
+
 def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
     """
     First-hit direction labels plus per-bar TP/SL percentages used for those paths.
@@ -372,7 +508,9 @@ def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFra
         ("Microstructure", add_microstructure_features),
         ("Risk-Reward Profile", lambda d: add_risk_reward_features(d, lookahead)),
         ("Interactions", add_interaction_features),
-        ("Target Labeling", add_target_labels)
+        # Route to Oracle labeler if enabled; falls back to ATR-based labeler
+        ("Oracle Target Labels" if config.strategy.USE_ORACLE_LABELS else "ATR Target Labels",
+         add_oracle_target_labels if config.strategy.USE_ORACLE_LABELS else add_target_labels),
     ]
     
     with get_progress() as progress:

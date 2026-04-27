@@ -154,9 +154,14 @@ def main() -> None:
             if cache_age_minutes < config.data.CACHE_VALID_MINS:
                 console.print(f"  Using cache for {symbol}")
                 features_frame = pd.read_csv(cache_name, index_col=0, parse_dates=True)
-                if "label_take_profit_pct" not in features_frame.columns:
+
+                # Invalidate if oracle columns missing (stale ATR-based cache)
+                oracle_cols_missing = "oracle_tp_pct" not in features_frame.columns
+                label_cols_missing  = "label_take_profit_pct" not in features_frame.columns
+                if oracle_cols_missing or label_cols_missing:
+                    reason = "oracle labels" if oracle_cols_missing else "dynamic TP/SL labels"
                     console.print(
-                        f"  [warning]Cache missing dynamic TP/SL labels; rebuilding {symbol}...[/warning]"
+                        f"  [warning]Cache missing {reason}; rebuilding {symbol}...[/warning]"
                     )
                     features_frame = create_full_feature_set(market_frame, lookahead=lookahead)
                     features_frame.to_csv(cache_name)
