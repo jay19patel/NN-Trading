@@ -3,13 +3,21 @@ import time
 import os
 import warnings
 
+import numpy as np
 import pandas as pd
 
 from config import config
 from data_gathering import fetch_data
 from features import create_full_feature_set
+from paper_trading import (
+    describe_last_candle_and_model_outputs,
+    run_paper_portfolio_on_signals,
+)
 from training_utils import (
+    build_target_arrays,
+    create_sequences,
     prepare_multi_symbol_data,
+    predict_model_outputs_for_single_window,
     train_model,
     run_inference_with_confidence_filter,
 )
@@ -23,60 +31,94 @@ def _bars_per_15m_day() -> int:
     return (24 * 60) // 15
 
 
-def evaluate_ai_verdicts(
-    dataframe: pd.DataFrame, target_pct: float, stop_pct: float, lookahead_bars: int
-) -> pd.DataFrame:
-    """Label each signal row as SUCCESS / FAILED / TIMEOUT for TP vs SL path (next `lookahead_bars` bars)."""
+def evaluate_ai_verdicts(dataframe: pd.DataFrame, lookahead_bars: int) -> pd.DataFrame:
+    """
+    Path simulation using model-predicted TP%/SL% per row (fallback to fixed strategy % if missing).
+
+    Same-bar touch: stop is assumed first (conservative). Populates ai_return_fraction for PnL math.
+    """
     dataframe = dataframe.copy()
+    if "ai_take_profit_pct" not in dataframe.columns:
+        dataframe["ai_take_profit_pct"] = config.strategy.TARGET_PROFIT_PCT
+    if "ai_stop_loss_pct" not in dataframe.columns:
+        dataframe["ai_stop_loss_pct"] = config.strategy.STOP_LOSS_PCT
+
     dataframe["ai_outcome"] = "NONE"
+    dataframe["ai_return_fraction"] = 0.0
 
     close_prices = dataframe["Close"].values
     high_prices = dataframe["High"].values
     low_prices = dataframe["Low"].values
     verdict_values = dataframe["ai_verdict"].values
+    target_pct_per_row = dataframe["ai_take_profit_pct"].values.astype(np.float64)
+    stop_pct_per_row = dataframe["ai_stop_loss_pct"].values.astype(np.float64)
 
     row_count = len(dataframe)
     outcomes = ["NONE"] * row_count
+    return_fractions = [0.0] * row_count
 
     for row_index in range(row_count - lookahead_bars):
-        if verdict_values[row_index] == 1:
+        verdict = verdict_values[row_index]
+        if verdict == 1:
             continue
 
         entry_price = close_prices[row_index]
-        take_profit = (
-            entry_price * (1 + target_pct / 100)
-            if verdict_values[row_index] == 0
-            else entry_price * (1 - target_pct / 100)
-        )
-        stop_level = (
-            entry_price * (1 - stop_pct / 100)
-            if verdict_values[row_index] == 0
-            else entry_price * (1 + stop_pct / 100)
-        )
+        target_pct = float(target_pct_per_row[row_index])
+        stop_pct = float(stop_pct_per_row[row_index])
 
         path_outcome = "TIMEOUT"
-        for step in range(1, lookahead_bars + 1):
-            bar_high = high_prices[row_index + step]
-            bar_low = low_prices[row_index + step]
-
-            if verdict_values[row_index] == 0:
-                if bar_low <= stop_level:
+        if verdict == 0:
+            take_profit_price = entry_price * (1 + target_pct / 100)
+            stop_loss_price = entry_price * (1 - stop_pct / 100)
+            for step in range(1, lookahead_bars + 1):
+                bar_high = high_prices[row_index + step]
+                bar_low = low_prices[row_index + step]
+                hit_stop = bar_low <= stop_loss_price
+                hit_target = bar_high >= take_profit_price
+                if hit_stop and hit_target:
                     path_outcome = "FAILED"
                     break
-                if bar_high >= take_profit:
-                    path_outcome = "SUCCESS"
-                    break
-            elif verdict_values[row_index] == 2:
-                if bar_high >= stop_level:
+                if hit_stop:
                     path_outcome = "FAILED"
                     break
-                if bar_low <= take_profit:
+                if hit_target:
                     path_outcome = "SUCCESS"
                     break
+        elif verdict == 2:
+            take_profit_price = entry_price * (1 - target_pct / 100)
+            stop_loss_price = entry_price * (1 + stop_pct / 100)
+            for step in range(1, lookahead_bars + 1):
+                bar_high = high_prices[row_index + step]
+                bar_low = low_prices[row_index + step]
+                hit_stop = bar_high >= stop_loss_price
+                hit_target = bar_low <= take_profit_price
+                if hit_stop and hit_target:
+                    path_outcome = "FAILED"
+                    break
+                if hit_stop:
+                    path_outcome = "FAILED"
+                    break
+                if hit_target:
+                    path_outcome = "SUCCESS"
+                    break
+        else:
+            continue
 
         outcomes[row_index] = path_outcome
+        exit_close = close_prices[row_index + lookahead_bars]
+        if path_outcome == "SUCCESS":
+            return_fraction = target_pct / 100.0
+        elif path_outcome == "FAILED":
+            return_fraction = -stop_pct / 100.0
+        elif verdict == 0:
+            return_fraction = (exit_close - entry_price) / entry_price
+        else:
+            return_fraction = (entry_price - exit_close) / entry_price
+
+        return_fractions[row_index] = return_fraction
 
     dataframe["ai_outcome"] = outcomes
+    dataframe["ai_return_fraction"] = return_fractions
     return dataframe
 
 
@@ -107,6 +149,12 @@ def main() -> None:
             if cache_age_minutes < config.data.CACHE_VALID_MINS:
                 console.print(f"  Using cache for {symbol}")
                 features_frame = pd.read_csv(cache_name, index_col=0, parse_dates=True)
+                if "label_take_profit_pct" not in features_frame.columns:
+                    console.print(
+                        f"  [warning]Cache missing dynamic TP/SL labels; rebuilding {symbol}...[/warning]"
+                    )
+                    features_frame = create_full_feature_set(market_frame, lookahead=lookahead)
+                    features_frame.to_csv(cache_name)
             else:
                 console.print(f"  Rebuilding features for {symbol}...")
                 features_frame = create_full_feature_set(market_frame, lookahead=lookahead)
@@ -129,7 +177,7 @@ def main() -> None:
         test_X,
         test_y,
         feature_names,
-        _,
+        feature_scaler,
     ) = prepare_multi_symbol_data(
         symbol_frames,
         test_days=config.training.TEST_DAYS,
@@ -179,6 +227,7 @@ def main() -> None:
     summary_table.add_column("Signals", justify="right")
     summary_table.add_column("Win rate (TP first)", justify="right")
     summary_table.add_column("W / L", justify="right")
+    summary_table.add_column("Paper $", justify="right")
 
     sequence_offset = 0
     for symbol in symbols:
@@ -193,12 +242,20 @@ def main() -> None:
 
         symbol_panel["ai_verdict"] = symbol_predictions["ai_verdict"].values
         symbol_panel["ai_confidence"] = symbol_predictions["ai_confidence"].values
+        symbol_panel["ai_take_profit_pct"] = symbol_predictions["ai_take_profit_pct"].values
+        symbol_panel["ai_stop_loss_pct"] = symbol_predictions["ai_stop_loss_pct"].values
 
         symbol_panel = evaluate_ai_verdicts(
             symbol_panel,
-            target_pct=config.strategy.TARGET_PROFIT_PCT,
-            stop_pct=config.strategy.STOP_LOSS_PCT,
             lookahead_bars=config.features.LOOKAHEAD_BARS,
+        )
+
+        _, _, paper_summary = run_paper_portfolio_on_signals(
+            symbol_panel,
+            initial_capital_usd=config.strategy.INITIAL_CAPITAL_USD,
+            risk_per_trade_pct_of_equity=config.strategy.RISK_PER_TRADE_PCT_OF_EQUITY,
+            max_notional_pct_of_equity=config.strategy.MAX_POSITION_NOTIONAL_PCT_OF_EQUITY,
+            round_trip_fee_pct=config.strategy.ROUND_TRIP_FEE_PCT,
         )
 
         buy_rows = symbol_panel[symbol_panel["ai_verdict"] == 0]
@@ -214,6 +271,7 @@ def main() -> None:
             str(len(signal_rows)),
             f"{win_rate:.1f}%",
             f"{wins} / {losses}",
+            f"{paper_summary['final_equity_usd']:.2f}",
         )
 
         detail_table = Table(
@@ -234,14 +292,64 @@ def main() -> None:
         detail_table.add_row("Signals", str(len(buy_rows)), str(len(sell_rows)), str(len(signal_rows)))
         detail_table.add_row("Wins", str(buy_wins), str(sell_wins), str(wins))
         detail_table.add_row("Losses", str(buy_losses), str(sell_losses), str(losses))
+        detail_table.add_row(
+            "Paper final $",
+            "—",
+            "—",
+            f"{paper_summary['final_equity_usd']:.2f}",
+        )
+        detail_table.add_row(
+            "Loss→next win",
+            "—",
+            "—",
+            str(paper_summary.get("loss_then_win_count", 0)),
+        )
         console.print(detail_table)
+        console.print(
+            f"[info]{symbol} paper book: trades={paper_summary['trade_count']} | "
+            f"fees≈${paper_summary.get('total_fees_usd', 0):.2f} | "
+            f"net PnL≈${paper_summary.get('total_pnl_net_usd', 0):.2f}[/info]"
+        )
         console.print("")
 
     console.print(summary_table)
     console.print(
-        f"\n[info]TP={config.strategy.TARGET_PROFIT_PCT}% | SL={config.strategy.STOP_LOSS_PCT}% "
-        f"| lookahead={config.features.LOOKAHEAD_BARS} bars[/info]\n"
+        f"\n[info]Path test uses model TP/SL % per bar | lookahead={config.features.LOOKAHEAD_BARS} bars | "
+        f"paper start=${config.strategy.INITIAL_CAPITAL_USD:.0f} "
+        f"(risk {config.strategy.RISK_PER_TRADE_PCT_OF_EQUITY}% equity / trade)[/info]"
     )
+
+    demo_symbol = next((symbol for symbol in symbols if symbol in symbol_frames), None)
+    if demo_symbol is not None:
+        test_row_count = config.training.TEST_DAYS * bars_per_day
+        cleaned_tail = (
+            symbol_frames[demo_symbol]
+            .iloc[-test_row_count:]
+            .copy()
+            .replace([np.inf, -np.inf], np.nan)
+            .ffill()
+            .bfill()
+            .fillna(0)
+        )
+        scaled_matrix = feature_scaler.transform(cleaned_tail[feature_names])
+        tail_targets = build_target_arrays(cleaned_tail)
+        demo_windows, _ = create_sequences(
+            scaled_matrix, tail_targets, sequence_length=config.model.SEQ_LEN
+        )
+        last_feature_window = demo_windows[-1]
+        last_candle_row = cleaned_tail.iloc[-1]
+        model_output_map = predict_model_outputs_for_single_window(
+            trained_model, last_feature_window, device
+        )
+        console.print("\n[highlight]Production-style preview (last test candle)[/highlight]")
+        console.print(
+            describe_last_candle_and_model_outputs(last_candle_row, model_output_map)
+        )
+        console.print(
+            "\n[info]Online 'learn from last mistake' is not applied inside one training run; "
+            "the model learns average TP/SL from labels. Use periodic retraining or a "
+            "separate calibration layer for live adaptation.[/info]\n"
+        )
 
 
 if __name__ == "__main__":

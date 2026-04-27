@@ -10,6 +10,7 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 from config import config
 
@@ -80,6 +81,8 @@ class MultiHeadTradingModel(nn.Module):
         self.downside_head = nn.Linear(hidden_dim, 1)
         self.risk_head = nn.Linear(hidden_dim, 1)
         self.direction_head = nn.Linear(hidden_dim, 3)
+        self.take_profit_pct_head = nn.Linear(hidden_dim, 1)
+        self.stop_loss_pct_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, window_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         # window_features: [batch, seq_len, features]
@@ -97,12 +100,27 @@ class MultiHeadTradingModel(nn.Module):
         encoded_sequence = self.encoder(encoded_positions, mask=causal_mask)
         last_step = encoded_sequence[:, -1, :]
         shared = self.shared_layer(last_step)
+        take_profit_positive = functional.softplus(self.take_profit_pct_head(shared)) + 0.05
+        stop_loss_positive = functional.softplus(self.stop_loss_pct_head(shared)) + 0.05
+        strategy = config.strategy
+        take_profit_pct = torch.clamp(
+            take_profit_positive,
+            min=strategy.LABEL_TP_PCT_MIN,
+            max=strategy.LABEL_TP_PCT_MAX,
+        )
+        stop_loss_pct = torch.clamp(
+            stop_loss_positive,
+            min=strategy.LABEL_SL_PCT_MIN,
+            max=strategy.LABEL_SL_PCT_MAX,
+        )
         return {
             "confidence": torch.sigmoid(self.confidence_head(shared)),
             "upside": self.upside_head(shared),
             "downside": self.downside_head(shared),
             "risk": torch.sigmoid(self.risk_head(shared)),
             "direction": self.direction_head(shared),
+            "take_profit_pct": take_profit_pct,
+            "stop_loss_pct": stop_loss_pct,
         }
 
 
@@ -121,6 +139,8 @@ class RiskAwareLoss(nn.Module):
         downside_weight: float = 1.5,
         risk_weight: float = 0.5,
         direction_weight: float = 1.0,
+        take_profit_weight: float = 1.0,
+        stop_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.confidence_weight = confidence_weight
@@ -128,6 +148,8 @@ class RiskAwareLoss(nn.Module):
         self.downside_weight = downside_weight
         self.risk_weight = risk_weight
         self.direction_weight = direction_weight
+        self.take_profit_weight = take_profit_weight
+        self.stop_loss_weight = stop_loss_weight
         self.regression_loss = nn.SmoothL1Loss(reduction="mean")
         self.confidence_loss = nn.MSELoss(reduction="mean")
         self.direction_loss_fn = nn.CrossEntropyLoss()
@@ -156,12 +178,23 @@ class RiskAwareLoss(nn.Module):
         risk_target = torch.clamp(torch.abs(targets["future_drawdown"]) / 20.0, 0.0, 1.0)
         risk_term = self.regression_loss(predictions["risk"].squeeze(-1), risk_target)
 
+        take_profit_targets = targets["take_profit_pct"]
+        stop_loss_targets = targets["stop_loss_pct"]
+        take_profit_term = self.regression_loss(
+            predictions["take_profit_pct"].squeeze(-1), take_profit_targets
+        )
+        stop_loss_term = self.regression_loss(
+            predictions["stop_loss_pct"].squeeze(-1), stop_loss_targets
+        )
+
         total_loss = (
             self.confidence_weight * confidence_term
             + self.upside_weight * upside_term
             + self.downside_weight * downside_term
             + self.risk_weight * risk_term
             + self.direction_weight * direction_term
+            + self.take_profit_weight * take_profit_term
+            + self.stop_loss_weight * stop_loss_term
         )
         return {
             "total": total_loss,
@@ -170,4 +203,6 @@ class RiskAwareLoss(nn.Module):
             "downside": downside_term,
             "risk": risk_term,
             "direction": direction_term,
+            "take_profit_pct": take_profit_term,
+            "stop_loss_pct": stop_loss_term,
         }

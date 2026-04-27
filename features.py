@@ -257,48 +257,75 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
     """
-    Add classification labels using 'First-Hit' logic.
-    Label 0 (BUY): Hits Target BEFORE Stop Loss
-    Label 2 (SELL): Hits -Target BEFORE +Stop Loss
-    Label 1 (NEUTRAL): No target hit or Stop Loss hit first
+    First-hit direction labels plus per-bar TP/SL percentages used for those paths.
+
+    When USE_DYNAMIC_TP_SL_LABELS is True, TP% and SL% scale with ATR% (volatility-aware).
+    Regression targets label_take_profit_pct / label_stop_loss_pct match the same levels.
     """
-    target = config.strategy.TARGET_PROFIT_PCT
-    stop = config.strategy.STOP_LOSS_PCT
-    
-    df['direction_label'] = 1  # Default to Neutral
-    
-    # We need to look ahead for each row
-    close_prices = df['Close'].values
-    high_prices = df['High'].values
-    low_prices = df['Low'].values
-    
-    labels = np.ones(len(df))
-    
-    for i in range(len(df) - lookahead):
-        entry_price = close_prices[i]
-        tp_price = entry_price * (1 + target / 100)
-        sl_price = entry_price * (1 - stop / 100)
-        
-        # Bullish Check
-        for j in range(1, lookahead + 1):
-            if low_prices[i + j] <= sl_price:
-                break # Hit SL first, neutral
-            if high_prices[i + j] >= tp_price:
-                labels[i] = 0 # Hit TP first
+    strategy = config.strategy
+    row_count = len(df)
+    close_prices = df["Close"].values
+    high_prices = df["High"].values
+    low_prices = df["Low"].values
+
+    if strategy.USE_DYNAMIC_TP_SL_LABELS and "ATR_pct" in df.columns:
+        atr_pct = df["ATR_pct"].values.astype(np.float64)
+        take_profit_pct_per_row = np.clip(
+            strategy.TP_ATR_MULTIPLIER * atr_pct,
+            strategy.LABEL_TP_PCT_MIN,
+            strategy.LABEL_TP_PCT_MAX,
+        )
+        stop_loss_pct_per_row = np.clip(
+            strategy.SL_ATR_MULTIPLIER * atr_pct,
+            strategy.LABEL_SL_PCT_MIN,
+            strategy.LABEL_SL_PCT_MAX,
+        )
+    else:
+        take_profit_pct_per_row = np.full(row_count, strategy.TARGET_PROFIT_PCT, dtype=np.float64)
+        stop_loss_pct_per_row = np.full(row_count, strategy.STOP_LOSS_PCT, dtype=np.float64)
+
+    labels = np.ones(row_count)
+
+    for row_index in range(row_count - lookahead):
+        entry_price = close_prices[row_index]
+        take_profit_pct = float(take_profit_pct_per_row[row_index])
+        stop_loss_pct = float(stop_loss_pct_per_row[row_index])
+
+        take_profit_price_long = entry_price * (1 + take_profit_pct / 100)
+        stop_loss_price_long = entry_price * (1 - stop_loss_pct / 100)
+
+        for step_index in range(1, lookahead + 1):
+            bar_low = low_prices[row_index + step_index]
+            bar_high = high_prices[row_index + step_index]
+            hit_stop_first = bar_low <= stop_loss_price_long
+            hit_target_first = bar_high >= take_profit_price_long
+            if hit_stop_first and hit_target_first:
                 break
-                
-        # Bearish Check (only if not already labelled as Buy)
-        if labels[i] == 1:
-            tp_sell = entry_price * (1 - target / 100)
-            sl_sell = entry_price * (1 + stop / 100)
-            for j in range(1, lookahead + 1):
-                if high_prices[i + j] >= sl_sell:
-                    break # Hit SL first
-                if low_prices[i + j] <= tp_sell:
-                    labels[i] = 2 # Hit TP first
+            if hit_stop_first:
+                break
+            if hit_target_first:
+                labels[row_index] = 0
+                break
+
+        if labels[row_index] == 1:
+            take_profit_price_short = entry_price * (1 - take_profit_pct / 100)
+            stop_loss_price_short = entry_price * (1 + stop_loss_pct / 100)
+            for step_index in range(1, lookahead + 1):
+                bar_low = low_prices[row_index + step_index]
+                bar_high = high_prices[row_index + step_index]
+                hit_stop_first = bar_high >= stop_loss_price_short
+                hit_target_first = bar_low <= take_profit_price_short
+                if hit_stop_first and hit_target_first:
                     break
-                    
-    df['direction_label'] = labels
+                if hit_stop_first:
+                    break
+                if hit_target_first:
+                    labels[row_index] = 2
+                    break
+
+    df["label_take_profit_pct"] = take_profit_pct_per_row
+    df["label_stop_loss_pct"] = stop_loss_pct_per_row
+    df["direction_label"] = labels
     return df
 
 def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFrame:

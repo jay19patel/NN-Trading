@@ -21,21 +21,23 @@ class TradingDataset(torch.utils.data.Dataset):
 
     def __init__(self, feature_windows: np.ndarray, task_targets: Dict[str, np.ndarray]):
         self.feature_windows = torch.FloatTensor(feature_windows)
-        self.upside_targets = torch.FloatTensor(task_targets["upside"])
-        self.downside_targets = torch.FloatTensor(task_targets["downside"])
-        self.drawdown_targets = torch.FloatTensor(task_targets["drawdown"])
         self.direction_targets = torch.LongTensor(task_targets["direction"])
+        self.float_target_tensors = {
+            target_name: torch.FloatTensor(task_targets[target_name])
+            for target_name in task_targets.keys()
+            if target_name != "direction"
+        }
 
     def __len__(self) -> int:
         return len(self.feature_windows)
 
     def __getitem__(self, index: int):
-        return self.feature_windows[index], {
-            "upside": self.upside_targets[index],
-            "downside": self.downside_targets[index],
-            "future_drawdown": self.drawdown_targets[index],
-            "direction": self.direction_targets[index],
-        }
+        batch_targets: Dict[str, torch.Tensor] = {}
+        for tensor_name, tensor in self.float_target_tensors.items():
+            loss_key = "future_drawdown" if tensor_name == "drawdown" else tensor_name
+            batch_targets[loss_key] = tensor[index]
+        batch_targets["direction"] = self.direction_targets[index]
+        return self.feature_windows[index], batch_targets
 
 
 def create_sequences(
@@ -71,6 +73,8 @@ def get_feature_cols(dataframe: pd.DataFrame) -> List[str]:
         "edge_ratio",
         "pain_ratio",
         "direction_label",
+        "label_take_profit_pct",
+        "label_stop_loss_pct",
         "time",
         "label",
         "index",
@@ -79,10 +83,26 @@ def get_feature_cols(dataframe: pd.DataFrame) -> List[str]:
 
 
 def build_target_arrays(dataframe: pd.DataFrame) -> Dict[str, np.ndarray]:
+    required_label_columns = (
+        "upside_pct",
+        "downside_pct",
+        "future_drawdown_pct",
+        "label_take_profit_pct",
+        "label_stop_loss_pct",
+        "direction_label",
+    )
+    missing_columns = [column for column in required_label_columns if column not in dataframe.columns]
+    if missing_columns:
+        raise ValueError(
+            "Feature frame is missing label columns "
+            f"{missing_columns}. Delete stale `features_cache_*.csv` files and rebuild."
+        )
     return {
         "upside": dataframe["upside_pct"].values,
         "downside": dataframe["downside_pct"].values,
         "drawdown": dataframe["future_drawdown_pct"].values,
+        "take_profit_pct": dataframe["label_take_profit_pct"].values,
+        "stop_loss_pct": dataframe["label_stop_loss_pct"].values,
         "direction": dataframe["direction_label"].values,
     }
 
@@ -294,14 +314,21 @@ def train_model(
                         batch_X = val_tensor[start:end]
                         batch_y_dir = direction_actual[start:end]
                         val_outputs = model(batch_X)
-                        batch_loss = loss_fn(val_outputs, {
+                        val_chunk_targets = {
                             "upside": torch.FloatTensor(val_targets["upside"][start:end]).to(device),
                             "downside": torch.FloatTensor(val_targets["downside"][start:end]).to(device),
                             "future_drawdown": torch.FloatTensor(
                                 val_targets["drawdown"][start:end]
                             ).to(device),
+                            "take_profit_pct": torch.FloatTensor(
+                                val_targets["take_profit_pct"][start:end]
+                            ).to(device),
+                            "stop_loss_pct": torch.FloatTensor(
+                                val_targets["stop_loss_pct"][start:end]
+                            ).to(device),
                             "direction": batch_y_dir,
-                        })["total"]
+                        }
+                        batch_loss = loss_fn(val_outputs, val_chunk_targets)["total"]
                         val_loss_sum += batch_loss.item()
                         val_batches += 1
                         predicted_direction = torch.argmax(val_outputs["direction"], dim=1)
@@ -337,21 +364,14 @@ def train_model(
 
     final_report: Dict[str, float] = {}
     if test_features is not None and test_targets is not None:
-        final_report = evaluate_model_on_split(
-            model,
-            test_features,
-            test_targets["direction"],
-            test_targets["upside"],
-            test_targets["downside"],
-            device,
-        )
+        final_report = evaluate_model_on_split(model, test_features, test_targets, device)
     return model, final_report
 
 
 def run_inference_with_confidence_filter(
     model: nn.Module, feature_windows: np.ndarray, device: torch.device
 ) -> pd.DataFrame:
-    """Direction softmax + confidence threshold; mirrors legacy column names for downstream tables."""
+    """Direction softmax, confidence gate, and volatility-aware TP/SL percentage heads."""
     model.eval()
     input_tensor = torch.FloatTensor(feature_windows).to(device)
     with torch.no_grad():
@@ -359,13 +379,25 @@ def run_inference_with_confidence_filter(
     direction_probabilities = torch.softmax(raw_outputs["direction"], dim=1)
     verdict_indices = torch.argmax(direction_probabilities, dim=1).cpu().numpy()
     predicted_upside = raw_outputs["upside"].cpu().numpy().reshape(-1)
+    predicted_downside = raw_outputs["downside"].cpu().numpy().reshape(-1)
     confidence_scores = raw_outputs["confidence"].cpu().numpy().reshape(-1)
+    take_profit_pct = raw_outputs["take_profit_pct"].cpu().numpy().reshape(-1)
+    stop_loss_pct = raw_outputs["stop_loss_pct"].cpu().numpy().reshape(-1)
+    buy_probability = direction_probabilities[:, 0].cpu().numpy()
+    neutral_probability = direction_probabilities[:, 1].cpu().numpy()
+    sell_probability = direction_probabilities[:, 2].cpu().numpy()
 
     result_frame = pd.DataFrame(
         {
             "ai_upside": predicted_upside,
+            "ai_downside": predicted_downside,
             "ai_confidence": confidence_scores,
             "ai_verdict": verdict_indices,
+            "ai_take_profit_pct": take_profit_pct,
+            "ai_stop_loss_pct": stop_loss_pct,
+            "ai_prob_buy": buy_probability,
+            "ai_prob_neutral": neutral_probability,
+            "ai_prob_sell": sell_probability,
         }
     )
 
@@ -384,3 +416,33 @@ def run_inference_with_confidence_filter(
         )
     result_frame.loc[low_confidence_mask, "ai_verdict"] = 1
     return result_frame
+
+
+def predict_model_outputs_for_single_window(
+    model: nn.Module,
+    window_features: np.ndarray,
+    device: torch.device,
+) -> Dict[str, float]:
+    """
+    Run a single [seq_len, n_features] window and return production-style scalars (CPU floats).
+    """
+    model.eval()
+    batch = torch.FloatTensor(window_features).unsqueeze(0).to(device)
+    verdict_names = ("BUY", "NEUTRAL", "SELL")
+    with torch.no_grad():
+        outputs = model(batch)
+    direction_probabilities = torch.softmax(outputs["direction"], dim=1)[0]
+    verdict_index = int(torch.argmax(direction_probabilities).item())
+    return {
+        "direction_verdict_code": verdict_index,
+        "direction_verdict_label": verdict_names[verdict_index],
+        "prob_buy": float(direction_probabilities[0].item()),
+        "prob_neutral": float(direction_probabilities[1].item()),
+        "prob_sell": float(direction_probabilities[2].item()),
+        "confidence": float(outputs["confidence"][0, 0].item()),
+        "regression_upside_pct": float(outputs["upside"][0, 0].item()),
+        "regression_downside_pct": float(outputs["downside"][0, 0].item()),
+        "risk_score": float(outputs["risk"][0, 0].item()),
+        "take_profit_pct": float(outputs["take_profit_pct"][0, 0].item()),
+        "stop_loss_pct": float(outputs["stop_loss_pct"][0, 0].item()),
+    }

@@ -100,9 +100,7 @@ def classification_metrics_numpy(
 def evaluate_model_on_split(
     model: torch.nn.Module,
     features: np.ndarray,
-    targets_direction: np.ndarray,
-    targets_upside: np.ndarray,
-    targets_downside: np.ndarray,
+    targets: Dict[str, np.ndarray],
     device: torch.device,
 ) -> Dict[str, float | str]:
     """Run model on numpy arrays and aggregate sklearn / numpy metrics."""
@@ -112,6 +110,9 @@ def evaluate_model_on_split(
     pred_dir = torch.argmax(predictions["direction"], dim=1).cpu().numpy()
     pred_up = predictions["upside"].cpu().numpy().reshape(-1)
     pred_dn = predictions["downside"].cpu().numpy().reshape(-1)
+    targets_direction = targets["direction"]
+    targets_upside = targets["upside"]
+    targets_downside = targets["downside"]
 
     metrics: Dict[str, float | str] = {}
     metrics.update(
@@ -120,4 +121,11 @@ def evaluate_model_on_split(
     metrics.update(directional_accuracy_numpy(pred_dir, targets_direction))
     metrics.update(directional_accuracy_non_neutral_numpy(pred_dir, targets_direction))
     metrics.update(classification_metrics_numpy(pred_dir, targets_direction))
+
+    pred_tp = predictions["take_profit_pct"].cpu().numpy().reshape(-1)
+    pred_sl = predictions["stop_loss_pct"].cpu().numpy().reshape(-1)
+    true_tp = targets["take_profit_pct"]
+    true_sl = targets["stop_loss_pct"]
+    metrics["mae_take_profit_pct"] = float(mean_absolute_error(true_tp, pred_tp))
+    metrics["mae_stop_loss_pct"] = float(mean_absolute_error(true_sl, pred_sl))
     return metrics
