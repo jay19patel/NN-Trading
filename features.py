@@ -119,6 +119,21 @@ def add_trend_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def add_regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Choppiness Index to distinguish between trending and ranging markets"""
+    # Chop Index: n=14
+    n = 14
+    tr = ta.true_range(df['High'], df['Low'], df['Close'])
+    atr_sum = tr.rolling(window=n).sum()
+    max_high = df['High'].rolling(window=n).max()
+    min_low = df['Low'].rolling(window=n).min()
+    
+    df['chop_index'] = 100 * np.log10(atr_sum / (max_high - min_low + 1e-8)) / np.log10(n)
+    df['is_choppy'] = (df['chop_index'] > 61.8).astype(int)
+    df['is_trending'] = (df['chop_index'] < 38.2).astype(int)
+    
+    return df
+
 def add_volume_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add volume-based indicators to confirm price movements"""
     df['OBV'] = ta.obv(df['Close'], df['Volume']).bfill()
@@ -506,6 +521,7 @@ def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFra
         ("Adv. Trend", add_advanced_trend_features),
         ("Entropy/Info Theory", add_information_theory_features),
         ("Microstructure", add_microstructure_features),
+        ("Market Regime (Chop)", add_regime_features),
         ("Risk-Reward Profile", lambda d: add_risk_reward_features(d, lookahead)),
         ("Interactions", add_interaction_features),
         # Route to Oracle labeler if enabled; falls back to ATR-based labeler

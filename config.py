@@ -6,94 +6,105 @@ import os
 @dataclass
 class DataConfig:
     """Settings for data fetching and caching"""
-    SYMBOLS: list[str] = ("BTCUSD","ETHUSD") # List of symbols to train on
-    INTERVAL: str = "15m"             # Timeframe bars ki length (e.g. 1m, 5m, 15m, 1h)
-    TOTAL_DAYS: int = 300       # History length; must exceed VAL_DAYS + TEST_DAYS + warmup for stable training
-    CACHE_VALID_MINS: int = 120       # Feature cache kitne minutes tak valid rahega (2 hours)
+    SYMBOLS: list[str] = ("BTCUSD", "ETHUSD")  # List of symbols to train on
+    INTERVAL: str = "15m"                        # Timeframe bars ki length
+    TOTAL_DAYS: int = 365                        # 1 full year of history for robust training
+    CACHE_VALID_MINS: int = 120                  # Feature cache validity (2 hours)
 
 @dataclass
 class FeatureConfig:
     """Settings for feature engineering and pruning"""
-    LOOKAHEAD_BARS: int = 200         # Labeling ke liye futures bars (192 = 2 Days in 15m)
-    PRUNING_THRESHOLD: float = 0.01   # Noise features ko hatane ke liye correlation threshold
+    LOOKAHEAD_BARS: int = 24                     # 6 hours (24 bars * 15m). Sweet spot between 16 and 96.
+    PRUNING_THRESHOLD: float = 0.03              # Spearman correlation pruning floor
+    # Auto-pruning thresholds (applied after scaling in training_utils)
+    VARIANCE_FLOOR: float = 0.01                 # Drop features with var < 0.01 after StandardScaler
+    CORRELATION_CEILING: float = 0.95            # Drop one of each pair with |corr| > 0.95
 
 @dataclass
 class ModelConfig:
     """Transformer Architecture Hyperparameters"""
-    HIDDEN_DIM: int = 64              # Model ki internal dimension complexity
-    NUM_HEADS: int = 4                # Attention heads ki count
-    NUM_LAYERS: int = 2               # Transformer blocks kitne layer honge
-    DROPOUT: float = 0.2              # Overfitting se bachne ke liye dropout rate
-    SEQ_LEN: int = 200                 # Sequence window size (Kitne pichle bars model dekhega)
+    HIDDEN_DIM: int = 48                         # Sweet spot: 32 was underfitting, 64 was overfitting
+    NUM_HEADS: int = 4                           # Attention heads (48 / 4 = 12 dim per head)
+    NUM_LAYERS: int = 2                          # 2 layers for pattern depth
+    DROPOUT: float = 0.3                         # Aggressive regularization (was 0.2)
+    SEQ_LEN: int = 48                            # 12 hours lookback (48 bars * 15m)
 
 @dataclass
 class TrainingConfig:
     """Settings for the AI training process"""
-    # Chronological holdouts: train -> val -> test (oldest -> newest). Critical for time series.
-    VAL_DAYS: int = 4                 # Validation window before the test window (tune early stopping / LR)
-    TEST_DAYS: int = 10               # Last kitne dino ka data final evaluation ke liye alag rakna he
-    EPOCHS: int = 100                  # Kitni baar model pura data repeat karke sikhega
-    RL_FINE_TUNE_EPOCHS: int = 20      # Extra epochs for phase 2 RL fine tuning
-    EARLY_STOP_PATIENCE: int = 30      # Stop if validation loss does not improve for this many epochs
-    BATCH_SIZE: int = 64              # Ek baar me kitne samples process honge
-    LEARNING_RATE: float = 0.001      # Weights update karne ki speed
-    RL_LEARNING_RATE: float = 0.0001  # Lower LR for RL phase
-    WEIGHT_DECAY: float = 0.01        # Weight regularization taaki pattern stable rahe
-    USE_WEIGHTED_SAMPLER: bool = True # Balance direction classes during training (can distort train metrics vs live distribution)
-    
+    # Chronological holdouts: train -> val -> test (oldest -> newest)
+    VAL_DAYS: int = 15                           # Increased from 4 — more reliable validation signal
+    TEST_DAYS: int = 30                          # 1 month test window
+    EPOCHS: int = 10                             # Max epochs — early stopping will cut this short
+    RL_FINE_TUNE_EPOCHS: int = 15                # ENABLED: Phase 2 RL with frozen backbone
+    EARLY_STOP_PATIENCE: int = 7                 # REDUCED: Stop faster when overfitting starts
+    BATCH_SIZE: int = 512                        # M4 GPU efficient batch size
+    LEARNING_RATE: float = 0.0001                # Phase 1 learning rate
+    RL_LEARNING_RATE: float = 0.00002            # Phase 2 RL: slower to preserve Phase 1 knowledge
+    WEIGHT_DECAY: float = 0.001                  # REDUCED from 0.01: was killing gradients
+    USE_WEIGHTED_SAMPLER: bool = False            # Replaced by Focal Loss (no class weights needed)
+
     # Loss weights
-    LOSS_ALPHA: float = 1.0           # Signal loss weight
-    LOSS_BETA: float = 0.5            # Sizing loss weight
-    LOSS_GAMMA: float = 0.3           # PnL penalty weight (used heavily in phase 2)
+    LOSS_ALPHA: float = 1.0                      # Signal (direction) loss weight — primary objective
+    LOSS_BETA: float = 0.3                       # Sizing loss weight — secondary
+    LOSS_GAMMA: float = 0.05                     # PnL penalty weight (Phase 2 only)
+
+    # Focal Loss hyperparameters
+    FOCAL_GAMMA: float = 2.0                     # Focus parameter — down-weights easy examples
+    USE_FOCAL_LOSS: bool = True                  # Use Focal Loss instead of CrossEntropy
 
 @dataclass
 class StrategyConfig:
     """Settings for trading strategy and evaluation"""
-    TARGET_PROFIT_PCT: float = 3.0    # Fixed TP% when USE_DYNAMIC_TP_SL_LABELS is False
-    STOP_LOSS_PCT: float = 1.0        # Fixed SL% when USE_DYNAMIC_TP_SL_LABELS is False
-    AI_CONFIDENCE_THRESHOLD: float = 0.3
-
-    # ATR-scaled dynamic TP/SL for labels, regression targets, and path simulation
-    USE_DYNAMIC_TP_SL_LABELS: bool = False  # Disabled when USE_ORACLE_LABELS=True
+    TARGET_PROFIT_PCT: float = 3.0              # Fixed TP% (fallback when oracle disabled)
+    STOP_LOSS_PCT: float = 1.0                  # Fixed SL% (fallback)
+    USE_DYNAMIC_TP_SL_LABELS: bool = False      # Disabled when USE_ORACLE_LABELS=True
     TP_ATR_MULTIPLIER: float = 1.25
     SL_ATR_MULTIPLIER: float = 0.65
-    LABEL_TP_PCT_MIN: float = 0.25
-    LABEL_TP_PCT_MAX: float = 12.0
-    LABEL_SL_PCT_MIN: float = 0.15
-    LABEL_SL_PCT_MAX: float = 6.0
+    LABEL_TP_PCT_MIN: float = 0.5              # Minimum 0.5% TP for 6-hour window
+    LABEL_TP_PCT_MAX: float = 10.0
+    LABEL_SL_PCT_MIN: float = 0.8              # Minimum 0.8% SL — realistic for 6h crypto noise
+    LABEL_SL_PCT_MAX: float = 5.0
 
     # -----------------------------------------------------------------------
-    # Oracle Labeling — uses ACTUAL future price data from historical backtest
-    # Har candle ke aage N bars ka actual max high aur min low dekh ke
-    # TP = 70% of max possible move, SL = 50% of adverse move
-    # Yeh labels ATR se zyada accurate hain kyunki real price data use hota hai
+    # Risk Management & Execution Rules
     # -----------------------------------------------------------------------
-    USE_ORACLE_LABELS: bool = True           # Master switch for oracle mode
-    ORACLE_TP_CAPTURE_RATIO: float = 0.70   # 70% of future max high used as TP target
-    ORACLE_SL_CAPTURE_RATIO: float = 0.50   # 50% of future min low used as SL
-    ORACLE_MIN_TP_PCT: float = 0.30         # Noise filter: ignore tiny moves as TP
-    ORACLE_MAX_TP_PCT: float = 12.0         # Cap TP to prevent outlier labels
-    ORACLE_MIN_SL_PCT: float = 0.20         # Minimum SL (very tight stops excluded)
-    ORACLE_MAX_SL_PCT: float = 6.0          # Cap SL
-    ORACLE_MIN_RR: float = 1.5             # Minimum Reward:Risk to assign a signal label
-    ORACLE_MIN_UPSIDE_PCT: float = 0.50    # Market must have at least 0.5% upside for LONG
-    ORACLE_MIN_DOWNSIDE_PCT: float = 0.50  # Market must have at least 0.5% downside for SHORT
+    AI_CONFIDENCE_THRESHOLD: float = 0.40       # Will be auto-calibrated per-class after training
+    MIN_REWARD_RISK_RATIO: float = 1.5           # Min predicted R:R before taking a trade
+    SLIPPAGE_PCT: float = 0.05                   # 5bps per leg (realistic for crypto)
+    PARALLEL_SLOTS: int = 1                      # One trade at a time
+    KELLY_FRACTION: float = 0.5                  # Half-Kelly for conservative capital growth
+
+    # -----------------------------------------------------------------------
+    # Oracle Labeling Engine
+    # Uses ACTUAL future price data to create high-quality training labels.
+    # -----------------------------------------------------------------------
+    USE_ORACLE_LABELS: bool = True
+    ORACLE_TP_CAPTURE_RATIO: float = 0.70       # Use 70% of max possible future high as TP
+    ORACLE_SL_CAPTURE_RATIO: float = 0.50       # FIX: Was 1.0 (=full adverse excursion, always hit). Back to 50%.
+    ORACLE_MIN_TP_PCT: float = 0.3              # LOWERED: 0.3% min target to get more directional labels
+    ORACLE_MAX_TP_PCT: float = 10.0
+    ORACLE_MIN_SL_PCT: float = 0.5              # LOWERED: 0.5% min stop — more labels, less neutral
+    ORACLE_MAX_SL_PCT: float = 5.0
+    ORACLE_MIN_RR: float = 1.2                  # LOWERED from 1.5: need more directional labels (was 74% neutral)
+    ORACLE_MIN_UPSIDE_PCT: float = 0.5          # LOWERED from 0.8: 0.5% move in 6h is a valid signal
+    ORACLE_MIN_DOWNSIDE_PCT: float = 0.5        # LOWERED from 0.8: 0.5% move in 6h is a valid signal
 
     INITIAL_CAPITAL_USD: float = 1000.0
-    RISK_PER_TRADE_PCT_OF_EQUITY: float = 1.0
+    RISK_PER_TRADE_PCT_OF_EQUITY: float = 1.0   # Risk 1% equity per trade
     MAX_POSITION_NOTIONAL_PCT_OF_EQUITY: float = 0.95
     ROUND_TRIP_FEE_PCT: float = 0.1
 
 @dataclass
 class TradingConfig:
-    """Global configuration object"""
+    """Global configuration object — single source of truth for all hyperparameters"""
     data: DataConfig = field(default_factory=DataConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    
-    # Auto-detect device for compute (MPS for Mac M1/M2, CUDA for NVIDIA, CPU for default)
+
+    # Auto-detect best compute device
     @property
     def DEVICE(self) -> torch.device:
         if torch.backends.mps.is_available():
@@ -102,5 +113,5 @@ class TradingConfig:
             return torch.device("cuda")
         return torch.device("cpu")
 
-# Create a singleton instance for project-wide use
+# Singleton instance — import this everywhere
 config = TradingConfig()

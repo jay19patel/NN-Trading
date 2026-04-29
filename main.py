@@ -218,7 +218,9 @@ def main() -> None:
     torch.save(trained_model.state_dict(), model_path)
     console.print(f"\n[bold green]💾 Model weights saved successfully to {model_path}[/bold green]")
 
+    calibrated_thresholds = None
     if test_metrics:
+        calibrated_thresholds = test_metrics.pop("calibrated_thresholds", None)
         console.print("\n[highlight]Held-out test metrics (direction + regression)[/highlight]")
         for metric_key, metric_value in test_metrics.items():
             if metric_key == "classification_report_text":
@@ -229,7 +231,9 @@ def main() -> None:
                 console.print(f"  {metric_key}: {metric_value}")
 
     console.print("\n[highlight]Per-symbol trading outcomes on last test window[/highlight]")
-    predictions_frame = run_inference_with_confidence_filter(trained_model, test_X, device)
+    predictions_frame = run_inference_with_confidence_filter(
+        trained_model, test_X, device, calibrated_thresholds=calibrated_thresholds
+    )
 
     bars_per_day = _bars_per_15m_day()
     test_row_count = config.training.TEST_DAYS * bars_per_day
@@ -281,10 +285,8 @@ def main() -> None:
         symbol_panel["ai_take_profit_pct"] = symbol_predictions["ai_take_profit_pct"].values
         symbol_panel["ai_stop_loss_pct"] = symbol_predictions["ai_stop_loss_pct"].values
 
-        symbol_panel = evaluate_ai_verdicts(
-            symbol_panel,
-            lookahead_bars=config.features.LOOKAHEAD_BARS,
-        )
+        # Skip evaluate_ai_verdicts as run_paper_portfolio_on_signals now handles path simulation sequentially
+        # symbol_panel = evaluate_ai_verdicts(symbol_panel, lookahead_bars=config.features.LOOKAHEAD_BARS)
 
         symbol_panel, trade_records, paper_summary = run_paper_portfolio_on_signals(
             symbol_panel,
@@ -296,42 +298,43 @@ def main() -> None:
         )
         all_trade_records.extend(trade_records)
 
-        buy_rows = symbol_panel[symbol_panel["ai_verdict"] == 0]
-        sell_rows = symbol_panel[symbol_panel["ai_verdict"] == 2]
-        signal_rows = pd.concat([buy_rows, sell_rows])
-        resolved = signal_rows[signal_rows["ai_outcome"].isin(["SUCCESS", "FAILED"])]
-        wins = int((resolved["ai_outcome"] == "SUCCESS").sum())
-        losses = int((resolved["ai_outcome"] == "FAILED").sum())
-        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0.0
+        # Use sequential trade results for summary — use .get() to handle 0-trade case
+        wins = paper_summary.get("wins", 0)
+        losses = paper_summary.get("losses", 0)
+        win_rate = paper_summary.get("win_rate_pct", 0.0)
+        total_trades = paper_summary.get("trade_count", 0)
 
         summary_table.add_row(
             symbol,
-            str(len(signal_rows)),
+            str(total_trades),
             f"{win_rate:.1f}%",
             f"{wins} / {losses}",
             f"{paper_summary['final_equity_usd']:.2f}",
         )
 
         detail_table = Table(
-            title=f"{symbol} — last {config.training.TEST_DAYS} days (strategy filter)",
+            title=f"{symbol} — Realistic Sequential Backtest ({config.training.TEST_DAYS} days)",
             show_header=True,
             header_style="bold magenta",
         )
         detail_table.add_column("Metric", justify="left")
-        detail_table.add_column("Buy", justify="right", style="buy")
-        detail_table.add_column("Sell", justify="right", style="sell")
+        detail_table.add_column("Long", justify="right", style="buy")
+        detail_table.add_column("Short", justify="right", style="sell")
         detail_table.add_column("Total", justify="right", style="bold")
 
-        buy_wins = int((buy_rows["ai_outcome"] == "SUCCESS").sum())
-        buy_losses = int((buy_rows["ai_outcome"] == "FAILED").sum())
-        sell_wins = int((sell_rows["ai_outcome"] == "SUCCESS").sum())
-        sell_losses = int((sell_rows["ai_outcome"] == "FAILED").sum())
+        long_trades = [t for t in trade_records if t.side == "LONG"]
+        short_trades = [t for t in trade_records if t.side == "SHORT"]
 
-        detail_table.add_row("Signals", str(len(buy_rows)), str(len(sell_rows)), str(len(signal_rows)))
-        detail_table.add_row("Wins", str(buy_wins), str(sell_wins), str(wins))
-        detail_table.add_row("Losses", str(buy_losses), str(sell_losses), str(losses))
+        long_wins = sum(1 for t in long_trades if t.outcome == "SUCCESS")
+        long_losses = sum(1 for t in long_trades if t.outcome == "FAILED")
+        short_wins = sum(1 for t in short_trades if t.outcome == "SUCCESS")
+        short_losses = sum(1 for t in short_trades if t.outcome == "FAILED")
+
+        detail_table.add_row("Trades", str(len(long_trades)), str(len(short_trades)), str(total_trades))
+        detail_table.add_row("Wins", str(long_wins), str(short_wins), str(wins))
+        detail_table.add_row("Losses", str(long_losses), str(short_losses), str(losses))
         detail_table.add_row(
-            "Paper final $",
+            "Final Equity $",
             "—",
             "—",
             f"{paper_summary['final_equity_usd']:.2f}",
@@ -342,12 +345,6 @@ def main() -> None:
         total_fees = paper_summary.get('total_fees_usd', 0)
         fees_pct = (total_fees / initial_cap) * 100
 
-        detail_table.add_row(
-            "Total Trades",
-            "—",
-            "—",
-            str(paper_summary['trade_count']),
-        )
         detail_table.add_row(
             "Net PnL %",
             "—",
@@ -373,21 +370,26 @@ def main() -> None:
             f"net PnL≈${paper_summary.get('total_pnl_net_usd', 0):.2f}[/info]"
         )
         console.print("")
-        
+
         # Track for global
         global_initial_capital += config.strategy.INITIAL_CAPITAL_USD
         global_final_capital += paper_summary['final_equity_usd']
         global_total_fees += paper_summary.get('total_fees_usd', 0)
-        global_total_trades += paper_summary['trade_count']
+        global_total_trades += paper_summary.get('trade_count', 0)
         global_total_wins += wins
         global_total_losses += losses
-        
-        # Track for plotting
+
+        # Track for plotting — handle case where paper_equity_curve may not exist (0 trades)
+        if "paper_equity_curve" in symbol_panel.columns:
+            equity_curve_vals = symbol_panel["paper_equity_curve"].values
+        else:
+            equity_curve_vals = [config.strategy.INITIAL_CAPITAL_USD] * len(symbol_panel)
         equity_curves[symbol] = {
             "dates": symbol_panel.index if isinstance(symbol_panel.index, pd.DatetimeIndex) else list(range(len(symbol_panel))),
-            "equity": symbol_panel["paper_equity_curve"].values
+            "equity": equity_curve_vals,
         }
         symbol_panels_data[symbol] = symbol_panel.copy()
+
 
     # Add global row
     global_win_rate = (global_total_wins / (global_total_wins + global_total_losses) * 100) if (global_total_wins + global_total_losses) > 0 else 0.0
@@ -420,9 +422,67 @@ def main() -> None:
 
     if all_trade_records:
         df_trades = pd.DataFrame([vars(t) for t in all_trade_records])
+        
+        # 1. Format CSV data: Convert fraction to % and round everything for readability
+        df_trades['return_pct'] = (df_trades.get('return_fraction', 0) * 100).round(2)
+        if 'return_fraction' in df_trades:
+            df_trades = df_trades.drop(columns=['return_fraction'])
+            
+        # Round percentages and model outputs
+        for col in ['take_profit_pct', 'stop_loss_pct', 'ai_confidence', 'ai_qty_ratio']:
+            if col in df_trades:
+                df_trades[col] = df_trades[col].astype(float).round(2)
+                
+        # Round monetary and price values
+        monetary_cols = ['entry_price', 'exit_price', 'notional_usd', 'pnl_before_fees_usd', 
+                         'fees_usd', 'pnl_net_usd', 'capital_before_usd', 'equity_after_usd']
+        for col in monetary_cols:
+            if col in df_trades:
+                df_trades[col] = df_trades[col].astype(float).round(2)
+                
+        # Crypto quantities need more precision
+        if 'quantity' in df_trades:
+            df_trades['quantity'] = df_trades['quantity'].astype(float).round(6)
+            
         trades_csv_path = os.path.join(results_dir, "paper_trading_results.csv")
         df_trades.to_csv(trades_csv_path, index=False)
-        console.print(f"\n[bold green]✅ Saved detailed trade analysis to {trades_csv_path} ({len(df_trades)} trades)[/bold green]")
+        
+        # 2. Easy UI Visualization: Generate a beautifully styled HTML Trade Log
+        html_styles = """
+        <style>
+            body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #e2e8f0; padding: 2rem; }
+            h1 { color: #38bdf8; text-align: center; margin-bottom: 2rem; }
+            table { width: 100%; border-collapse: collapse; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+            th { background-color: #1e293b; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 0.85rem; padding: 1rem; text-align: left; border-bottom: 2px solid #334155; }
+            td { padding: 1rem; border-bottom: 1px solid #1e293b; font-size: 0.95rem; }
+            tr:hover { background-color: #1e293b; }
+            .success { color: #4ade80; font-weight: bold; }
+            .failed { color: #f87171; font-weight: bold; }
+            .long { color: #38bdf8; font-weight: bold; }
+            .short { color: #c084fc; font-weight: bold; }
+        </style>
+        """
+        # Add CSS classes for coloring
+        styled_df = df_trades.copy()
+        if 'outcome' in styled_df:
+            styled_df['outcome'] = styled_df['outcome'].apply(lambda x: f'<span class="success">{x}</span>' if x == 'SUCCESS' else f'<span class="failed">{x}</span>')
+        if 'side' in styled_df:
+            styled_df['side'] = styled_df['side'].apply(lambda x: f'<span class="long">{x}</span>' if x == 'LONG' else f'<span class="short">{x}</span>')
+        if 'pnl_net_usd' in styled_df:
+            styled_df['pnl_net_usd'] = styled_df['pnl_net_usd'].apply(lambda x: f'<span class="{"success" if float(x) > 0 else "failed"}">${x}</span>')
+            
+        html_content = f"""
+        <html><head><title>AI Trading Log</title>{html_styles}</head>
+        <body><h1>AI Trading Execution Log</h1>
+        {styled_df.to_html(escape=False, index=False, classes='trade-table')}
+        </body></html>
+        """
+        html_path = os.path.join(results_dir, "trade_log_dashboard.html")
+        with open(html_path, "w") as f:
+            f.write(html_content)
+
+        console.print(f"\n[bold green]✅ Saved formatted CSV to {trades_csv_path} ({len(df_trades)} trades)[/bold green]")
+        console.print(f"[bold cyan]✅ Created Interactive UI Trade Log at {html_path}[/bold cyan]")
         
     # Generate Advanced Visualizations
     from plotly.subplots import make_subplots
@@ -479,6 +539,7 @@ def main() -> None:
 
     console.print(f"\n[bold cyan]📊 All visualizations saved to the '{results_dir}' folder:[/bold cyan]")
     console.print(f"  - portfolio_equity_curve.html (Individual + TOTAL)")
+    console.print(f"  - trade_log_dashboard.html (Beautiful Interactive Trade Table)")
     for sym in symbols:
         console.print(f"  - {sym}_detailed_analytics.html (Price + Buy/Sell Markers)")
         

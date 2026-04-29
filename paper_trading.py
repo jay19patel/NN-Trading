@@ -19,6 +19,8 @@ class PaperTradeRecord:
     symbol: str
     entry_datetime: str
     entry_index: int
+    exit_datetime: str
+    exit_price: float
     side: str
     entry_price: float
     quantity: float
@@ -77,76 +79,164 @@ def run_paper_portfolio_on_signals(
     round_trip_fee_pct: float,
 ) -> tuple[pd.DataFrame, List[PaperTradeRecord], dict]:
     """
-    Walk forward in time: each non-neutral signal opens a trade sized by predicted SL%.
-
-    Expects columns: Close, ai_verdict, ai_outcome, ai_return_fraction, ai_take_profit_pct, ai_stop_loss_pct.
+    Advanced walk-forward backtester:
+    1. Supports PARALLEL_SLOTS (multiple concurrent trades).
+    2. Applies SLIPPAGE_PCT to entry and exit prices.
+    3. Uses AI-predicted TP% and SL% for each entry.
+    4. Records exit time and price with realistic fee/slippage logic.
     """
-    strategy = config.strategy
     risk_fraction = risk_per_trade_pct_of_equity / 100.0
     max_notional_fraction = max_notional_pct_of_equity
     fee_fraction_per_leg = (round_trip_fee_pct / 100.0) / 2.0
+    slippage_fraction = config.strategy.SLIPPAGE_PCT / 100.0
+    lookahead_limit = config.features.LOOKAHEAD_BARS
+    max_slots = config.strategy.PARALLEL_SLOTS
 
     working_frame = panel.sort_index().copy()
     equity_usd = float(initial_capital_usd)
     trade_records: List[PaperTradeRecord] = []
     equity_by_bar: List[float] = []
 
-    for row_position in range(len(working_frame)):
-        row = working_frame.iloc[row_position]
-        verdict = int(row["ai_verdict"])
-        if verdict != 1:
-            outcome = str(row.get("ai_outcome", "NONE"))
-            if outcome != "NONE":
-                entry_price = float(row["Close"])
-                stop_loss_pct = float(row["ai_stop_loss_pct"])
-                take_profit_pct = float(row["ai_take_profit_pct"])
-                qty_ratio = float(row.get("ai_qty_ratio", 1.0))
-                confidence = float(row.get("ai_confidence", 0.0))
-                return_fraction = float(row.get("ai_return_fraction", 0.0))
-                
-                entry_datetime = str(row.name)
-                if "Date" in row:
-                    entry_datetime = str(row["Date"])
+    # List of active trades (up to PARALLEL_SLOTS)
+    active_trades: List[dict] = []
 
-                capital_before = equity_usd
+    for i in range(len(working_frame)):
+        row = working_frame.iloc[i]
+        curr_price = float(row["Close"])
+        curr_high = float(row["High"])
+        curr_low = float(row["Low"])
+        curr_time = str(row.name)
+        if "Date" in row:
+            curr_time = str(row["Date"])
+
+        # 1. Handle Active Trades
+        finished_trades_indices = []
+        for idx, t in enumerate(active_trades):
+            t["bars_held"] += 1
+            hit_tp = False
+            hit_sl = False
+            exit_price = curr_price
+            outcome = "NONE"
+
+            if t["side"] == "LONG":
+                if curr_high >= t["tp_price"]:
+                    hit_tp = True
+                    exit_price = t["tp_price"]
+                if curr_low <= t["sl_price"]:
+                    hit_sl = True
+                    exit_price = t["sl_price"]
+            else: # SHORT
+                if curr_low <= t["tp_price"]:
+                    hit_tp = True
+                    exit_price = t["tp_price"]
+                if curr_high >= t["sl_price"]:
+                    hit_sl = True
+                    exit_price = t["sl_price"]
+
+            # Same-bar hit logic (conservative: SL first)
+            if hit_tp and hit_sl:
+                outcome = "FAILED"
+                exit_price = t["sl_price"]
+            elif hit_tp:
+                outcome = "SUCCESS"
+            elif hit_sl:
+                outcome = "FAILED"
+            elif t["bars_held"] >= lookahead_limit:
+                outcome = "TIMEOUT"
+                exit_price = curr_price
+
+            if outcome != "NONE":
+                # Apply exit slippage (bad for trader)
+                if t["side"] == "LONG":
+                    real_exit_price = exit_price * (1 - slippage_fraction)
+                    return_fraction = (real_exit_price - t["entry_price"]) / t["entry_price"]
+                else:
+                    real_exit_price = exit_price * (1 + slippage_fraction)
+                    return_fraction = (t["entry_price"] - real_exit_price) / t["entry_price"]
+
+                pnl_before_fees = t["notional_usd"] * return_fraction
+                fees_usd = t["notional_usd"] * fee_fraction_per_leg * 2.0
+                pnl_net = pnl_before_fees - fees_usd
+                equity_usd = max(equity_usd + pnl_net, 0.0)
+
+                trade_records.append(
+                    PaperTradeRecord(
+                        symbol=symbol,
+                        entry_datetime=t["entry_time"],
+                        entry_index=t["entry_index"],
+                        exit_datetime=curr_time,
+                        exit_price=real_exit_price,
+                        side=t["side"],
+                        entry_price=t["entry_price"],
+                        quantity=t["quantity"],
+                        notional_usd=t["notional_usd"],
+                        take_profit_pct=t["tp_pct"],
+                        stop_loss_pct=t["sl_pct"],
+                        ai_confidence=t["confidence"],
+                        ai_qty_ratio=t["qty_ratio"],
+                        outcome=outcome,
+                        return_fraction=return_fraction,
+                        pnl_before_fees_usd=pnl_before_fees,
+                        fees_usd=fees_usd,
+                        pnl_net_usd=pnl_net,
+                        capital_before_usd=t["capital_before"],
+                        equity_after_usd=equity_usd,
+                    )
+                )
+                finished_trades_indices.append(idx)
+
+        # Remove finished trades in reverse to keep indices valid
+        for idx in sorted(finished_trades_indices, reverse=True):
+            active_trades.pop(idx)
+
+        # 2. Check for New Signal (if we have open slots)
+        if len(active_trades) < max_slots:
+            verdict = int(row["ai_verdict"])
+            if verdict != 1:  # 0=BUY, 2=SELL
+                raw_entry_price = curr_price
+                side = "LONG" if verdict == 0 else "SHORT"
+                
+                # Apply entry slippage (bad for trader)
+                entry_price = raw_entry_price * (1 + slippage_fraction if side == "LONG" else 1 - slippage_fraction)
+                
+                tp_pct = float(row["ai_take_profit_pct"])
+                sl_pct = float(row["ai_stop_loss_pct"])
+                confidence = float(row.get("ai_confidence", 0.0))
+                qty_ratio = float(row.get("ai_qty_ratio", 1.0))
+                
+                if side == "LONG":
+                    tp_price = entry_price * (1 + tp_pct / 100.0)
+                    sl_price = entry_price * (1 - sl_pct / 100.0)
+                else:
+                    tp_price = entry_price * (1 - tp_pct / 100.0)
+                    sl_price = entry_price * (1 + sl_pct / 100.0)
 
                 quantity, notional_usd = compute_position_size_for_risk_budget(
                     equity_usd=equity_usd,
                     entry_price=entry_price,
-                    stop_loss_pct=stop_loss_pct,
+                    stop_loss_pct=sl_pct,
                     risk_budget_fraction_of_equity=risk_fraction,
                     max_notional_fraction_of_equity=max_notional_fraction,
                     qty_ratio=qty_ratio,
                 )
-                if quantity > 0 and notional_usd > 0:
-                    pnl_before_fees = notional_usd * return_fraction
-                    fees_usd = notional_usd * fee_fraction_per_leg * 2.0
-                    pnl_net = pnl_before_fees - fees_usd
-                    equity_usd = max(equity_usd + pnl_net, 0.0)
 
-                    side = "LONG" if verdict == 0 else "SHORT"
-                    trade_records.append(
-                        PaperTradeRecord(
-                            symbol=symbol,
-                            entry_datetime=entry_datetime,
-                            entry_index=row_position,
-                            side=side,
-                            entry_price=entry_price,
-                            quantity=quantity,
-                            notional_usd=notional_usd,
-                            take_profit_pct=take_profit_pct,
-                            stop_loss_pct=stop_loss_pct,
-                            ai_confidence=confidence,
-                            ai_qty_ratio=qty_ratio,
-                            outcome=outcome,
-                            return_fraction=return_fraction,
-                            pnl_before_fees_usd=pnl_before_fees,
-                            fees_usd=fees_usd,
-                            pnl_net_usd=pnl_net,
-                            capital_before_usd=capital_before,
-                            equity_after_usd=equity_usd,
-                        )
-                    )
+                if quantity > 0:
+                    active_trades.append({
+                        "side": side,
+                        "entry_price": entry_price,
+                        "tp_price": tp_price,
+                        "sl_price": sl_price,
+                        "tp_pct": tp_pct,
+                        "sl_pct": sl_pct,
+                        "quantity": quantity,
+                        "notional_usd": notional_usd,
+                        "entry_time": curr_time,
+                        "entry_index": i,
+                        "confidence": confidence,
+                        "qty_ratio": qty_ratio,
+                        "capital_before": equity_usd,
+                        "bars_held": 0
+                    })
 
         equity_by_bar.append(equity_usd)
 
@@ -160,11 +250,17 @@ def summarize_trade_feedback(trade_records: List[PaperTradeRecord]) -> dict:
     Post-trade diagnostics: win rate and whether a loss was followed by a win (simple adaptation signal).
     """
     if not trade_records:
+        # Always return a complete dict with all keys — prevents KeyError in main.py
         return {
             "trade_count": 0,
             "win_rate_pct": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "timeouts": 0,
             "final_equity_usd": float(config.strategy.INITIAL_CAPITAL_USD),
             "loss_then_win_count": 0,
+            "total_fees_usd": 0.0,
+            "total_pnl_net_usd": 0.0,
         }
 
     wins = sum(1 for trade in trade_records if trade.outcome == "SUCCESS")
