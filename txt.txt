@@ -1,0 +1,74 @@
+Architecture choice is correct. Transformer with causal masking for time series — good call. Positional encoding added (Bug #8 fix noted). 2-layer, hidden_dim=64 is appropriately lightweight for 93 features, prevents over-parameterization.
+GOOD
+Causal mask is present in MultiHeadAttention. Future data leakage via attention is correctly blocked. forward-looking reward_risk_ratio, edge_ratio, pain_ratio are correctly excluded from feature_cols in prepare_data.
+GOOD
+StandardScaler fitted only on train, then applied to val/test. This is correct. No leakage here.
+ISSUE
+create_sequences uses y[k][i-1] not y[k][i]. Target is label of last-1 bar, not last bar. Off-by-one in label alignment. The model is trying to predict the label of the bar before the last one in its window.
+ISSUE
+VWAP is computed on daily bars but data is 15m. ta.vwap needs an anchor — without it, it cumulates from the start of the dataset, making VWAP meaningless after the first day. Should reset daily.
+ISSUE
+Phase 2 "RL" is not real RL. Labeling it "Reinforcement Learning" is misleading. It's a fine-tune pass with a PnL-influenced loss. PnL Effect is negative throughout (−0.39 → −0.49), meaning RL phase is actively hurting PnL, not improving it. RL fine-tune = wasted compute here.
+CRITICAL
+Label symmetry problem. In add_target_labels, BUY logic runs first — if TP hits on bar j, it labels BUY and breaks. But SELL check only runs if labels[i]==1. Problem: if SL hits first on the BUY loop, it breaks to Neutral but never checks if it would have been a clean SELL. Asymmetric logic biases SELL count downward, explaining why SELL precision = 27% (worst class).
+NOTE
+No tests, no config file. Hyperparameters (seq_len=48, lookahead=24, target=1%, stop=1%) are scattered hardcoded across files. One central config.py or yaml file would massively improve reproducibility.
+
+Model is above random (33%) but barely useful. 40% accuracy on 3-class problem. Random baseline = 33%. Net edge = 7 percentage points. That's not enough to overcome 0.68–11.3% in fees per backtest.
+CRITICAL
+ETHUSD is catastrophically overtriggering. BTC = 8 trades (4 LONG, 4 SHORT). ETH = 145 trades (87L, 58S). Same model, same symbols, 18x more trades on ETH. This means ETH price structure is being predicted very differently — likely because ETH's volatility makes the 1%/1% TP/SL labels much more frequently triggered, creating a different class distribution. The model fires way too often on ETH.
+CRITICAL
+Fees killed ETH. Total fees = $113 on $1000 capital = 11.3%. You need to win >11.3% just to break even on fees alone. With 19.8% win rate and 80.2% loss rate, the math doesn't close.
+ANALYSIS
+No overfitting — but underfitting instead. Train loss 0.39 vs val loss 0.43 — small gap, healthy. But both are high. The model isn't memorizing but it isn't learning either. Problem is signal-to-noise in the data, not the model size.
+ANALYSIS
+Confusion matrix shows the model defaults to Neutral/BUY. SELL recall = 22% — model almost never calls SELL. Out of 1788 actual SELL candles, it only called SELL 392 times correctly. This ties directly to the asymmetric labeling bug.
+
+Root Cause Diagnosis
+SINGLE BIGGEST ISSUE: Label Quality + TP/SL = 1%/1% (1:1 R:R)
+Your labels use equal TP and SL (1% each). On a 15-minute BTC/ETH chart, both get triggered very frequently by noise — almost every candle could hit ±1% within 24 bars. This creates a near-random labeling scheme. The model is learning to predict coin-flip outcomes, not market structure.
+
+Secondary cause: The asymmetric BUY-first labeling logic suppresses SELL labels, making the model's SELL head essentially untrained.
+Root cause chain: Label noise → weak signal → model can't learn → high fee drag → net loss
+Data quality issue (label design), not architecture or feature issue. The Transformer is fine. The features are rich. The problem is that what you're asking the model to predict is not meaningfully predictable with the current label scheme.
+
+ Improvement Roadmap
+Quick fixes — do today
+Fix asymmetric label logic in add_target_labels
+Run BUY and SELL checks independently, then resolve conflicts. This alone will lift SELL precision from 27% significantly.
+for i in range(len(df) - lookahead):
+  # Check BUY independently
+  buy_hit = check_tp_before_sl(i, direction='long')
+  sell_hit = check_tp_before_sl(i, direction='short')
+  if buy_hit and not sell_hit: labels[i] = 0
+  elif sell_hit and not buy_hit: labels[i] = 2
+  else: labels[i] = 1 # conflict or neither
+Add a config.py / config.yaml
+Centralize: LOOKAHEAD, SEQ_LEN, TP_PCT, SL_PCT, SYMBOLS, EPOCHS, HIDDEN_DIM. Zero code change needed, massive reproducibility gain.
+Fix off-by-one in create_sequences
+Change y[k][i-1] to y[k][i] so target aligns with last bar in the window, not second-to-last.
+y_seq[k].append(y[k][i]) # not y[k][i-1]
+Medium-term — 1–2 weeks
+Change TP:SL ratio to 2:1 (e.g. TP=1.5%, SL=0.75%)
+This is the most impactful single change for trading profitability. With 2:1 R:R, you only need to be right 35% of the time to be profitable. Current 1:1 requires >50% win rate which is nearly impossible.
+TP_PCT = 1.5 # was 1.0
+SL_PCT = 0.75 # was 1.0
+Add per-symbol min-trade-frequency guardrail
+Cap ETH at max N trades/day to prevent fee bleed. ETH fired 145 trades in 30 days = nearly 5 trades/day at 15m TF. Add a cooldown: after any trade, suppress signals for next 4 bars minimum.
+Fix daily VWAP reset
+Use groupby date before applying ta.vwap, or manually reset cumulative volume/price at each trading day start. Current VWAP is useless after day 1.
+df['VWAP'] = df.groupby(df.index.date, group_keys=False).apply(
+  lambda g: ta.vwap(g.High, g.Low, g.Close, g.Volume)
+)
+Remove or restructure Phase 2 RL
+PnL Effect went from -0.39 to -0.49 during RL — it's making things worse. Either remove it entirely, or replace with proper REINFORCE/PPO using a simulated environment. Current implementation = expensive noise.
+Advanced — production readiness
+Walk-forward validation instead of single holdout
+Train on months 1-10, test on month 11. Slide forward. Current single 30-day test window can't distinguish luck from skill. Need at least 6 out-of-sample windows to trust accuracy metrics.
+Add regime detection as meta-feature
+Trending vs ranging markets need different strategies. ADX > 25 = trending, ADX < 20 = ranging. Train separate heads or use regime as a conditional input. Model currently tries to generalize across all regimes, diluting its signal.
+Add Sharpe ratio and max drawdown to training objective
+Current RiskAwareLoss focuses on direction + regression but doesn't optimize for risk-adjusted returns. Add a Sharpe term to the loss. This requires simulating trades in the training loop — viable with differentiable approximations.
+
+
+

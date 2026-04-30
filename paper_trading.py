@@ -100,6 +100,11 @@ def run_paper_portfolio_on_signals(
     # List of active trades (up to PARALLEL_SLOTS)
     active_trades: List[dict] = []
 
+    # Daily trade tracking
+    last_day: str | None = None
+    daily_trade_count: int = 0
+    MAX_DAILY_TRADES: int = 5    # Max 5 trades per symbol per day as requested
+
     for i in range(len(working_frame)):
         row = working_frame.iloc[i]
         curr_price = float(row["Close"])
@@ -189,18 +194,29 @@ def run_paper_portfolio_on_signals(
         for idx in sorted(finished_trades_indices, reverse=True):
             active_trades.pop(idx)
 
-        # 2. Check for New Signal (if we have open slots)
-        if len(active_trades) < max_slots:
+        # 2. Check for New Signal (if we have open slots and daily limit not reached)
+        # Handle daily counter reset
+        curr_day = curr_time.split(" ")[0] if " " in curr_time else curr_time
+        if curr_day != last_day:
+            last_day = curr_day
+            daily_trade_count = 0
+
+        if len(active_trades) < max_slots and daily_trade_count < MAX_DAILY_TRADES:
             verdict = int(row["ai_verdict"])
             if verdict != 1:  # 0=BUY, 2=SELL
+                tp_pct = float(row["ai_take_profit_pct"])
+                sl_pct = float(row["ai_stop_loss_pct"])
+
+                # Risk Rule: Enforce minimum 1:1 Reward-to-Risk ratio (Target >= SL)
+                if tp_pct < (sl_pct * config.strategy.MIN_REWARD_RISK_RATIO):
+                    continue
+
                 raw_entry_price = curr_price
                 side = "LONG" if verdict == 0 else "SHORT"
                 
                 # Apply entry slippage (bad for trader)
                 entry_price = raw_entry_price * (1 + slippage_fraction if side == "LONG" else 1 - slippage_fraction)
                 
-                tp_pct = float(row["ai_take_profit_pct"])
-                sl_pct = float(row["ai_stop_loss_pct"])
                 confidence = float(row.get("ai_confidence", 0.0))
                 qty_ratio = float(row.get("ai_qty_ratio", 1.0))
                 
@@ -237,6 +253,7 @@ def run_paper_portfolio_on_signals(
                         "capital_before": equity_usd,
                         "bars_held": 0
                     })
+                    daily_trade_count += 1
 
         equity_by_bar.append(equity_usd)
 

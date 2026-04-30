@@ -7,7 +7,7 @@ import os
 class DataConfig:
     """Settings for data fetching and caching"""
     SYMBOLS: list[str] = ("BTCUSD", "ETHUSD")  # List of symbols to train on
-    INTERVAL: str = "15m"                        # Timeframe bars ki length
+    INTERVAL: str = "1h"                        # Timeframe bars ki length
     TOTAL_DAYS: int = 365                        # 1 full year of history for robust training
     CACHE_VALID_MINS: int = 120                  # Feature cache validity (2 hours)
 
@@ -35,7 +35,7 @@ class TrainingConfig:
     # Chronological holdouts: train -> val -> test (oldest -> newest)
     VAL_DAYS: int = 15                           # Increased from 4 — more reliable validation signal
     TEST_DAYS: int = 30                          # 1 month test window
-    EPOCHS: int = 10                             # Max epochs — early stopping will cut this short
+    EPOCHS: int = 30                             # Increased epochs for better training depth
     RL_FINE_TUNE_EPOCHS: int = 15                # ENABLED: Phase 2 RL with frozen backbone
     EARLY_STOP_PATIENCE: int = 7                 # REDUCED: Stop faster when overfitting starts
     BATCH_SIZE: int = 512                        # M4 GPU efficient batch size
@@ -56,8 +56,8 @@ class TrainingConfig:
 @dataclass
 class StrategyConfig:
     """Settings for trading strategy and evaluation"""
-    TARGET_PROFIT_PCT: float = 3.0              # Fixed TP% (fallback when oracle disabled)
-    STOP_LOSS_PCT: float = 1.0                  # Fixed SL% (fallback)
+    TARGET_PROFIT_PCT: float = 1.0              # Fixed TP% (fallback)
+    STOP_LOSS_PCT: float = 1.0                  # Fixed SL% (fallback) - Enforcing 1:1 ratio
     USE_DYNAMIC_TP_SL_LABELS: bool = False      # Disabled when USE_ORACLE_LABELS=True
     TP_ATR_MULTIPLIER: float = 1.25
     SL_ATR_MULTIPLIER: float = 0.65
@@ -69,8 +69,8 @@ class StrategyConfig:
     # -----------------------------------------------------------------------
     # Risk Management & Execution Rules
     # -----------------------------------------------------------------------
-    AI_CONFIDENCE_THRESHOLD: float = 0.40       # Will be auto-calibrated per-class after training
-    MIN_REWARD_RISK_RATIO: float = 1.5           # Min predicted R:R before taking a trade
+    AI_CONFIDENCE_THRESHOLD: float = 0.50       # Higher threshold to filter out low-conviction noise
+    MIN_REWARD_RISK_RATIO: float = 1.0           # Enforce minimum 1:1 R:R before taking a trade
     SLIPPAGE_PCT: float = 0.05                   # 5bps per leg (realistic for crypto)
     PARALLEL_SLOTS: int = 1                      # One trade at a time
     KELLY_FRACTION: float = 0.5                  # Half-Kelly for conservative capital growth
@@ -80,15 +80,15 @@ class StrategyConfig:
     # Uses ACTUAL future price data to create high-quality training labels.
     # -----------------------------------------------------------------------
     USE_ORACLE_LABELS: bool = True
-    ORACLE_TP_CAPTURE_RATIO: float = 0.70       # Use 70% of max possible future high as TP
-    ORACLE_SL_CAPTURE_RATIO: float = 0.50       # FIX: Was 1.0 (=full adverse excursion, always hit). Back to 50%.
-    ORACLE_MIN_TP_PCT: float = 0.3              # LOWERED: 0.3% min target to get more directional labels
-    ORACLE_MAX_TP_PCT: float = 10.0
-    ORACLE_MIN_SL_PCT: float = 0.5              # LOWERED: 0.5% min stop — more labels, less neutral
+    ORACLE_TP_CAPTURE_RATIO: float = 0.70       # 70% capture as requested
+    ORACLE_SL_CAPTURE_RATIO: float = 0.50       # 50% adverse excursion
+    ORACLE_MIN_TP_PCT: float = 0.8              # Increased floor to 0.8% to avoid market noise
+    ORACLE_MAX_TP_PCT: float = 5.0
+    ORACLE_MIN_SL_PCT: float = 0.8              # Minimum 0.8% stop to survive normal volatility
     ORACLE_MAX_SL_PCT: float = 5.0
-    ORACLE_MIN_RR: float = 1.2                  # LOWERED from 1.5: need more directional labels (was 74% neutral)
-    ORACLE_MIN_UPSIDE_PCT: float = 0.5          # LOWERED from 0.8: 0.5% move in 6h is a valid signal
-    ORACLE_MIN_DOWNSIDE_PCT: float = 0.5        # LOWERED from 0.8: 0.5% move in 6h is a valid signal
+    ORACLE_MIN_RR: float = 1.0                  # Keep 1:1 RR
+    ORACLE_MIN_UPSIDE_PCT: float = 0.8          # Require 0.8% move
+    ORACLE_MIN_DOWNSIDE_PCT: float = 0.8        # Require 0.8% move
 
     INITIAL_CAPITAL_USD: float = 1000.0
     RISK_PER_TRADE_PCT_OF_EQUITY: float = 1.0   # Risk 1% equity per trade

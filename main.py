@@ -245,10 +245,12 @@ def main() -> None:
         header_style="bold cyan",
     )
     summary_table.add_column("Symbol", justify="left", style="bold")
-    summary_table.add_column("Signals", justify="right")
-    summary_table.add_column("Win rate (TP first)", justify="right")
+    summary_table.add_column("Trades", justify="right")
+    summary_table.add_column("Win %", justify="right")
     summary_table.add_column("W / L", justify="right")
-    summary_table.add_column("Paper $", justify="right")
+    summary_table.add_column("Fees $", justify="right", style="red")
+    summary_table.add_column("Net PnL $", justify="right")
+    summary_table.add_column("Equity $", justify="right", style="bold green")
 
     # Create results directory
     results_dir = "backtest_results"
@@ -276,13 +278,14 @@ def main() -> None:
         symbol_predictions = predictions_frame.iloc[
             sequence_offset : sequence_offset + sequences_per_symbol
         ]
-        symbol_panel = symbol_frames[symbol].iloc[-sequences_per_symbol:].copy()
+        actual_len = len(symbol_predictions)
+        symbol_panel = symbol_frames[symbol].iloc[-actual_len:].copy()
         sequence_offset += sequences_per_symbol
 
         symbol_panel["ai_verdict"] = symbol_predictions["ai_verdict"].values
         symbol_panel["ai_confidence"] = symbol_predictions["ai_confidence"].values
         symbol_panel["ai_qty_ratio"] = symbol_predictions["ai_qty_ratio"].values
-        symbol_panel["ai_take_profit_pct"] = symbol_predictions["ai_take_profit_pct"].values
+        symbol_panel["ai_take_profit_pct"] = symbol_predictions["ai_take_profit_pct"].values * 0.70 # 70% safety factor as requested
         symbol_panel["ai_stop_loss_pct"] = symbol_predictions["ai_stop_loss_pct"].values
 
         # Skip evaluate_ai_verdicts as run_paper_portfolio_on_signals now handles path simulation sequentially
@@ -309,66 +312,11 @@ def main() -> None:
             str(total_trades),
             f"{win_rate:.1f}%",
             f"{wins} / {losses}",
+            f"{paper_summary.get('total_fees_usd', 0):.2f}",
+            f"{paper_summary.get('total_pnl_net_usd', 0):.2f}",
             f"{paper_summary['final_equity_usd']:.2f}",
         )
 
-        detail_table = Table(
-            title=f"{symbol} — Realistic Sequential Backtest ({config.training.TEST_DAYS} days)",
-            show_header=True,
-            header_style="bold magenta",
-        )
-        detail_table.add_column("Metric", justify="left")
-        detail_table.add_column("Long", justify="right", style="buy")
-        detail_table.add_column("Short", justify="right", style="sell")
-        detail_table.add_column("Total", justify="right", style="bold")
-
-        long_trades = [t for t in trade_records if t.side == "LONG"]
-        short_trades = [t for t in trade_records if t.side == "SHORT"]
-
-        long_wins = sum(1 for t in long_trades if t.outcome == "SUCCESS")
-        long_losses = sum(1 for t in long_trades if t.outcome == "FAILED")
-        short_wins = sum(1 for t in short_trades if t.outcome == "SUCCESS")
-        short_losses = sum(1 for t in short_trades if t.outcome == "FAILED")
-
-        detail_table.add_row("Trades", str(len(long_trades)), str(len(short_trades)), str(total_trades))
-        detail_table.add_row("Wins", str(long_wins), str(short_wins), str(wins))
-        detail_table.add_row("Losses", str(long_losses), str(short_losses), str(losses))
-        detail_table.add_row(
-            "Final Equity $",
-            "—",
-            "—",
-            f"{paper_summary['final_equity_usd']:.2f}",
-        )
-        initial_cap = config.strategy.INITIAL_CAPITAL_USD
-        final_cap = paper_summary['final_equity_usd']
-        net_pnl_pct = ((final_cap - initial_cap) / initial_cap) * 100
-        total_fees = paper_summary.get('total_fees_usd', 0)
-        fees_pct = (total_fees / initial_cap) * 100
-
-        detail_table.add_row(
-            "Net PnL %",
-            "—",
-            "—",
-            f"{net_pnl_pct:.2f}%",
-        )
-        detail_table.add_row(
-            "Total Fees %",
-            "—",
-            "—",
-            f"{fees_pct:.2f}%",
-        )
-        detail_table.add_row(
-            "Loss→next win",
-            "—",
-            "—",
-            str(paper_summary.get("loss_then_win_count", 0)),
-        )
-        console.print(detail_table)
-        console.print(
-            f"[info]{symbol} paper book: trades={paper_summary['trade_count']} | "
-            f"fees≈${paper_summary.get('total_fees_usd', 0):.2f} | "
-            f"net PnL≈${paper_summary.get('total_pnl_net_usd', 0):.2f}[/info]"
-        )
         console.print("")
 
         # Track for global
@@ -401,24 +349,16 @@ def main() -> None:
         str(global_total_trades),
         f"{global_win_rate:.1f}%",
         f"{global_total_wins} / {global_total_losses}",
-        f"${global_final_capital:.2f}",
+        f"{global_total_fees:.2f}",
+        f"{(global_final_capital - global_initial_capital):.2f}",
+        f"{global_final_capital:.2f}",
         style="bold yellow"
     )
+
     
     console.print(summary_table)
-    
-    global_stats_table = Table(title="Global Portfolio Performance", show_header=True, header_style="bold green")
-    global_stats_table.add_column("Metric", justify="left")
-    global_stats_table.add_column("Value", justify="right", style="bold")
-    
-    global_stats_table.add_row("Total Initial Capital", f"${global_initial_capital:.2f}")
-    global_stats_table.add_row("Total Final Capital", f"${global_final_capital:.2f}")
-    global_stats_table.add_row("Global Net PnL %", f"{global_net_pnl_pct:.2f}%")
-    global_stats_table.add_row("Total Fees Paid", f"${global_total_fees:.2f}")
-    global_stats_table.add_row("Fees as % of Capital", f"{global_fees_pct:.2f}%")
-    global_stats_table.add_row("Total Trades Taken", str(global_total_trades))
-    
-    console.print(global_stats_table)
+
+
 
     if all_trade_records:
         df_trades = pd.DataFrame([vars(t) for t in all_trade_records])
@@ -447,101 +387,32 @@ def main() -> None:
         trades_csv_path = os.path.join(results_dir, "paper_trading_results.csv")
         df_trades.to_csv(trades_csv_path, index=False)
         
-        # 2. Easy UI Visualization: Generate a beautifully styled HTML Trade Log
-        html_styles = """
-        <style>
-            body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #e2e8f0; padding: 2rem; }
-            h1 { color: #38bdf8; text-align: center; margin-bottom: 2rem; }
-            table { width: 100%; border-collapse: collapse; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
-            th { background-color: #1e293b; color: #94a3b8; font-weight: 600; text-transform: uppercase; font-size: 0.85rem; padding: 1rem; text-align: left; border-bottom: 2px solid #334155; }
-            td { padding: 1rem; border-bottom: 1px solid #1e293b; font-size: 0.95rem; }
-            tr:hover { background-color: #1e293b; }
-            .success { color: #4ade80; font-weight: bold; }
-            .failed { color: #f87171; font-weight: bold; }
-            .long { color: #38bdf8; font-weight: bold; }
-            .short { color: #c084fc; font-weight: bold; }
-        </style>
-        """
-        # Add CSS classes for coloring
-        styled_df = df_trades.copy()
-        if 'outcome' in styled_df:
-            styled_df['outcome'] = styled_df['outcome'].apply(lambda x: f'<span class="success">{x}</span>' if x == 'SUCCESS' else f'<span class="failed">{x}</span>')
-        if 'side' in styled_df:
-            styled_df['side'] = styled_df['side'].apply(lambda x: f'<span class="long">{x}</span>' if x == 'LONG' else f'<span class="short">{x}</span>')
-        if 'pnl_net_usd' in styled_df:
-            styled_df['pnl_net_usd'] = styled_df['pnl_net_usd'].apply(lambda x: f'<span class="{"success" if float(x) > 0 else "failed"}">${x}</span>')
-            
-        html_content = f"""
-        <html><head><title>AI Trading Log</title>{html_styles}</head>
-        <body><h1>AI Trading Execution Log</h1>
-        {styled_df.to_html(escape=False, index=False, classes='trade-table')}
-        </body></html>
-        """
-        html_path = os.path.join(results_dir, "trade_log_dashboard.html")
-        with open(html_path, "w") as f:
-            f.write(html_content)
-
+        trades_csv_path = os.path.join(results_dir, "paper_trading_results.csv")
+        df_trades.to_csv(trades_csv_path, index=False)
         console.print(f"\n[bold green]✅ Saved formatted CSV to {trades_csv_path} ({len(df_trades)} trades)[/bold green]")
-        console.print(f"[bold cyan]✅ Created Interactive UI Trade Log at {html_path}[/bold cyan]")
-        
-    # Generate Advanced Visualizations
-    from plotly.subplots import make_subplots
-    
-    # 1. Portfolio Equity Curve (Individual + Global Total)
-    fig_equity = go.Figure()
-    
-    # Calculate Global Total Equity Curve
-    first_sym = symbols[0]
-    if first_sym in equity_curves:
-        total_equity_curve = np.zeros_like(equity_curves[first_sym]["equity"])
-        dates = equity_curves[first_sym]["dates"]
-        
-        for sym, data in equity_curves.items():
-            fig_equity.add_trace(go.Scatter(x=data["dates"], y=data["equity"], mode='lines', name=f"{sym} Equity", line=dict(width=1.5, dash='dot')))
-            # Add to total if shapes match
-            if len(data["equity"]) == len(total_equity_curve):
-                total_equity_curve += data["equity"]
-        
-        # Add the BOLD Global Total line
-        fig_equity.add_trace(go.Scatter(x=dates, y=total_equity_curve, mode='lines', name="TOTAL PORTFOLIO", line=dict(color='gold', width=4)))
 
-    fig_equity.update_layout(
-        title="Portfolio Capital Growth (Individual & Global Total)",
-        xaxis_title="Date/Time", yaxis_title="Account Equity (USD)",
-        template="plotly_dark", hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-    fig_equity.write_html(os.path.join(results_dir, "portfolio_equity_curve.html"))
+        
+    # -----------------------------------------------------------------------
+    # Final Summary Dashboard
+    # -----------------------------------------------------------------------
+    final_summary_table = Table(title="[bold gold]Final System Summary[/bold gold]", show_header=True, header_style="bold magenta")
+    final_summary_table.add_column("Parameter", style="cyan")
+    final_summary_table.add_column("Value", style="bold green")
 
-    # 2. Detailed Trade Visualizer (Price + Markers)
-    for sym, panel in symbol_panels_data.items():
-        fig_trades = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                   vertical_spacing=0.03, subplot_titles=(f"{sym} Price & Trades", "Equity Growth"),
-                                   row_width=[0.3, 0.7])
-        
-        # Price Trace
-        fig_trades.add_trace(go.Scatter(x=panel.index, y=panel['Close'], name='Price', line=dict(color='gray', width=1)), row=1, col=1)
-        
-        # Add Trade Markers
-        buys = panel[panel['ai_verdict'] == 0]
-        sells = panel[panel['ai_verdict'] == 2]
-        
-        fig_trades.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers', name='Buy Signal',
-                                        marker=dict(symbol='triangle-up', size=10, color='green')), row=1, col=1)
-        fig_trades.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers', name='Sell Signal',
-                                        marker=dict(symbol='triangle-down', size=10, color='red')), row=1, col=1)
-        
-        # Equity Trace on Subplot 2
-        fig_trades.add_trace(go.Scatter(x=panel.index, y=panel['paper_equity_curve'], name='Equity', line=dict(color='cyan')), row=2, col=1)
-        
-        fig_trades.update_layout(height=800, title_text=f"{sym} Detailed Trade Analytics", template="plotly_dark")
-        fig_trades.write_html(os.path.join(results_dir, f"{sym}_detailed_analytics.html"))
+    final_summary_table.add_row("Training Epochs", str(config.training.EPOCHS))
+    final_summary_table.add_row("Training History Days", str(config.data.TOTAL_DAYS))
+    final_summary_table.add_row("Backtest Testing Days", str(config.training.TEST_DAYS))
+    final_summary_table.add_row("Total Initial Capital", f"${global_initial_capital:.2f}")
+    final_summary_table.add_row("Total Final Capital", f"${global_final_capital:.2f}")
+    final_summary_table.add_row("Net Profit/Loss", f"${(global_final_capital - global_initial_capital):.2f}")
+    final_summary_table.add_row("Percentage Growth", f"{global_net_pnl_pct:.2f}%")
+    final_summary_table.add_row("Total Trades (Global)", str(global_total_trades))
+    final_summary_table.add_row("Overall Win Rate", f"{global_win_rate:.1f}%")
+    final_summary_table.add_row("Total Fees Paid", f"${global_total_fees:.2f}")
 
-    console.print(f"\n[bold cyan]📊 All visualizations saved to the '{results_dir}' folder:[/bold cyan]")
-    console.print(f"  - portfolio_equity_curve.html (Individual + TOTAL)")
-    console.print(f"  - trade_log_dashboard.html (Beautiful Interactive Trade Table)")
-    for sym in symbols:
-        console.print(f"  - {sym}_detailed_analytics.html (Price + Buy/Sell Markers)")
+    console.print("\n")
+    console.print(final_summary_table)
+
         
     console.print(
         f"\n[info]Model evaluation completed on {config.training.TEST_DAYS} held-out days. | lookahead={config.features.LOOKAHEAD_BARS} bars | "
