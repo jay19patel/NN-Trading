@@ -11,11 +11,11 @@ import numpy as np
 import torch
 from sklearn.metrics import (
     accuracy_score,
+    balanced_accuracy_score,
     classification_report,
     confusion_matrix,
     f1_score,
     mean_absolute_error,
-    mean_squared_error,
 )
 
 
@@ -77,6 +77,9 @@ def classification_metrics_numpy(
 ) -> Dict[str, float | str]:
     macro_f1 = f1_score(true_direction, predicted_direction, average="macro", zero_division=0)
     weighted_f1 = f1_score(true_direction, predicted_direction, average="weighted", zero_division=0)
+    balanced_acc = balanced_accuracy_score(true_direction, predicted_direction)
+    class_counts = np.bincount(true_direction.astype(int), minlength=3)
+    majority_baseline = class_counts.max() / max(class_counts.sum(), 1)
     report = classification_report(
         true_direction,
         predicted_direction,
@@ -88,6 +91,8 @@ def classification_metrics_numpy(
     return {
         "f1_macro": float(macro_f1),
         "f1_weighted": float(weighted_f1),
+        "balanced_accuracy": float(balanced_acc),
+        "majority_class_baseline_accuracy": float(majority_baseline),
         "classification_report_text": report,
         "confusion_matrix_3x3": confusion.tolist(),
     }

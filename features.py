@@ -6,6 +6,68 @@ from scipy import stats
 from config import config
 from ui_utils import console, get_progress
 
+
+FEATURE_CACHE_VERSION = config.data.FEATURE_CACHE_VERSION
+
+
+def _ffill_only(series: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    """Forward fill only so we do not leak future values into earlier rows."""
+    return series.ffill()
+
+
+def _daily_vwap(df: pd.DataFrame) -> pd.Series:
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    session_key = pd.to_datetime(df.index).normalize()
+    cumulative_pv = (typical_price * df["Volume"]).groupby(session_key).cumsum()
+    cumulative_volume = df["Volume"].groupby(session_key).cumsum()
+    return cumulative_pv / cumulative_volume.replace(0, np.nan)
+
+
+def _simulate_trade_path(
+    close_prices: np.ndarray,
+    high_prices: np.ndarray,
+    low_prices: np.ndarray,
+    row_index: int,
+    lookahead: int,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    direction: str,
+) -> tuple[str, float]:
+    """Return first-hit path outcome and signed pnl percent for a candidate trade."""
+    entry_price = float(close_prices[row_index])
+    final_close = float(close_prices[row_index + lookahead])
+
+    if direction == "long":
+        take_profit_price = entry_price * (1 + take_profit_pct / 100.0)
+        stop_loss_price = entry_price * (1 - stop_loss_pct / 100.0)
+    else:
+        take_profit_price = entry_price * (1 - take_profit_pct / 100.0)
+        stop_loss_price = entry_price * (1 + stop_loss_pct / 100.0)
+
+    for step in range(1, lookahead + 1):
+        bar_high = float(high_prices[row_index + step])
+        bar_low = float(low_prices[row_index + step])
+        if direction == "long":
+            hit_stop = bar_low <= stop_loss_price
+            hit_target = bar_high >= take_profit_price
+        else:
+            hit_stop = bar_high >= stop_loss_price
+            hit_target = bar_low <= take_profit_price
+
+        if hit_stop and hit_target:
+            return "FAILED", -stop_loss_pct
+        if hit_stop:
+            return "FAILED", -stop_loss_pct
+        if hit_target:
+            return "SUCCESS", take_profit_pct
+
+    if direction == "long":
+        timeout_pnl = ((final_close - entry_price) / entry_price) * 100.0
+    else:
+        timeout_pnl = ((entry_price - final_close) / entry_price) * 100.0
+    return "TIMEOUT", timeout_pnl
+
+
 def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add fundamental price and volume based features"""
     df['close_return'] = np.log(df['Close'] / df['Close'].shift(1))
@@ -29,20 +91,26 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
     """Add various moving averages to identify trends"""
-    for period in [5, 10, 20, 50, 100]:
-        df[f'EMA_{period}'] = ta.ema(df['Close'], length=period).bfill()
+    for period in [5, 10, 20, 50, 100, 200]:
+        df[f'EMA_{period}'] = _ffill_only(ta.ema(df['Close'], length=period))
 
     for period in [20, 50, 100, 200]:
-        df[f'SMA_{period}'] = ta.sma(df['Close'], length=period).bfill()
+        df[f'SMA_{period}'] = _ffill_only(ta.sma(df['Close'], length=period))
 
     df['price_to_ema_5'] = (df['Close'] - df['EMA_5']) / df['EMA_5']
     df['price_to_ema_20'] = (df['Close'] - df['EMA_20']) / df['EMA_20']
+    df['price_to_ema_50'] = (df['Close'] - df['EMA_50']) / df['EMA_50']
+    df['price_to_ema_100'] = (df['Close'] - df['EMA_100']) / df['EMA_100']
+    df['price_to_ema_200'] = (df['Close'] - df['EMA_200']) / df['EMA_200']
     df['price_to_sma_50'] = (df['Close'] - df['SMA_50']) / df['SMA_50']
+    df['price_to_sma_200'] = (df['Close'] - df['SMA_200']) / df['SMA_200']
 
     df['ema_5_10_cross'] = df['EMA_5'] - df['EMA_10']
     df['ema_10_20_cross'] = df['EMA_10'] - df['EMA_20']
+    df['ema_5_10_cross_pct'] = (df['EMA_5'] - df['EMA_10']) / df['Close']
+    df['ema_10_20_cross_pct'] = (df['EMA_10'] - df['EMA_20']) / df['Close']
 
-    df['VWAP'] = ta.vwap(df['High'], df['Low'], df['Close'], df['Volume']).bfill()
+    df['VWAP'] = _daily_vwap(df)
     df['price_to_vwap'] = (df['Close'] - df['VWAP']) / df['VWAP']
 
     return df
@@ -50,44 +118,45 @@ def add_moving_averages(df: pd.DataFrame) -> pd.DataFrame:
 def add_momentum_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add momentum oscillators to identify overbought/oversold conditions"""
     for period in [7, 14, 21]:
-        df[f'RSI_{period}'] = ta.rsi(df['Close'], length=period).bfill()
+        df[f'RSI_{period}'] = _ffill_only(ta.rsi(df['Close'], length=period))
 
     macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
-    df['MACD'] = macd['MACD_12_26_9'].bfill()
-    df['MACD_signal'] = macd['MACDs_12_26_9'].bfill()
-    df['MACD_hist'] = macd['MACDh_12_26_9'].bfill()
+    df['MACD'] = _ffill_only(macd['MACD_12_26_9'])
+    df['MACD_signal'] = _ffill_only(macd['MACDs_12_26_9'])
+    df['MACD_hist'] = _ffill_only(macd['MACDh_12_26_9'])
+    df['MACD_hist_pct'] = df['MACD_hist'] / df['Close']
 
     stoch = ta.stoch(df['High'], df['Low'], df['Close'], k=14, d=3)
-    df['Stoch_K'] = stoch['STOCHk_14_3_3'].bfill()
-    df['Stoch_D'] = stoch['STOCHd_14_3_3'].bfill()
+    df['Stoch_K'] = _ffill_only(stoch['STOCHk_14_3_3'])
+    df['Stoch_D'] = _ffill_only(stoch['STOCHd_14_3_3'])
 
-    df['CCI_20'] = ta.cci(df['High'], df['Low'], df['Close'], length=20).bfill()
-    df['WilliamsR_14'] = ta.willr(df['High'], df['Low'], df['Close'], length=14).bfill()
-    df['ROC_10'] = ta.roc(df['Close'], length=10).bfill()
-    df['ROC_20'] = ta.roc(df['Close'], length=20).bfill()
+    df['CCI_20'] = _ffill_only(ta.cci(df['High'], df['Low'], df['Close'], length=20))
+    df['WilliamsR_14'] = _ffill_only(ta.willr(df['High'], df['Low'], df['Close'], length=14))
+    df['ROC_10'] = _ffill_only(ta.roc(df['Close'], length=10))
+    df['ROC_20'] = _ffill_only(ta.roc(df['Close'], length=20))
 
     return df
 
 def add_volatility_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add volatility measures to gauge market risk and movement potential"""
     for period in [7, 14, 21]:
-        df[f'ATR_{period}'] = ta.atr(df['High'], df['Low'], df['Close'], length=period).bfill()
+        df[f'ATR_{period}'] = _ffill_only(ta.atr(df['High'], df['Low'], df['Close'], length=period))
 
     df['ATR_pct'] = (df['ATR_14'] / df['Close']) * 100
 
     bbands = ta.bbands(df['Close'], length=20, std=2)
     if bbands is not None:
-         df['BB_upper'] = bbands.iloc[:, 2].bfill()
-         df['BB_middle'] = bbands.iloc[:, 1].bfill()
-         df['BB_lower'] = bbands.iloc[:, 0].bfill()
+         df['BB_upper'] = _ffill_only(bbands.iloc[:, 2])
+         df['BB_middle'] = _ffill_only(bbands.iloc[:, 1])
+         df['BB_lower'] = _ffill_only(bbands.iloc[:, 0])
 
     df['BB_width'] = ((df['BB_upper'] - df['BB_lower']) / df['BB_middle']) * 100
     df['BB_position'] = (df['Close'] - df['BB_lower']) / (df['BB_upper'] - df['BB_lower'])
 
     kc = ta.kc(df['High'], df['Low'], df['Close'], length=20, scalar=2)
     if kc is not None:
-        df['KC_upper'] = kc.iloc[:, 2].bfill()
-        df['KC_lower'] = kc.iloc[:, 0].bfill()
+        df['KC_upper'] = _ffill_only(kc.iloc[:, 2])
+        df['KC_lower'] = _ffill_only(kc.iloc[:, 0])
 
     df['volatility_10'] = df['Close'].pct_change().rolling(10).std()
     df['volatility_20'] = df['Close'].pct_change().rolling(20).std()
@@ -99,22 +168,23 @@ def add_trend_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add indicators that measure trend strength and direction"""
     for period in [14, 20]:
         adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=period)
-        df[f'ADX_{period}'] = adx_df[f'ADX_{period}'].bfill()
-        df[f'DMP_{period}'] = adx_df[f'DMP_{period}'].bfill()
-        df[f'DMN_{period}'] = adx_df[f'DMN_{period}'].bfill()
+        df[f'ADX_{period}'] = _ffill_only(adx_df[f'ADX_{period}'])
+        df[f'DMP_{period}'] = _ffill_only(adx_df[f'DMP_{period}'])
+        df[f'DMN_{period}'] = _ffill_only(adx_df[f'DMN_{period}'])
 
     df['directional_bias'] = df['DMP_14'] - df['DMN_14']
 
     supertrend = ta.supertrend(df['High'], df['Low'], df['Close'], length=10, multiplier=3)
-    df['supertrend'] = supertrend["SUPERT_10_3"].bfill()
-    df['supertrend_direction'] = supertrend["SUPERTd_10_3"].bfill()
+    df['supertrend'] = _ffill_only(supertrend["SUPERT_10_3"])
+    df['supertrend_direction'] = _ffill_only(supertrend["SUPERTd_10_3"])
+    df['supertrend_distance'] = (df['Close'] - df['supertrend']) / df['Close']
 
     df['st_flip'] = df['supertrend_direction'].diff().abs()
     df['bars_since_flip'] = df.groupby((df['st_flip'] == 2).cumsum()).cumcount()
 
     aroon = ta.aroon(df['High'], df['Low'], length=25)
-    df['aroon_up'] = aroon['AROONU_25'].bfill()
-    df['aroon_down'] = aroon['AROOND_25'].bfill()
+    df['aroon_up'] = _ffill_only(aroon['AROONU_25'])
+    df['aroon_down'] = _ffill_only(aroon['AROOND_25'])
     df['aroon_oscillator'] = df['aroon_up'] - df['aroon_down']
 
     return df
@@ -136,12 +206,18 @@ def add_regime_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_volume_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add volume-based indicators to confirm price movements"""
-    df['OBV'] = ta.obv(df['Close'], df['Volume']).bfill()
-    df['OBV_ema'] = ta.ema(df['OBV'], length=20).bfill()
-    df['AD'] = ta.ad(df['High'], df['Low'], df['Close'], df['Volume']).bfill()
-    df['CMF'] = ta.cmf(df['High'], df['Low'], df['Close'], df['Volume'], length=20).bfill()
-    df['MFI'] = ta.mfi(df['High'], df['Low'], df['Close'], df['Volume'], length=14).bfill()
-    df['VPT'] = ta.pvt(df['Close'], df['Volume']).bfill()
+    df['OBV'] = _ffill_only(ta.obv(df['Close'], df['Volume']))
+    df['OBV_ema'] = _ffill_only(ta.ema(df['OBV'], length=20))
+    df['OBV_change_20'] = df['OBV'].pct_change(20).replace([np.inf, -np.inf], np.nan)
+    df['AD'] = _ffill_only(ta.ad(df['High'], df['Low'], df['Close'], df['Volume']))
+    df['CMF'] = _ffill_only(ta.cmf(df['High'], df['Low'], df['Close'], df['Volume'], length=20))
+    df['MFI'] = _ffill_only(ta.mfi(df['High'], df['Low'], df['Close'], df['Volume'], length=14))
+    df['VPT'] = _ffill_only(ta.pvt(df['Close'], df['Volume']))
+    df['volume_change_5'] = df['Volume'].pct_change(5).replace([np.inf, -np.inf], np.nan)
+    df['volume_zscore_20'] = (
+        (df['Volume'] - df['Volume'].rolling(20).mean())
+        / (df['Volume'].rolling(20).std() + 1e-6)
+    )
     return df
 
 def add_candle_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -270,27 +346,116 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features['vol_atr_ratio'] = (df['volume_ratio'] if 'volume_ratio' in df else 1.0) / (df['ATR_pct'] + 0.0001)
     return pd.concat([df, new_features], axis=1)
 
+
+def add_pattern_setup_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Past-only setup features for scalp pattern learning.
+
+    These columns describe *where a trader might look*, while oracle labels later
+    decide whether that setup actually paid after costs. This keeps the model from
+    trying to predict every noisy candle as a trade.
+    """
+    new_features = pd.DataFrame(index=df.index)
+
+    volume_ratio = df.get("volume_ratio", pd.Series(1.0, index=df.index)).fillna(1.0)
+    atr_pct = df.get("ATR_pct", pd.Series(0.0, index=df.index)).fillna(0.0)
+    bb_width = df.get("BB_width", pd.Series(0.0, index=df.index)).fillna(0.0)
+    bb_width_ma = bb_width.rolling(50).mean()
+    close_position = df.get("close_position", pd.Series(0.5, index=df.index)).fillna(0.5)
+    bb_position = df.get("BB_position", pd.Series(0.5, index=df.index)).fillna(0.5)
+    rsi = df.get("RSI_14", pd.Series(50.0, index=df.index)).fillna(50.0)
+    macd_hist_pct = df.get("MACD_hist_pct", pd.Series(0.0, index=df.index)).fillna(0.0)
+    trend_strength = df.get("trend_strength", pd.Series(0.0, index=df.index)).fillna(0.0)
+    adx = df.get("ADX_14", pd.Series(0.0, index=df.index)).fillna(0.0)
+    directional_bias = df.get("directional_bias", pd.Series(0.0, index=df.index)).fillna(0.0)
+    return_5 = df.get("return_5", pd.Series(0.0, index=df.index)).fillna(0.0)
+    return_10 = df.get("return_10", pd.Series(0.0, index=df.index)).fillna(0.0)
+    zscore_20 = df.get("zscore_20", pd.Series(0.0, index=df.index)).fillna(0.0)
+    wick_imbalance = df.get("wick_imbalance", pd.Series(0.0, index=df.index)).fillna(0.0)
+    candle_strength = df.get("candle_strength", pd.Series(0.0, index=df.index)).fillna(0.0)
+    chop_index = df.get("chop_index", pd.Series(50.0, index=df.index)).fillna(50.0)
+    supertrend_direction = df.get("supertrend_direction", pd.Series(0.0, index=df.index)).fillna(0.0)
+    price_to_ema_20 = df.get("price_to_ema_20", pd.Series(0.0, index=df.index)).fillna(0.0)
+
+    trend_long = (
+        (supertrend_direction > 0)
+        & (price_to_ema_20 > -0.002)
+        & (directional_bias > 0)
+        & (adx > 14)
+    )
+    trend_short = (
+        (supertrend_direction < 0)
+        & (price_to_ema_20 < 0.002)
+        & (directional_bias < 0)
+        & (adx > 14)
+    )
+
+    pullback_long = trend_long & (rsi.between(38, 58)) & (return_5 < 0.002) & (close_position > 0.35)
+    pullback_short = trend_short & (rsi.between(42, 62)) & (return_5 > -0.002) & (close_position < 0.65)
+
+    compression = (bb_width < bb_width_ma) & (chop_index < 65) & (atr_pct > 0.08)
+    breakout_long = compression & (close_position > 0.68) & (return_5 > 0) & (volume_ratio > 1.05)
+    breakout_short = compression & (close_position < 0.32) & (return_5 < 0) & (volume_ratio > 1.05)
+
+    reversal_long = (
+        (zscore_20 < -1.0)
+        & (rsi < 42)
+        & (wick_imbalance < 0)
+        & (close_position > 0.45)
+        & (candle_strength > 0.25)
+    )
+    reversal_short = (
+        (zscore_20 > 1.0)
+        & (rsi > 58)
+        & (wick_imbalance > 0)
+        & (close_position < 0.55)
+        & (candle_strength > 0.25)
+    )
+
+    trend_quality = np.clip((adx - 12.0) / 25.0, 0.0, 1.0)
+    volume_quality = np.clip((volume_ratio - 0.8) / 1.2, 0.0, 1.0)
+    volatility_quality = np.clip(atr_pct / 0.8, 0.0, 1.0)
+    momentum_long = np.clip((macd_hist_pct * 1000.0) + (return_10 * 8.0), -1.0, 1.0)
+    momentum_short = np.clip((-macd_hist_pct * 1000.0) + (-return_10 * 8.0), -1.0, 1.0)
+
+    long_setup_score = (
+        pullback_long.astype(float) * 0.35
+        + breakout_long.astype(float) * 0.35
+        + reversal_long.astype(float) * 0.30
+        + trend_quality * 0.10
+        + volume_quality * 0.08
+        + volatility_quality * 0.07
+        + np.clip(momentum_long, 0.0, 1.0) * 0.10
+    )
+    short_setup_score = (
+        pullback_short.astype(float) * 0.35
+        + breakout_short.astype(float) * 0.35
+        + reversal_short.astype(float) * 0.30
+        + trend_quality * 0.10
+        + volume_quality * 0.08
+        + volatility_quality * 0.07
+        + np.clip(momentum_short, 0.0, 1.0) * 0.10
+    )
+
+    new_features["trend_pullback_long_setup"] = pullback_long.astype(int)
+    new_features["trend_pullback_short_setup"] = pullback_short.astype(int)
+    new_features["breakout_long_setup"] = breakout_long.astype(int)
+    new_features["breakout_short_setup"] = breakout_short.astype(int)
+    new_features["reversal_long_setup"] = reversal_long.astype(int)
+    new_features["reversal_short_setup"] = reversal_short.astype(int)
+    new_features["long_setup_score"] = np.clip(long_setup_score, 0.0, 1.0)
+    new_features["short_setup_score"] = np.clip(short_setup_score, 0.0, 1.0)
+    new_features["setup_score_spread"] = new_features["long_setup_score"] - new_features["short_setup_score"]
+    new_features["compression_breakout_score"] = compression.astype(float) * volume_quality
+
+    return pd.concat([df, new_features], axis=1)
+
 def add_oracle_target_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Oracle Labeling Engine — uses ACTUAL future price data to derive per-bar TP and SL.
+    Build path-consistent oracle labels from future excursion estimates.
 
-    Strategy (as approved):
-      - Look N bars ahead (done already in add_risk_reward_features)
-      - upside_pct  = (future_max_high - close) / close * 100
-      - downside_pct = (future_min_low  - close) / close * 100  [negative number]
-
-      - LONG  TP = upside_pct    * ORACLE_TP_CAPTURE_RATIO  (e.g. 70% of max high)
-      - LONG  SL = abs_down_pct  * ORACLE_SL_CAPTURE_RATIO  (e.g. 50% of min low)
-      - SHORT TP = abs_down_pct  * ORACLE_TP_CAPTURE_RATIO
-      - SHORT SL = upside_pct    * ORACLE_SL_CAPTURE_RATIO
-
-      Direction:
-        LONG  if upside > abs_downside AND long_rr  >= ORACLE_MIN_RR AND upside >= MIN_UPSIDE
-        SHORT if abs_down > upside     AND short_rr >= ORACLE_MIN_RR AND abs_down >= MIN_DOWN
-        NEUTRAL otherwise
-
-    Requires: upside_pct, downside_pct columns (from add_risk_reward_features).
-    NOTE: These columns are excluded from model inputs to prevent data leakage.
+    The forward-looking columns remain excluded from model inputs; they are only used
+    to create labels that match the same first-hit logic used in the backtest.
     """
     if "upside_pct" not in df.columns or "downside_pct" not in df.columns:
         raise ValueError(
@@ -300,10 +465,21 @@ def add_oracle_target_labels(df: pd.DataFrame) -> pd.DataFrame:
 
     strategy = config.strategy
     row_count = len(df)
+    lookahead = config.features.LOOKAHEAD_BARS
 
-    upside_pct   = df["upside_pct"].values.astype(np.float64)   # positive: max future high %
-    downside_pct = df["downside_pct"].values.astype(np.float64)  # negative: min future low %
+    upside_pct = df["upside_pct"].values.astype(np.float64)
+    downside_pct = df["downside_pct"].values.astype(np.float64)
     abs_down_pct = np.abs(downside_pct)
+    close_prices = df["Close"].values.astype(np.float64)
+    high_prices = df["High"].values.astype(np.float64)
+    low_prices = df["Low"].values.astype(np.float64)
+    long_setup_score = df.get("long_setup_score", pd.Series(1.0, index=df.index)).values.astype(np.float64)
+    short_setup_score = df.get("short_setup_score", pd.Series(1.0, index=df.index)).values.astype(np.float64)
+    estimated_trade_cost_pct = (
+        strategy.ROUND_TRIP_FEE_PCT
+        + (2.0 * strategy.SLIPPAGE_PCT)
+        + strategy.COST_BUFFER_PCT
+    )
 
     # ------------------------------------------------------------------
     # LONG oracle levels
@@ -335,55 +511,85 @@ def add_oracle_target_labels(df: pd.DataFrame) -> pd.DataFrame:
     )
     oracle_rr_short = oracle_tp_short / (oracle_sl_short + 1e-6)
 
-    # ------------------------------------------------------------------
-    # Direction labeling
-    # LONG  wins when upside capacity is greater
-    # SHORT wins when downside capacity is greater
-    # Both need their R:R to be >= ORACLE_MIN_RR
-    # ------------------------------------------------------------------
-    long_mask = (
-        (upside_pct >= strategy.ORACLE_MIN_UPSIDE_PCT)
-        & (oracle_rr_long >= strategy.ORACLE_MIN_RR)
-        & (upside_pct > abs_down_pct)
-    )
-    short_mask = (
-        (abs_down_pct >= strategy.ORACLE_MIN_DOWNSIDE_PCT)
-        & (oracle_rr_short >= strategy.ORACLE_MIN_RR)
-        & (abs_down_pct > upside_pct)
-        & ~long_mask  # Prevent double-labeling
-    )
-
-    labels = np.ones(row_count, dtype=np.float64)       # 1 = NEUTRAL (default)
-    labels[long_mask]  = 0.0                            # 0 = LONG
-    labels[short_mask] = 2.0                            # 2 = SHORT
-
-    # Set per-row TP/SL from the winning direction
-    label_tp_pct = np.where(labels == 0, oracle_tp_long,
-                   np.where(labels == 2, oracle_tp_short,
-                            strategy.ORACLE_MIN_TP_PCT))
-    label_sl_pct = np.where(labels == 0, oracle_sl_long,
-                   np.where(labels == 2, oracle_sl_short,
-                            strategy.ORACLE_MIN_SL_PCT))
-
-    # Actual PnL stored for the RL loss (positive = profitable outcome)
+    labels = np.ones(row_count, dtype=np.float64)
+    label_tp_pct = np.full(row_count, strategy.ORACLE_MIN_TP_PCT, dtype=np.float64)
+    label_sl_pct = np.full(row_count, strategy.ORACLE_MIN_SL_PCT, dtype=np.float64)
     actual_pnl_pct_arr = np.zeros(row_count, dtype=np.float64)
-    actual_pnl_pct_arr[labels == 0] =  oracle_tp_long[labels == 0]
-    actual_pnl_pct_arr[labels == 2] =  oracle_tp_short[labels == 2]
+    winning_rr = np.ones(row_count, dtype=np.float64)
+    best_capacity = np.zeros(row_count, dtype=np.float64)
+
+    for row_index in range(row_count - lookahead):
+        long_outcome, long_pnl = _simulate_trade_path(
+            close_prices,
+            high_prices,
+            low_prices,
+            row_index,
+            lookahead,
+            float(oracle_tp_long[row_index]),
+            float(oracle_sl_long[row_index]),
+            "long",
+        )
+        short_outcome, short_pnl = _simulate_trade_path(
+            close_prices,
+            high_prices,
+            low_prices,
+            row_index,
+            lookahead,
+            float(oracle_tp_short[row_index]),
+            float(oracle_sl_short[row_index]),
+            "short",
+        )
+
+        long_eligible = (
+            upside_pct[row_index] >= strategy.ORACLE_MIN_UPSIDE_PCT
+            and oracle_rr_long[row_index] >= strategy.ORACLE_MIN_RR
+            and oracle_tp_long[row_index] >= estimated_trade_cost_pct
+            and long_outcome == "SUCCESS"
+            and (
+                not strategy.REQUIRE_PATTERN_SETUP_FOR_ORACLE
+                or long_setup_score[row_index] >= strategy.MIN_ORACLE_SETUP_SCORE
+            )
+        )
+        short_eligible = (
+            abs_down_pct[row_index] >= strategy.ORACLE_MIN_DOWNSIDE_PCT
+            and oracle_rr_short[row_index] >= strategy.ORACLE_MIN_RR
+            and oracle_tp_short[row_index] >= estimated_trade_cost_pct
+            and short_outcome == "SUCCESS"
+            and (
+                not strategy.REQUIRE_PATTERN_SETUP_FOR_ORACLE
+                or short_setup_score[row_index] >= strategy.MIN_ORACLE_SETUP_SCORE
+            )
+        )
+
+        if long_eligible and (
+            not short_eligible
+            or long_pnl > short_pnl
+            or (np.isclose(long_pnl, short_pnl) and oracle_rr_long[row_index] >= oracle_rr_short[row_index])
+        ):
+            labels[row_index] = 0.0
+            label_tp_pct[row_index] = oracle_tp_long[row_index]
+            label_sl_pct[row_index] = oracle_sl_long[row_index]
+            actual_pnl_pct_arr[row_index] = long_pnl - estimated_trade_cost_pct
+            winning_rr[row_index] = oracle_rr_long[row_index]
+            best_capacity[row_index] = upside_pct[row_index]
+        elif short_eligible:
+            labels[row_index] = 2.0
+            label_tp_pct[row_index] = oracle_tp_short[row_index]
+            label_sl_pct[row_index] = oracle_sl_short[row_index]
+            actual_pnl_pct_arr[row_index] = short_pnl - estimated_trade_cost_pct
+            winning_rr[row_index] = oracle_rr_short[row_index]
+            best_capacity[row_index] = abs_down_pct[row_index]
 
     # ------------------------------------------------------------------
     # Capacity score — how much "room" exists in the winning direction
     # Normalized 0-1; model uses this to learn position sizing
     # ------------------------------------------------------------------
-    best_capacity = np.where(labels == 0, upside_pct,
-                    np.where(labels == 2, abs_down_pct, 0.0))
     oracle_capacity_score = np.clip(best_capacity / strategy.ORACLE_MAX_TP_PCT, 0.0, 1.0)
 
     # ------------------------------------------------------------------
     # qty_ratio — composite sizing signal for the sizing_head target
     # Higher R:R + bigger capacity = larger sizing confidence
     # ------------------------------------------------------------------
-    winning_rr = np.where(labels == 0, oracle_rr_long,
-                 np.where(labels == 2, oracle_rr_short, 1.0))
     rr_bonus       = np.clip((winning_rr - strategy.ORACLE_MIN_RR) * 0.10, 0.0, 0.30)
     capacity_bonus = np.clip(oracle_capacity_score * 0.20, 0.0, 0.20)
     qty_ratio_arr  = np.clip(0.50 + rr_bonus + capacity_bonus, 0.10, 1.0)
@@ -437,57 +643,40 @@ def add_target_labels(df: pd.DataFrame, lookahead: int = 192) -> pd.DataFrame:
     actual_pnl_pct_arr = np.zeros(row_count, dtype=np.float64)
 
     for row_index in range(row_count - lookahead):
-        entry_price = close_prices[row_index]
         take_profit_pct = float(take_profit_pct_per_row[row_index])
         stop_loss_pct = float(stop_loss_pct_per_row[row_index])
 
-        take_profit_price_long = entry_price * (1 + take_profit_pct / 100)
-        stop_loss_price_long = entry_price * (1 - stop_loss_pct / 100)
+        long_outcome, long_pnl = _simulate_trade_path(
+            close_prices,
+            high_prices,
+            low_prices,
+            row_index,
+            lookahead,
+            take_profit_pct,
+            stop_loss_pct,
+            "long",
+        )
+        short_outcome, short_pnl = _simulate_trade_path(
+            close_prices,
+            high_prices,
+            low_prices,
+            row_index,
+            lookahead,
+            take_profit_pct,
+            stop_loss_pct,
+            "short",
+        )
 
-        # Baseline: timeout PnL
-        final_close = close_prices[row_index + lookahead]
-
-        # Try long
-        long_failed = False
-        for step_index in range(1, lookahead + 1):
-            bar_low = low_prices[row_index + step_index]
-            bar_high = high_prices[row_index + step_index]
-            hit_stop_first = bar_low <= stop_loss_price_long
-            hit_target_first = bar_high >= take_profit_price_long
-            if hit_stop_first and hit_target_first:
-                long_failed = True
-                break
-            if hit_stop_first:
-                long_failed = True
-                break
-            if hit_target_first:
-                labels[row_index] = 0
-                actual_pnl_pct_arr[row_index] = take_profit_pct
-                break
-
-        if labels[row_index] == 1:
-            # Try short
-            take_profit_price_short = entry_price * (1 - take_profit_pct / 100)
-            stop_loss_price_short = entry_price * (1 + stop_loss_pct / 100)
-            for step_index in range(1, lookahead + 1):
-                bar_low = low_prices[row_index + step_index]
-                bar_high = high_prices[row_index + step_index]
-                hit_stop_first = bar_high >= stop_loss_price_short
-                hit_target_first = bar_low <= take_profit_price_short
-                if hit_stop_first and hit_target_first:
-                    actual_pnl_pct_arr[row_index] = -stop_loss_pct
-                    break
-                if hit_stop_first:
-                    actual_pnl_pct_arr[row_index] = -stop_loss_pct
-                    break
-                if hit_target_first:
-                    labels[row_index] = 2
-                    actual_pnl_pct_arr[row_index] = take_profit_pct
-                    break
-                    
-            if labels[row_index] == 1:
-                # Still Hold
-                actual_pnl_pct_arr[row_index] = 0.0
+        if long_outcome == "SUCCESS" and (
+            short_outcome != "SUCCESS" or long_pnl >= short_pnl
+        ):
+            labels[row_index] = 0
+            actual_pnl_pct_arr[row_index] = long_pnl
+        elif short_outcome == "SUCCESS":
+            labels[row_index] = 2
+            actual_pnl_pct_arr[row_index] = short_pnl
+        else:
+            actual_pnl_pct_arr[row_index] = 0.0
 
     df["label_take_profit_pct"] = take_profit_pct_per_row
     df["label_stop_loss_pct"] = stop_loss_pct_per_row
@@ -524,6 +713,7 @@ def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFra
         ("Market Regime (Chop)", add_regime_features),
         ("Risk-Reward Profile", lambda d: add_risk_reward_features(d, lookahead)),
         ("Interactions", add_interaction_features),
+        ("Pattern Setups", add_pattern_setup_features),
         # Route to Oracle labeler if enabled; falls back to ATR-based labeler
         ("Oracle Target Labels" if config.strategy.USE_ORACLE_LABELS else "ATR Target Labels",
          add_oracle_target_labels if config.strategy.USE_ORACLE_LABELS else add_target_labels),
@@ -537,7 +727,8 @@ def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFra
             df = func(df)
             progress.update(task, advance=1)
 
-    # Clean up NaNs
-    df = df.ffill().bfill().fillna(0)
+    # Clean up without backward-filling future values into earlier rows.
+    df["feature_cache_version"] = FEATURE_CACHE_VERSION
+    df = df.ffill().fillna(0)
     console.print(f"[success]✅ Feature engineering complete![/success] Total features: [bold]{len(df.columns)}[/bold]")
     return df

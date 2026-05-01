@@ -103,9 +103,20 @@ def run_paper_portfolio_on_signals(
     # Daily trade tracking
     last_day: str | None = None
     daily_trade_count: int = 0
-    MAX_DAILY_TRADES: int = 5    # Max 5 trades per symbol per day as requested
+    consecutive_losses: int = 0
+    cooldown_bars_left: int = 0
+    daily_start_equity = equity_usd
+    trading_locked_for_day = False
+    max_daily_trades = config.strategy.MAX_DAILY_TRADES
+    cooldown_bars = config.strategy.COOLDOWN_BARS
+    max_consecutive_losses = config.strategy.MAX_CONSECUTIVE_LOSSES
+    daily_stop_loss_fraction = config.strategy.DAILY_STOP_LOSS_PCT / 100.0
+    break_even_after_r = config.strategy.BREAK_EVEN_AFTER_R
+    trail_stop_after_r = config.strategy.TRAIL_STOP_AFTER_R
+    trail_stop_r_multiple = config.strategy.TRAIL_STOP_R_MULTIPLE
 
     for i in range(len(working_frame)):
+        equity_by_bar.append(equity_usd)
         row = working_frame.iloc[i]
         curr_price = float(row["Close"])
         curr_high = float(row["High"])
@@ -113,6 +124,17 @@ def run_paper_portfolio_on_signals(
         curr_time = str(row.name)
         if "Date" in row:
             curr_time = str(row["Date"])
+
+        curr_day = curr_time.split(" ")[0] if " " in curr_time else curr_time
+        if curr_day != last_day:
+            last_day = curr_day
+            daily_trade_count = 0
+            consecutive_losses = 0
+            cooldown_bars_left = 0
+            daily_start_equity = equity_usd
+            trading_locked_for_day = False
+        elif cooldown_bars_left > 0:
+            cooldown_bars_left -= 1
 
         # 1. Handle Active Trades
         finished_trades_indices = []
@@ -124,6 +146,13 @@ def run_paper_portfolio_on_signals(
             outcome = "NONE"
 
             if t["side"] == "LONG":
+                risk_per_unit = max(t["entry_price"] - t["sl_price_initial"], 1e-8)
+                best_r_multiple = (curr_high - t["entry_price"]) / risk_per_unit
+                if best_r_multiple >= break_even_after_r:
+                    t["sl_price"] = max(t["sl_price"], t["entry_price"])
+                if best_r_multiple >= trail_stop_after_r:
+                    trailing_price = curr_high - (risk_per_unit * trail_stop_r_multiple)
+                    t["sl_price"] = max(t["sl_price"], trailing_price)
                 if curr_high >= t["tp_price"]:
                     hit_tp = True
                     exit_price = t["tp_price"]
@@ -131,6 +160,13 @@ def run_paper_portfolio_on_signals(
                     hit_sl = True
                     exit_price = t["sl_price"]
             else: # SHORT
+                risk_per_unit = max(t["sl_price_initial"] - t["entry_price"], 1e-8)
+                best_r_multiple = (t["entry_price"] - curr_low) / risk_per_unit
+                if best_r_multiple >= break_even_after_r:
+                    t["sl_price"] = min(t["sl_price"], t["entry_price"])
+                if best_r_multiple >= trail_stop_after_r:
+                    trailing_price = curr_low + (risk_per_unit * trail_stop_r_multiple)
+                    t["sl_price"] = min(t["sl_price"], trailing_price)
                 if curr_low <= t["tp_price"]:
                     hit_tp = True
                     exit_price = t["tp_price"]
@@ -163,6 +199,17 @@ def run_paper_portfolio_on_signals(
                 fees_usd = t["notional_usd"] * fee_fraction_per_leg * 2.0
                 pnl_net = pnl_before_fees - fees_usd
                 equity_usd = max(equity_usd + pnl_net, 0.0)
+                realized_outcome = outcome
+                if pnl_net > 0:
+                    realized_outcome = "SUCCESS"
+                elif abs(pnl_net) <= max(fees_usd * 0.25, 1e-8):
+                    realized_outcome = "BREAKEVEN"
+
+                if pnl_net < 0:
+                    consecutive_losses += 1
+                    cooldown_bars_left = max(cooldown_bars_left, cooldown_bars)
+                elif pnl_net > 0:
+                    consecutive_losses = 0
 
                 trade_records.append(
                     PaperTradeRecord(
@@ -179,7 +226,7 @@ def run_paper_portfolio_on_signals(
                         stop_loss_pct=t["sl_pct"],
                         ai_confidence=t["confidence"],
                         ai_qty_ratio=t["qty_ratio"],
-                        outcome=outcome,
+                        outcome=realized_outcome,
                         return_fraction=return_fraction,
                         pnl_before_fees_usd=pnl_before_fees,
                         fees_usd=fees_usd,
@@ -194,21 +241,27 @@ def run_paper_portfolio_on_signals(
         for idx in sorted(finished_trades_indices, reverse=True):
             active_trades.pop(idx)
 
-        # 2. Check for New Signal (if we have open slots and daily limit not reached)
-        # Handle daily counter reset
-        curr_day = curr_time.split(" ")[0] if " " in curr_time else curr_time
-        if curr_day != last_day:
-            last_day = curr_day
-            daily_trade_count = 0
+        if daily_start_equity > 0 and (daily_start_equity - equity_usd) / daily_start_equity >= daily_stop_loss_fraction:
+            trading_locked_for_day = True
 
-        if len(active_trades) < max_slots and daily_trade_count < MAX_DAILY_TRADES:
+        # 2. Check for New Signal (if we have open slots and daily limit not reached)
+        if (
+            len(active_trades) < max_slots
+            and daily_trade_count < max_daily_trades
+            and cooldown_bars_left == 0
+            and consecutive_losses < max_consecutive_losses
+            and not trading_locked_for_day
+        ):
             verdict = int(row["ai_verdict"])
             if verdict != 1:  # 0=BUY, 2=SELL
                 tp_pct = float(row["ai_take_profit_pct"])
                 sl_pct = float(row["ai_stop_loss_pct"])
+                directional_edge = float(row.get("ai_directional_edge", 0.0))
 
                 # Risk Rule: Enforce minimum 1:1 Reward-to-Risk ratio (Target >= SL)
                 if tp_pct < (sl_pct * config.strategy.MIN_REWARD_RISK_RATIO):
+                    continue
+                if directional_edge < config.strategy.MIN_DIRECTIONAL_EDGE:
                     continue
 
                 raw_entry_price = curr_price
@@ -227,13 +280,21 @@ def run_paper_portfolio_on_signals(
                     tp_price = entry_price * (1 - tp_pct / 100.0)
                     sl_price = entry_price * (1 + sl_pct / 100.0)
 
+                rr_ratio = tp_pct / max(sl_pct, 1e-6)
+                confidence_risk_scale = min(
+                    max((confidence - config.strategy.AI_CONFIDENCE_THRESHOLD) / 0.20, 0.25),
+                    1.0,
+                )
+                rr_risk_scale = min(max((rr_ratio - 1.0) / 1.0, 0.50), 1.2)
+                adjusted_qty_ratio = min(max(qty_ratio * confidence_risk_scale * rr_risk_scale, 0.10), 1.0)
+
                 quantity, notional_usd = compute_position_size_for_risk_budget(
                     equity_usd=equity_usd,
                     entry_price=entry_price,
                     stop_loss_pct=sl_pct,
                     risk_budget_fraction_of_equity=risk_fraction,
                     max_notional_fraction_of_equity=max_notional_fraction,
-                    qty_ratio=qty_ratio,
+                    qty_ratio=adjusted_qty_ratio,
                 )
 
                 if quantity > 0:
@@ -242,6 +303,7 @@ def run_paper_portfolio_on_signals(
                         "entry_price": entry_price,
                         "tp_price": tp_price,
                         "sl_price": sl_price,
+                        "sl_price_initial": sl_price,
                         "tp_pct": tp_pct,
                         "sl_pct": sl_pct,
                         "quantity": quantity,
@@ -249,13 +311,11 @@ def run_paper_portfolio_on_signals(
                         "entry_time": curr_time,
                         "entry_index": i,
                         "confidence": confidence,
-                        "qty_ratio": qty_ratio,
+                        "qty_ratio": adjusted_qty_ratio,
                         "capital_before": equity_usd,
                         "bars_held": 0
                     })
                     daily_trade_count += 1
-
-        equity_by_bar.append(equity_usd)
 
     working_frame["paper_equity_curve"] = equity_by_bar
     summary = summarize_trade_feedback(trade_records)
@@ -280,14 +340,14 @@ def summarize_trade_feedback(trade_records: List[PaperTradeRecord]) -> dict:
             "total_pnl_net_usd": 0.0,
         }
 
-    wins = sum(1 for trade in trade_records if trade.outcome == "SUCCESS")
-    losses = sum(1 for trade in trade_records if trade.outcome == "FAILED")
+    wins = sum(1 for trade in trade_records if trade.pnl_net_usd > 0)
+    losses = sum(1 for trade in trade_records if trade.pnl_net_usd < 0)
     resolved = wins + losses
     win_rate = (wins / resolved * 100.0) if resolved > 0 else 0.0
 
     loss_then_win = 0
     for previous, current in zip(trade_records, trade_records[1:]):
-        if previous.outcome == "FAILED" and current.outcome == "SUCCESS":
+        if previous.pnl_net_usd < 0 and current.pnl_net_usd > 0:
             loss_then_win += 1
 
     return {

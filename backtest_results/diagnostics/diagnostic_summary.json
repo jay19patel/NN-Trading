@@ -1,0 +1,57 @@
+{
+  "strict": {
+    "trades": 0,
+    "growth_pct": 0.0,
+    "net_pnl_usd": 0.0,
+    "production_gate": "BLOCKED"
+  },
+  "relaxed_diagnostic": {
+    "mode": "relaxed_diagnostic_not_production",
+    "trades": 1,
+    "win_rate_pct": 100.0,
+    "growth_pct": 0.06978110702613094,
+    "net_pnl_usd": 1.3956221405226188,
+    "fees_usd": 0.6253668330253426,
+    "csv": "backtest_results/paper_trading_diagnostic_relaxed.csv"
+  },
+  "test_metrics": {
+    "mae_qty_ratio": 0.05494955605326498,
+    "mae_take_profit_pct": 0.04705297471024356,
+    "mae_stop_loss_pct": 0.010184376173278798,
+    "direction_accuracy_all": 0.878686797752809,
+    "direction_accuracy_excl_neutral": 0.23880597014925373,
+    "f1_macro": 0.4877565721836849,
+    "f1_weighted": 0.8726416158309458,
+    "balanced_accuracy": 0.47510446057797245,
+    "majority_class_baseline_accuracy": 0.9058988764044944,
+    "confusion_matrix_3x3": [
+      [
+        56,
+        205,
+        16
+      ],
+      [
+        88,
+        4877,
+        195
+      ],
+      [
+        7,
+        180,
+        72
+      ]
+    ]
+  },
+  "charts": [
+    "backtest_results/diagnostics/training_history.png",
+    "backtest_results/diagnostics/confusion_matrix.png",
+    "backtest_results/diagnostics/test_metrics.png",
+    "backtest_results/diagnostics/signal_distribution.png",
+    "backtest_results/diagnostics/strict_equity_curve.png",
+    "backtest_results/diagnostics/strict_trade_pnl.png",
+    "backtest_results/diagnostics/feature_relevance.png",
+    "backtest_results/diagnostics/relaxed_diagnostic_equity_curve.png",
+    "backtest_results/diagnostics/relaxed_diagnostic_trade_pnl.png"
+  ],
+  "feature_relevance_csv": "backtest_results/diagnostics/feature_relevance.csv"
+}

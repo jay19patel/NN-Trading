@@ -2,8 +2,7 @@
 import logging
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -11,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-from config import config
+from config import bars_per_day, config
 from ui_utils import console
 from rich.live import Live
 from rich.table import Table
@@ -53,9 +52,10 @@ def create_sequences(
     sequence_length: int = 32,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
-    Build sliding windows; label at index i-1 is the supervised target for window ending at i-1.
+    Build sliding windows and use the last bar inside each window as the target row.
 
-    For each i in [sequence_length, len), appends X[i-sequence_length:i] and y[i-1].
+    For each end_index in [sequence_length, len), appends
+    X[end_index-sequence_length:end_index] and y[end_index-1].
     """
     window_list: List[np.ndarray] = []
     target_sequences: Dict[str, List] = {key: [] for key in task_targets.keys()}
@@ -91,12 +91,46 @@ def get_feature_cols(dataframe: pd.DataFrame) -> List[str]:
         "label_stop_loss_pct",
         "actual_pnl_pct",
         "label_qty_ratio",
+        # Absolute Price Columns (scale-dependent, bad for multi-symbol global models)
+        "Open", "High", "Low", "Close", "VWAP",
+        "BB_upper", "BB_lower", "BB_middle",
+        "KC_upper", "KC_lower",
+        "supertrend",
+        "EMA_5", "EMA_10", "EMA_20", "EMA_50", "EMA_100", "EMA_200",
+        "SMA_20", "SMA_50", "SMA_100", "SMA_200",
+        "OBV", "AD", "VPT",
         # Index / meta columns
         "time",
         "label",
         "index",
+        "feature_cache_version",
     }
-    return [c for c in dataframe.select_dtypes(include=[np.number]).columns if c not in excluded_targets]
+    safe_numeric_columns = [
+        c for c in dataframe.select_dtypes(include=[np.number]).columns if c not in excluded_targets
+    ]
+    if config.features.USE_CURATED_FEATURES:
+        curated_columns = [
+            column
+            for column in config.features.CURATED_FEATURES
+            if column in safe_numeric_columns
+        ]
+        missing_columns = [
+            column
+            for column in config.features.CURATED_FEATURES
+            if column not in safe_numeric_columns
+        ]
+        if missing_columns:
+            console.print(
+                f"[warning]Curated feature columns missing and skipped: "
+                f"{', '.join(missing_columns[:8])}[/warning]"
+            )
+        return curated_columns
+    return safe_numeric_columns
+
+
+def sanitize_partition(frame: pd.DataFrame) -> pd.DataFrame:
+    """Clean a split without backward-filling future values into earlier rows."""
+    return frame.copy().replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
 
 
 def build_target_arrays(dataframe: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -133,9 +167,9 @@ def prepare_data(
 ) -> Tuple[np.ndarray, Dict, np.ndarray, Dict, List[str], StandardScaler]:
     """Single-symbol train/test prep (backward-compatible wrapper)."""
     feature_columns = get_feature_cols(dataframe)
-    cleaned = dataframe.copy().replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
-    bars_per_day = (24 * 60) // 15
-    test_row_count = test_days * bars_per_day
+    cleaned = sanitize_partition(dataframe)
+    interval_bars_per_day = bars_per_day(config.data.INTERVAL)
+    test_row_count = test_days * interval_bars_per_day
     train_frame = cleaned.iloc[:-test_row_count]
     test_frame = cleaned.iloc[-test_row_count:]
     scaler = StandardScaler()
@@ -155,7 +189,7 @@ def prepare_multi_symbol_data(
     symbol_dataframes: Dict[str, pd.DataFrame],
     test_days: int = 10,
     val_days: int = 2,
-) -> Tuple[np.ndarray, Dict, np.ndarray, Dict, np.ndarray, Dict, List[str], StandardScaler]:
+) -> Tuple[np.ndarray, Dict, np.ndarray, Dict, np.ndarray, Dict, List[str], Dict[str, StandardScaler]]:
     """
     Chronological split per symbol: train | validation | test (most recent = test).
 
@@ -165,9 +199,9 @@ def prepare_multi_symbol_data(
     first_frame = next(iter(symbol_dataframes.values()))
     feature_columns = get_feature_cols(first_frame)
     sequence_length = config.model.SEQ_LEN
-    bars_per_day = (24 * 60) // 15
-    test_row_count = test_days * bars_per_day
-    val_row_count = val_days * bars_per_day
+    interval_bars_per_day = bars_per_day(config.data.INTERVAL)
+    test_row_count = test_days * interval_bars_per_day
+    val_row_count = val_days * interval_bars_per_day
 
     train_frames: Dict[str, pd.DataFrame] = {}
     validation_frames: Dict[str, pd.DataFrame] = {}
@@ -175,12 +209,12 @@ def prepare_multi_symbol_data(
 
     train_feature_pool: List[pd.DataFrame] = []
     for symbol, raw_frame in symbol_dataframes.items():
-        cleaned_frame = raw_frame.copy().replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
-        train_frames[symbol] = cleaned_frame.iloc[: -(val_row_count + test_row_count)]
-        validation_frames[symbol] = cleaned_frame.iloc[
-            -(val_row_count + test_row_count) : -test_row_count
-        ]
-        test_frames[symbol] = cleaned_frame.iloc[-test_row_count:]
+        train_slice = raw_frame.iloc[: -(val_row_count + test_row_count)]
+        val_slice = raw_frame.iloc[-(val_row_count + test_row_count) : -test_row_count]
+        test_slice = raw_frame.iloc[-test_row_count:]
+        train_frames[symbol] = sanitize_partition(train_slice)
+        validation_frames[symbol] = sanitize_partition(val_slice)
+        test_frames[symbol] = sanitize_partition(test_slice)
         train_feature_pool.append(train_frames[symbol][feature_columns])
 
     global_train_feature_frame = pd.concat(train_feature_pool, axis=0)
@@ -226,15 +260,27 @@ def prepare_multi_symbol_data(
     train_windows: List[np.ndarray] = []
     validation_windows: List[np.ndarray] = []
     test_windows: List[np.ndarray] = []
+    symbol_scalers: Dict[str, StandardScaler] = {}
 
     train_target_parts: Dict[str, List[np.ndarray]] = {name: [] for name in build_target_arrays(first_frame)}
     val_target_parts: Dict[str, List[np.ndarray]] = {name: [] for name in train_target_parts}
     test_target_parts: Dict[str, List[np.ndarray]] = {name: [] for name in train_target_parts}
 
+    # Use per-symbol scaling to handle different price magnitudes (BTC vs ETH)
+    # We still keep one global scaler for the final model (fit on first symbol as a proxy, 
+    # but the real normalization happens per-symbol below)
+    global_scaler = StandardScaler()
+    global_scaler.fit(global_train_pruned)
+
     for symbol in symbol_dataframes:
-        train_features = scaler.transform(train_frames[symbol][feature_columns])
-        validation_features = scaler.transform(validation_frames[symbol][feature_columns])
-        test_features = scaler.transform(test_frames[symbol][feature_columns])
+        # Fit scaler on THIS symbol's training data only
+        symbol_scaler = StandardScaler()
+        symbol_scaler.fit(train_frames[symbol][feature_columns])
+        symbol_scalers[symbol] = symbol_scaler
+        
+        train_features = symbol_scaler.transform(train_frames[symbol][feature_columns])
+        validation_features = symbol_scaler.transform(validation_frames[symbol][feature_columns])
+        test_features = symbol_scaler.transform(test_frames[symbol][feature_columns])
 
         train_targets = build_target_arrays(train_frames[symbol])
         validation_targets = build_target_arrays(validation_frames[symbol])
@@ -267,7 +313,7 @@ def prepare_multi_symbol_data(
         combined_test_X,
         combined_test_y,
         feature_columns,
-        scaler,
+        symbol_scalers,
     )
 
 
@@ -299,7 +345,13 @@ def train_model(
     # Passing weights to CrossEntropyLoss is mathematically equivalent but avoids this mismatch.
     direction_labels = train_targets["direction"].astype(np.int64)
     class_counts = np.bincount(direction_labels, minlength=3).astype(np.float32)
-    class_weights_np = (class_counts.sum() / (3.0 * class_counts + 1e-6))
+    inverse_frequency = class_counts.sum() / (3.0 * class_counts + 1e-6)
+    class_weights_np = np.power(inverse_frequency, config.training.CLASS_WEIGHT_POWER)
+    class_weights_np = np.clip(
+        class_weights_np,
+        config.training.MIN_CLASS_WEIGHT,
+        config.training.MAX_CLASS_WEIGHT,
+    )
     class_weight_tensor = torch.FloatTensor(class_weights_np).to(device)
     console.print(
         f"[info]Class weights: LONG={class_weights_np[0]:.2f}, "
@@ -351,6 +403,7 @@ def train_model(
     best_val_loss = float("inf")
     best_state: Optional[Dict] = None
     patience_left = config.training.EARLY_STOP_PATIENCE
+    training_history: List[Dict[str, float | int | str]] = []
 
     metrics_table = Table(show_header=True, header_style="bold magenta", border_style="bright_black")
     metrics_table.add_column("Epoch", justify="center")
@@ -440,6 +493,15 @@ def train_model(
             status = "Phase 1"
             if patience_left <= 0 and val_features is not None:
                 status = "early-stop"
+            training_history.append(
+                {
+                    "epoch": epoch + 1,
+                    "train_loss": float(average_train_loss),
+                    "val_loss": float(val_loss_value),
+                    "val_direction_accuracy_pct": float(val_direction_accuracy),
+                    "status": status,
+                }
+            )
             metrics_table.add_row(
                 f"{epoch + 1}/{epochs}",
                 f"{average_train_loss:.5f}",
@@ -454,198 +516,218 @@ def train_model(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    rl_enabled = config.training.RL_FINE_TUNE_EPOCHS > 0 and config.training.LOSS_GAMMA > 0
+    if rl_enabled:
+        console.print("\n[highlight]Phase 2: Reinforcement Learning (PnL Consequence Fine-Tuning)[/highlight]")
+        console.print(f"[info]RL gamma={config.training.LOSS_GAMMA} | LR={config.training.RL_LEARNING_RATE} | epochs={config.training.RL_FINE_TUNE_EPOCHS}[/info]")
 
-    console.print("\n[highlight]Phase 2: Reinforcement Learning (PnL Consequence Fine-Tuning)[/highlight]")
-    console.print(f"[info]RL gamma={config.training.LOSS_GAMMA} | LR={config.training.RL_LEARNING_RATE} | epochs={config.training.RL_FINE_TUNE_EPOCHS}[/info]")
+        for param in model.input_projection.parameters():
+            param.requires_grad = False
+        for param in model.input_norm.parameters():
+            param.requires_grad = False
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        for param in model.positional_encoding.parameters():
+            param.requires_grad = False
+        trainable_rl = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        console.print(f"[info]RL trainable params: {trainable_rl:,} (backbone frozen)[/info]")
 
-    # Phase 2: RL Fine-Tuning with PnL Consequence Loss
-    # FREEZE encoder backbone — only fine-tune heads to prevent catastrophic forgetting
-    for param in model.input_projection.parameters():
-        param.requires_grad = False
-    for param in model.input_norm.parameters():
-        param.requires_grad = False
-    for param in model.encoder.parameters():
-        param.requires_grad = False
-    for param in model.positional_encoding.parameters():
-        param.requires_grad = False
-    trainable_rl = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    console.print(f"[info]RL trainable params: {trainable_rl:,} (backbone frozen)[/info]")
+        rl_loss_fn = TradingLoss(
+            alpha=config.training.LOSS_ALPHA,
+            beta=config.training.LOSS_BETA,
+            gamma=config.training.LOSS_GAMMA,
+            class_weights=class_weight_tensor,
+            focal_gamma=config.training.FOCAL_GAMMA,
+            use_focal=config.training.USE_FOCAL_LOSS,
+        ).to(device)
 
-    # Cache Phase 1 predictions for KL divergence regularization
-    model.eval()
-    with torch.no_grad():
-        phase1_val_logits = None
-        if val_features is not None:
-            val_tensor_p1 = torch.FloatTensor(val_features).to(device)
-            phase1_val_logits = model(val_tensor_p1)["direction"]
-            phase1_val_probs = F.softmax(phase1_val_logits, dim=1)
+        rl_optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=config.training.RL_LEARNING_RATE,
+            weight_decay=config.training.WEIGHT_DECAY,
+        )
 
-    rl_loss_fn = TradingLoss(
-        alpha=config.training.LOSS_ALPHA,
-        beta=config.training.LOSS_BETA,
-        gamma=config.training.LOSS_GAMMA,  # PnL penalty now active
-        class_weights=class_weight_tensor,
-        focal_gamma=config.training.FOCAL_GAMMA,
-        use_focal=config.training.USE_FOCAL_LOSS,
-    ).to(device)
+        rl_best_val_loss = float("inf")
+        rl_best_state: dict | None = None
+        patience_left = config.training.EARLY_STOP_PATIENCE
 
-    rl_optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=config.training.RL_LEARNING_RATE,
-        weight_decay=config.training.WEIGHT_DECAY,
-    )
+        with Live(metrics_table, console=console, refresh_per_second=4):
+            rl_epochs = config.training.RL_FINE_TUNE_EPOCHS
+            for epoch in range(rl_epochs):
+                model.train()
+                running_loss_tensor = torch.tensor(0.0, device=device)
+                running_pnl_tensor = torch.tensor(0.0, device=device)
+                batch_count = 0
+                for batch_features, batch_targets in train_loader:
+                    batch_features = batch_features.to(device)
+                    batch_targets = {name: tensor.to(device) for name, tensor in batch_targets.items()}
+                    rl_optimizer.zero_grad(set_to_none=True)
 
-    # FIXED: Independent tracking for Phase 2
-    rl_best_val_loss = float("inf")
-    rl_best_state: dict | None = None
-    patience_left = config.training.EARLY_STOP_PATIENCE
-    
-    with Live(metrics_table, console=console, refresh_per_second=4):
-        rl_epochs = config.training.RL_FINE_TUNE_EPOCHS
-        for epoch in range(rl_epochs):
-            model.train()
-            running_loss_tensor = torch.tensor(0.0, device=device)
-            running_pnl_tensor = torch.tensor(0.0, device=device)
-            batch_count = 0
-            for batch_features, batch_targets in train_loader:
-                batch_features = batch_features.to(device)
-                batch_targets = {name: tensor.to(device) for name, tensor in batch_targets.items()}
-                rl_optimizer.zero_grad(set_to_none=True)
-                
-                with torch.autocast(device_type="mps" if "mps" in str(device) else "cpu", enabled=True):
-                    outputs = model(batch_features)
-                    loss_dict = rl_loss_fn(outputs, batch_targets)
-                    loss = loss_dict["total"]
-                
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                rl_optimizer.step()
-                running_loss_tensor = running_loss_tensor + loss.detach()
-                running_pnl_tensor = running_pnl_tensor + loss_dict["pnl_effect"].detach()
-                batch_count += 1
+                    with torch.autocast(device_type="mps" if "mps" in str(device) else "cpu", enabled=True):
+                        outputs = model(batch_features)
+                        loss_dict = rl_loss_fn(outputs, batch_targets)
+                        loss = loss_dict["total"]
 
-            # Single GPU-CPU sync per epoch
-            average_train_loss = (running_loss_tensor / max(batch_count, 1)).item()
-            average_pnl_effect = (running_pnl_tensor / max(batch_count, 1)).item()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    rl_optimizer.step()
+                    running_loss_tensor = running_loss_tensor + loss.detach()
+                    running_pnl_tensor = running_pnl_tensor + loss_dict["pnl_effect"].detach()
+                    batch_count += 1
 
-            val_loss_value = float("nan")
-            val_direction_accuracy = float("nan")
-            if val_features is not None and val_targets is not None:
-                model.eval()
-                val_loss_sum = 0.0
-                val_batches = 0
-                correct_direction = 0
-                total_direction = 0
-                with torch.no_grad():
-                    val_tensor = torch.FloatTensor(val_features).to(device)
-                    direction_actual = torch.LongTensor(val_targets["direction"]).to(device)
-                    chunk_size = 2048
-                    for start in range(0, val_tensor.size(0), chunk_size):
-                        end = min(start + chunk_size, val_tensor.size(0))
-                        batch_X = val_tensor[start:end]
-                        batch_y_dir = direction_actual[start:end]
-                        val_outputs = model(batch_X)
-                        val_chunk_targets = {
-                            "upside": torch.FloatTensor(val_targets["upside"][start:end]).to(device),
-                            "downside": torch.FloatTensor(val_targets["downside"][start:end]).to(device),
-                            "future_drawdown": torch.FloatTensor(val_targets["drawdown"][start:end]).to(device),
-                            "take_profit_pct": torch.FloatTensor(val_targets["take_profit_pct"][start:end]).to(device),
-                            "stop_loss_pct": torch.FloatTensor(val_targets["stop_loss_pct"][start:end]).to(device),
-                            "direction": batch_y_dir,
-                            "actual_pnl_pct": torch.FloatTensor(val_targets["actual_pnl_pct"][start:end]).to(device),
-                            "qty_ratio": torch.FloatTensor(val_targets["qty_ratio"][start:end]).to(device),
-                        }
-                        batch_loss = rl_loss_fn(val_outputs, val_chunk_targets)["total"]
-                        val_loss_sum += batch_loss.item()
-                        val_batches += 1
-                        predicted_direction = torch.argmax(val_outputs["direction"], dim=1)
-                        correct_direction += (predicted_direction == batch_y_dir).sum().item()
-                        total_direction += batch_X.size(0)
-                val_loss_value = val_loss_sum / max(val_batches, 1)
-                val_direction_accuracy = (correct_direction / max(total_direction, 1)) * 100.0
+                average_train_loss = (running_loss_tensor / max(batch_count, 1)).item()
+                average_pnl_effect = (running_pnl_tensor / max(batch_count, 1)).item()
 
-                # FIXED: Use separate rl_best_val_loss and rl_best_state for Phase 2
-                if val_loss_value < rl_best_val_loss - 1e-6:
-                    rl_best_val_loss = val_loss_value
-                    rl_best_state = {name: tensor.cpu().clone() for name, tensor in model.state_dict().items()}
-                    patience_left = config.training.EARLY_STOP_PATIENCE
-                else:
-                    patience_left -= 1
+                val_loss_value = float("nan")
+                val_direction_accuracy = float("nan")
+                if val_features is not None and val_targets is not None:
+                    model.eval()
+                    val_loss_sum = 0.0
+                    val_batches = 0
+                    correct_direction = 0
+                    total_direction = 0
+                    with torch.no_grad():
+                        val_tensor = torch.FloatTensor(val_features).to(device)
+                        direction_actual = torch.LongTensor(val_targets["direction"]).to(device)
+                        chunk_size = 2048
+                        for start in range(0, val_tensor.size(0), chunk_size):
+                            end = min(start + chunk_size, val_tensor.size(0))
+                            batch_X = val_tensor[start:end]
+                            batch_y_dir = direction_actual[start:end]
+                            val_outputs = model(batch_X)
+                            val_chunk_targets = {
+                                "upside": torch.FloatTensor(val_targets["upside"][start:end]).to(device),
+                                "downside": torch.FloatTensor(val_targets["downside"][start:end]).to(device),
+                                "future_drawdown": torch.FloatTensor(val_targets["drawdown"][start:end]).to(device),
+                                "take_profit_pct": torch.FloatTensor(val_targets["take_profit_pct"][start:end]).to(device),
+                                "stop_loss_pct": torch.FloatTensor(val_targets["stop_loss_pct"][start:end]).to(device),
+                                "direction": batch_y_dir,
+                                "actual_pnl_pct": torch.FloatTensor(val_targets["actual_pnl_pct"][start:end]).to(device),
+                                "qty_ratio": torch.FloatTensor(val_targets["qty_ratio"][start:end]).to(device),
+                            }
+                            batch_loss = rl_loss_fn(val_outputs, val_chunk_targets)["total"]
+                            val_loss_sum += batch_loss.item()
+                            val_batches += 1
+                            predicted_direction = torch.argmax(val_outputs["direction"], dim=1)
+                            correct_direction += (predicted_direction == batch_y_dir).sum().item()
+                            total_direction += batch_X.size(0)
+                    val_loss_value = val_loss_sum / max(val_batches, 1)
+                    val_direction_accuracy = (correct_direction / max(total_direction, 1)) * 100.0
 
-            status = "Phase 2 (RL)"
-            if patience_left <= 0 and val_features is not None:
-                status = "early-stop ✓"
-            metrics_table.add_row(
-                f"RL {epoch + 1}/{rl_epochs}",
-                f"{average_train_loss:.5f}",
-                f"{val_loss_value:.5f}" if val_features is not None else "—",
-                f"{val_direction_accuracy:.1f}%" if val_features is not None else "—",
-                f"{average_pnl_effect:.4f}",  # Monitor RL health — should stay near 0
-                status,
-            )
+                    if val_loss_value < rl_best_val_loss - 1e-6:
+                        rl_best_val_loss = val_loss_value
+                        rl_best_state = {name: tensor.cpu().clone() for name, tensor in model.state_dict().items()}
+                        patience_left = config.training.EARLY_STOP_PATIENCE
+                    else:
+                        patience_left -= 1
 
-            if val_features is not None and patience_left <= 0:
-                break
+                status = "Phase 2 (RL)"
+                if patience_left <= 0 and val_features is not None:
+                    status = "early-stop ✓"
+                metrics_table.add_row(
+                    f"RL {epoch + 1}/{rl_epochs}",
+                    f"{average_train_loss:.5f}",
+                    f"{val_loss_value:.5f}" if val_features is not None else "—",
+                    f"{val_direction_accuracy:.1f}%" if val_features is not None else "—",
+                    f"{average_pnl_effect:.4f}",
+                    status,
+                )
 
-    # FIXED: Restore the best Phase 2 checkpoint if it improved on Phase 1
-    if rl_best_state is not None:
-        model.load_state_dict(rl_best_state)
-        console.print("[success]✅ Phase 2 checkpoint restored (RL improved val loss)[/success]")
-    elif best_state is not None:
-        # Phase 2 didn't improve — keep Phase 1's best
-        model.load_state_dict(best_state)
-        console.print("[warning]⚠️  Phase 2 did not improve val loss. Using Phase 1 best checkpoint.[/warning]")
+                if val_features is not None and patience_left <= 0:
+                    break
 
-    # Unfreeze all params for inference
-    for param in model.parameters():
-        param.requires_grad = True
+        if rl_best_state is not None:
+            model.load_state_dict(rl_best_state)
+            console.print("[success]✅ Phase 2 checkpoint restored (RL improved val loss)[/success]")
+        elif best_state is not None:
+            model.load_state_dict(best_state)
+            console.print("[warning]⚠️  Phase 2 did not improve val loss. Using Phase 1 best checkpoint.[/warning]")
+
+        for param in model.parameters():
+            param.requires_grad = True
+    else:
+        console.print(
+            "\n[warning]Phase 2 skipped: RL fine-tuning is disabled because the current objective is supervised and not production-safe as an RL surrogate.[/warning]"
+        )
 
     # ---- Per-class confidence calibration on val set ----
-    calibrated_thresholds = {0: config.strategy.AI_CONFIDENCE_THRESHOLD,
-                             2: config.strategy.AI_CONFIDENCE_THRESHOLD}
+    calibrated_thresholds = {0: 1.01, 2: 1.01}
     if val_features is not None and val_targets is not None:
         model.eval()
         with torch.no_grad():
             val_tensor_cal = torch.FloatTensor(val_features).to(device)
             val_out = model(val_tensor_cal)
             val_probs = torch.softmax(val_out["direction"], dim=1).cpu().numpy()
+            val_sizing = val_out["sizing"].cpu().numpy()
         val_true = val_targets["direction"].astype(int)
+        minimum_support = max(20, int(len(val_true) * 0.01))
+        predicted_tp = val_sizing[:, 1] * config.strategy.LABEL_TP_PCT_MAX
+        predicted_sl = val_sizing[:, 2] * config.strategy.LABEL_SL_PCT_MAX
+        directional_edge = np.maximum(val_probs[:, 0], val_probs[:, 2]) - val_probs[:, 1]
+        estimated_round_trip_cost_pct = (
+            config.strategy.ROUND_TRIP_FEE_PCT
+            + (2.0 * config.strategy.SLIPPAGE_PCT)
+            + config.strategy.COST_BUFFER_PCT
+        )
         for cls, cls_name in [(0, "BUY"), (2, "SELL")]:
-            # Find threshold that maximizes F1-like score (balance precision + recall)
-            best_thresh = config.strategy.AI_CONFIDENCE_THRESHOLD
-            best_f1 = 0.0
+            best_thresh = 1.01
+            best_expectancy = float("-inf")
             best_prec = 0.0
-            # Force threshold to be at least 0.44 (0.33 is random, anything below 0.44 is too noisy)
-            for thresh in np.arange(0.44, 0.65, 0.01):
-                pred_mask = (np.argmax(val_probs, axis=1) == cls) & (val_probs[:, cls] >= thresh)
+            best_support = 0
+            edge_floor = config.strategy.MIN_DIRECTIONAL_EDGE
+            for thresh in np.arange(config.strategy.AI_CONFIDENCE_THRESHOLD, 0.86, 0.02):
+                pred_mask = (
+                    (np.argmax(val_probs, axis=1) == cls)
+                    & (val_probs[:, cls] >= thresh)
+                    & (directional_edge >= edge_floor)
+                )
                 total_pred = pred_mask.sum()
-                if total_pred < 5:  # lowered sample requirement since we are looking at higher thresholds
+                if total_pred < minimum_support:
                     continue
                 correct = (val_true[pred_mask] == cls).sum()
                 precision = correct / total_pred
-                # Recall: of all true cls, how many did we catch at this threshold?
-                true_cls_mask = val_true == cls
-                recall = correct / max(true_cls_mask.sum(), 1)
-                f1 = 2 * precision * recall / max(precision + recall, 1e-6)
-                if f1 > best_f1 and precision >= 0.45:
-                    best_f1 = f1
+                avg_tp = float(np.mean(predicted_tp[pred_mask])) if total_pred > 0 else config.strategy.TARGET_PROFIT_PCT
+                avg_sl = float(np.mean(predicted_sl[pred_mask])) if total_pred > 0 else config.strategy.STOP_LOSS_PCT
+                expectancy = precision * avg_tp - (1.0 - precision) * avg_sl - estimated_round_trip_cost_pct
+                if (
+                    precision < config.strategy.MIN_VALIDATION_PRECISION
+                    or expectancy < config.strategy.MIN_VALIDATION_EXPECTANCY_PCT
+                ):
+                    continue
+                score = expectancy * np.log1p(total_pred)
+                if score > best_expectancy:
+                    best_expectancy = score
                     best_prec = precision
                     best_thresh = float(thresh)
+                    best_support = int(total_pred)
             calibrated_thresholds[cls] = best_thresh
-            console.print(f"[info]Calibrated {cls_name} threshold: {best_thresh:.2f} (precision={best_prec:.1%}, f1={best_f1:.3f})[/info]")
+            if best_support == 0:
+                best_expectancy = 0.0
+                console.print(
+                    f"[warning]Calibrated {cls_name} threshold: BLOCKED "
+                    f"(no validation slice met precision/expectancy gates)[/warning]"
+                )
+                continue
+            console.print(
+                f"[info]Calibrated {cls_name} threshold: {best_thresh:.2f} "
+                f"(precision={best_prec:.1%}, support={best_support}, net_expectancy={best_expectancy:.3f}%)[/info]"
+            )
 
     final_report: Dict[str, float] = {}
     if test_features is not None and test_targets is not None:
         final_report = evaluate_model_on_split(model, test_features, test_targets, device)
     final_report["calibrated_thresholds"] = calibrated_thresholds
+    final_report["training_history"] = training_history
     return model, final_report
 
 
 def run_inference_with_confidence_filter(
     model: nn.Module, feature_windows: np.ndarray, device: torch.device,
     calibrated_thresholds: Dict[int, float] | None = None,
+    min_directional_edge: float | None = None,
+    min_reward_risk_ratio: float | None = None,
 ) -> pd.DataFrame:
-    """Direction softmax, per-class confidence gate, and volatility-aware TP/SL percentage heads."""
+    """Direction softmax, directional-edge gate, and volatility-aware TP/SL percentage heads."""
     model.eval()
     input_tensor = torch.FloatTensor(feature_windows).to(device)
     with torch.no_grad():
@@ -670,6 +752,7 @@ def run_inference_with_confidence_filter(
     result_frame = pd.DataFrame(
         {
             "ai_confidence": confidence_scores,
+            "ai_raw_verdict": verdict_indices,
             "ai_qty_ratio": qty_ratios,
             "ai_verdict": verdict_indices,
             "ai_take_profit_pct": take_profit_pct,
@@ -677,6 +760,7 @@ def run_inference_with_confidence_filter(
             "ai_prob_buy": buy_probability,
             "ai_prob_neutral": neutral_probability,
             "ai_prob_sell": sell_probability,
+            "ai_directional_edge": np.maximum(buy_probability, sell_probability) - neutral_probability,
         }
     )
 
@@ -698,10 +782,23 @@ def run_inference_with_confidence_filter(
         result_frame.loc[cls_mask, "ai_verdict"] = 1
     if suppressed_count > 0:
         console.print(f"[warning]Risk Rule 1: forced neutral on {suppressed_count} low-confidence rows (per-class calibrated)[/warning]")
+
+    directional_edge_floor = (
+        config.strategy.MIN_DIRECTIONAL_EDGE
+        if min_directional_edge is None
+        else min_directional_edge
+    )
+    edge_mask = result_frame["ai_directional_edge"] < directional_edge_floor
+    suppressed_edge = int((edge_mask & (result_frame["ai_verdict"] != 1)).sum())
+    if suppressed_edge > 0:
+        console.print(
+            f"[warning]Risk Rule 1B: forced neutral on {suppressed_edge} weak-edge rows (edge < {directional_edge_floor:.2f})[/warning]"
+        )
+    result_frame.loc[edge_mask, "ai_verdict"] = 1
     
     # R:R Rule
     rr_ratios = result_frame["ai_take_profit_pct"] / (result_frame["ai_stop_loss_pct"] + 1e-6)
-    min_rr = config.strategy.MIN_REWARD_RISK_RATIO
+    min_rr = config.strategy.MIN_REWARD_RISK_RATIO if min_reward_risk_ratio is None else min_reward_risk_ratio
     poor_rr_mask = rr_ratios < min_rr
     suppressed_rr = int((poor_rr_mask & (result_frame["ai_verdict"] != 1)).sum())
     if suppressed_rr > 0:
@@ -733,9 +830,14 @@ def predict_model_outputs_for_single_window(
     sl_pct = float(sizing[2].item() * config.strategy.LABEL_SL_PCT_MAX)
     
     confidence = float(torch.max(direction_probabilities).item())
+    directional_edge = float(max(direction_probabilities[0].item(), direction_probabilities[2].item()) - direction_probabilities[1].item())
     
     # Apply rules
-    if confidence < config.strategy.AI_CONFIDENCE_THRESHOLD or (tp_pct / (sl_pct + 1e-6)) < config.strategy.MIN_REWARD_RISK_RATIO:
+    if (
+        confidence < config.strategy.AI_CONFIDENCE_THRESHOLD
+        or directional_edge < config.strategy.MIN_DIRECTIONAL_EDGE
+        or (tp_pct / (sl_pct + 1e-6)) < config.strategy.MIN_REWARD_RISK_RATIO
+    ):
         verdict_index = 1
     
     return {
@@ -745,6 +847,7 @@ def predict_model_outputs_for_single_window(
         "prob_neutral": float(direction_probabilities[1].item()),
         "prob_sell": float(direction_probabilities[2].item()),
         "confidence": confidence,
+        "directional_edge": directional_edge,
         "qty_ratio": qty_ratio,
         "take_profit_pct": tp_pct,
         "stop_loss_pct": sl_pct,

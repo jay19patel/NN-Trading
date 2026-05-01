@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from config import config
+from config import bars_per_day, config
 from data_gathering import fetch_data
 from features import create_full_feature_set
 from paper_trading import (
@@ -23,16 +23,22 @@ from training_utils import (
     predict_model_outputs_for_single_window,
     train_model,
     run_inference_with_confidence_filter,
+    sanitize_partition,
 )
 from evaluation_metrics import sequence_count_for_split
 from ui_utils import console, print_banner, Table
+from diagnostics import (
+    save_confusion_matrix_chart,
+    save_diagnostic_summary,
+    save_equity_curve_chart,
+    save_feature_relevance_chart,
+    save_metrics_bar_chart,
+    save_signal_distribution_chart,
+    save_trade_pnl_chart,
+    save_training_history_chart,
+)
 
 warnings.filterwarnings("ignore")
-
-
-def _bars_per_15m_day() -> int:
-    return (24 * 60) // 15
-
 
 def evaluate_ai_verdicts(dataframe: pd.DataFrame, lookahead_bars: int) -> pd.DataFrame:
     """
@@ -158,8 +164,14 @@ def main() -> None:
                 # Invalidate if oracle columns missing (stale ATR-based cache)
                 oracle_cols_missing = "oracle_tp_pct" not in features_frame.columns
                 label_cols_missing  = "label_take_profit_pct" not in features_frame.columns
-                if oracle_cols_missing or label_cols_missing:
+                cache_version_mismatch = (
+                    "feature_cache_version" not in features_frame.columns
+                    or int(features_frame["feature_cache_version"].iloc[0]) != config.data.FEATURE_CACHE_VERSION
+                )
+                if oracle_cols_missing or label_cols_missing or cache_version_mismatch:
                     reason = "oracle labels" if oracle_cols_missing else "dynamic TP/SL labels"
+                    if cache_version_mismatch:
+                        reason = "feature cache version"
                     console.print(
                         f"  [warning]Cache missing {reason}; rebuilding {symbol}...[/warning]"
                     )
@@ -187,7 +199,7 @@ def main() -> None:
         test_X,
         test_y,
         feature_names,
-        feature_scaler,
+        symbol_scalers,
     ) = prepare_multi_symbol_data(
         symbol_frames,
         test_days=config.training.TEST_DAYS,
@@ -219,8 +231,10 @@ def main() -> None:
     console.print(f"\n[bold green]💾 Model weights saved successfully to {model_path}[/bold green]")
 
     calibrated_thresholds = None
+    training_history = []
     if test_metrics:
         calibrated_thresholds = test_metrics.pop("calibrated_thresholds", None)
+        training_history = test_metrics.pop("training_history", [])
         console.print("\n[highlight]Held-out test metrics (direction + regression)[/highlight]")
         for metric_key, metric_value in test_metrics.items():
             if metric_key == "classification_report_text":
@@ -235,8 +249,8 @@ def main() -> None:
         trained_model, test_X, device, calibrated_thresholds=calibrated_thresholds
     )
 
-    bars_per_day = _bars_per_15m_day()
-    test_row_count = config.training.TEST_DAYS * bars_per_day
+    interval_bars_per_day = bars_per_day(config.data.INTERVAL)
+    test_row_count = config.training.TEST_DAYS * interval_bars_per_day
     sequences_per_symbol = sequence_count_for_split(test_row_count, config.model.SEQ_LEN)
 
     summary_table = Table(
@@ -255,6 +269,8 @@ def main() -> None:
     # Create results directory
     results_dir = "backtest_results"
     os.makedirs(results_dir, exist_ok=True)
+    diagnostics_dir = os.path.join(results_dir, "diagnostics")
+    os.makedirs(diagnostics_dir, exist_ok=True)
 
     # Global tracking
     global_initial_capital = 0.0
@@ -279,14 +295,22 @@ def main() -> None:
             sequence_offset : sequence_offset + sequences_per_symbol
         ]
         actual_len = len(symbol_predictions)
-        symbol_panel = symbol_frames[symbol].iloc[-actual_len:].copy()
+        test_frame = symbol_frames[symbol].iloc[-test_row_count:]
+        target_start = config.model.SEQ_LEN - 1
+        target_end = target_start + actual_len
+        symbol_panel = test_frame.iloc[target_start:target_end].copy()
         sequence_offset += sequences_per_symbol
 
         symbol_panel["ai_verdict"] = symbol_predictions["ai_verdict"].values
         symbol_panel["ai_confidence"] = symbol_predictions["ai_confidence"].values
         symbol_panel["ai_qty_ratio"] = symbol_predictions["ai_qty_ratio"].values
-        symbol_panel["ai_take_profit_pct"] = symbol_predictions["ai_take_profit_pct"].values * 0.70 # 70% safety factor as requested
-        symbol_panel["ai_stop_loss_pct"] = symbol_predictions["ai_stop_loss_pct"].values
+        symbol_panel["ai_directional_edge"] = symbol_predictions["ai_directional_edge"].values
+        symbol_panel["ai_take_profit_pct"] = (
+            symbol_predictions["ai_take_profit_pct"].values * config.strategy.EXECUTION_TP_SCALE
+        )
+        symbol_panel["ai_stop_loss_pct"] = (
+            symbol_predictions["ai_stop_loss_pct"].values * config.strategy.EXECUTION_SL_SCALE
+        )
 
         # Skip evaluate_ai_verdicts as run_paper_portfolio_on_signals now handles path simulation sequentially
         # symbol_panel = evaluate_ai_verdicts(symbol_panel, lookahead_bars=config.features.LOOKAHEAD_BARS)
@@ -386,10 +410,223 @@ def main() -> None:
             
         trades_csv_path = os.path.join(results_dir, "paper_trading_results.csv")
         df_trades.to_csv(trades_csv_path, index=False)
-        
-        trades_csv_path = os.path.join(results_dir, "paper_trading_results.csv")
-        df_trades.to_csv(trades_csv_path, index=False)
         console.print(f"\n[bold green]✅ Saved formatted CSV to {trades_csv_path} ({len(df_trades)} trades)[/bold green]")
+    else:
+        trades_csv_path = os.path.join(results_dir, "paper_trading_results.csv")
+        empty_trade_columns = [
+            "symbol",
+            "entry_datetime",
+            "exit_datetime",
+            "side",
+            "entry_price",
+            "exit_price",
+            "notional_usd",
+            "take_profit_pct",
+            "stop_loss_pct",
+            "ai_confidence",
+            "ai_qty_ratio",
+            "outcome",
+            "return_pct",
+            "pnl_net_usd",
+            "fees_usd",
+        ]
+        pd.DataFrame(columns=empty_trade_columns).to_csv(trades_csv_path, index=False)
+        console.print(f"\n[warning]No validated trades. Wrote empty CSV to {trades_csv_path}.[/warning]")
+
+    diagnostic_trade_records = []
+    diagnostic_equity_curves = {}
+    diagnostic_summary_payload = {}
+    if global_total_trades == 0:
+        console.print(
+            "\n[warning]Strict production filters produced 0 trades. Running relaxed diagnostic "
+            "paper test for visibility only; these trades are NOT production-approved.[/warning]"
+        )
+        diagnostic_predictions_frame = run_inference_with_confidence_filter(
+            trained_model,
+            test_X,
+            device,
+            calibrated_thresholds={0: 0.40, 2: 0.40},
+            min_directional_edge=0.03,
+            min_reward_risk_ratio=1.20,
+        )
+
+        diagnostic_table = Table(
+            title="Relaxed diagnostic model — not production approved",
+            show_header=True,
+            header_style="bold yellow",
+        )
+        diagnostic_table.add_column("Symbol", justify="left", style="bold")
+        diagnostic_table.add_column("Trades", justify="right")
+        diagnostic_table.add_column("Win %", justify="right")
+        diagnostic_table.add_column("W / L", justify="right")
+        diagnostic_table.add_column("Fees $", justify="right")
+        diagnostic_table.add_column("Net PnL $", justify="right")
+        diagnostic_table.add_column("Equity $", justify="right")
+
+        diagnostic_offset = 0
+        diagnostic_initial = 0.0
+        diagnostic_final = 0.0
+        diagnostic_fees = 0.0
+        diagnostic_trades = 0
+        diagnostic_wins = 0
+        diagnostic_losses = 0
+
+        for symbol in symbols:
+            if symbol not in symbol_frames:
+                continue
+            symbol_predictions = diagnostic_predictions_frame.iloc[
+                diagnostic_offset : diagnostic_offset + sequences_per_symbol
+            ]
+            actual_len = len(symbol_predictions)
+            test_frame = symbol_frames[symbol].iloc[-test_row_count:]
+            target_start = config.model.SEQ_LEN - 1
+            target_end = target_start + actual_len
+            symbol_panel = test_frame.iloc[target_start:target_end].copy()
+            diagnostic_offset += sequences_per_symbol
+
+            symbol_panel["ai_verdict"] = symbol_predictions["ai_verdict"].values
+            symbol_panel["ai_confidence"] = symbol_predictions["ai_confidence"].values
+            symbol_panel["ai_qty_ratio"] = symbol_predictions["ai_qty_ratio"].values
+            symbol_panel["ai_directional_edge"] = symbol_predictions["ai_directional_edge"].values
+            symbol_panel["ai_take_profit_pct"] = (
+                symbol_predictions["ai_take_profit_pct"].values * config.strategy.EXECUTION_TP_SCALE
+            )
+            symbol_panel["ai_stop_loss_pct"] = (
+                symbol_predictions["ai_stop_loss_pct"].values * config.strategy.EXECUTION_SL_SCALE
+            )
+
+            symbol_panel, trade_records, paper_summary = run_paper_portfolio_on_signals(
+                symbol_panel,
+                symbol=symbol,
+                initial_capital_usd=config.strategy.INITIAL_CAPITAL_USD,
+                risk_per_trade_pct_of_equity=config.strategy.RISK_PER_TRADE_PCT_OF_EQUITY,
+                max_notional_pct_of_equity=config.strategy.MAX_POSITION_NOTIONAL_PCT_OF_EQUITY,
+                round_trip_fee_pct=config.strategy.ROUND_TRIP_FEE_PCT,
+            )
+            diagnostic_trade_records.extend(trade_records)
+            wins = paper_summary.get("wins", 0)
+            losses = paper_summary.get("losses", 0)
+            diagnostic_table.add_row(
+                symbol,
+                str(paper_summary.get("trade_count", 0)),
+                f"{paper_summary.get('win_rate_pct', 0.0):.1f}%",
+                f"{wins} / {losses}",
+                f"{paper_summary.get('total_fees_usd', 0):.2f}",
+                f"{paper_summary.get('total_pnl_net_usd', 0):.2f}",
+                f"{paper_summary['final_equity_usd']:.2f}",
+            )
+            diagnostic_initial += config.strategy.INITIAL_CAPITAL_USD
+            diagnostic_final += paper_summary["final_equity_usd"]
+            diagnostic_fees += paper_summary.get("total_fees_usd", 0.0)
+            diagnostic_trades += paper_summary.get("trade_count", 0)
+            diagnostic_wins += wins
+            diagnostic_losses += losses
+            diagnostic_equity_curves[symbol] = {
+                "dates": symbol_panel.index if isinstance(symbol_panel.index, pd.DatetimeIndex) else list(range(len(symbol_panel))),
+                "equity": symbol_panel.get(
+                    "paper_equity_curve",
+                    pd.Series([config.strategy.INITIAL_CAPITAL_USD] * len(symbol_panel), index=symbol_panel.index),
+                ).values,
+            }
+
+        diagnostic_growth = (
+            (diagnostic_final - diagnostic_initial) / diagnostic_initial * 100.0
+            if diagnostic_initial > 0
+            else 0.0
+        )
+        diagnostic_win_rate = (
+            diagnostic_wins / (diagnostic_wins + diagnostic_losses) * 100.0
+            if diagnostic_wins + diagnostic_losses > 0
+            else 0.0
+        )
+        diagnostic_table.add_row(
+            "DIAGNOSTIC TOTAL",
+            str(diagnostic_trades),
+            f"{diagnostic_win_rate:.1f}%",
+            f"{diagnostic_wins} / {diagnostic_losses}",
+            f"{diagnostic_fees:.2f}",
+            f"{(diagnostic_final - diagnostic_initial):.2f}",
+            f"{diagnostic_final:.2f}",
+            style="bold yellow",
+        )
+        console.print(diagnostic_table)
+
+        diagnostic_csv_path = os.path.join(results_dir, "paper_trading_diagnostic_relaxed.csv")
+        if diagnostic_trade_records:
+            diagnostic_df = pd.DataFrame([vars(t) for t in diagnostic_trade_records])
+            diagnostic_df["return_pct"] = (diagnostic_df.get("return_fraction", 0) * 100).round(2)
+            if "return_fraction" in diagnostic_df:
+                diagnostic_df = diagnostic_df.drop(columns=["return_fraction"])
+            diagnostic_df.to_csv(diagnostic_csv_path, index=False)
+        else:
+            pd.DataFrame(columns=["symbol", "side", "outcome", "pnl_net_usd"]).to_csv(
+                diagnostic_csv_path, index=False
+            )
+        diagnostic_summary_payload = {
+            "mode": "relaxed_diagnostic_not_production",
+            "trades": diagnostic_trades,
+            "win_rate_pct": diagnostic_win_rate,
+            "growth_pct": diagnostic_growth,
+            "net_pnl_usd": diagnostic_final - diagnostic_initial,
+            "fees_usd": diagnostic_fees,
+            "csv": diagnostic_csv_path,
+        }
+        console.print(f"[info]Saved relaxed diagnostic CSV to {diagnostic_csv_path}[/info]")
+
+    chart_paths = []
+    chart_paths.append(save_training_history_chart(training_history, diagnostics_dir))
+    chart_paths.append(save_confusion_matrix_chart(test_metrics.get("confusion_matrix_3x3"), diagnostics_dir))
+    chart_paths.append(save_metrics_bar_chart(test_metrics, diagnostics_dir))
+    chart_paths.append(save_signal_distribution_chart(predictions_frame, test_y, diagnostics_dir))
+    chart_paths.append(save_equity_curve_chart(equity_curves, diagnostics_dir, "strict_equity_curve.png"))
+    chart_paths.append(save_trade_pnl_chart(all_trade_records, diagnostics_dir, "strict_trade_pnl.png"))
+    relevance_frame = pd.concat(symbol_frames.values(), axis=0)
+    feature_relevance_png, feature_relevance_csv = save_feature_relevance_chart(
+        relevance_frame,
+        feature_names,
+        diagnostics_dir,
+    )
+    chart_paths.append(feature_relevance_png)
+    if diagnostic_equity_curves:
+        chart_paths.append(
+            save_equity_curve_chart(
+                diagnostic_equity_curves,
+                diagnostics_dir,
+                "relaxed_diagnostic_equity_curve.png",
+            )
+        )
+        chart_paths.append(
+            save_trade_pnl_chart(
+                diagnostic_trade_records,
+                diagnostics_dir,
+                "relaxed_diagnostic_trade_pnl.png",
+            )
+        )
+
+    summary_json_path = save_diagnostic_summary(
+        {
+            "strict": {
+                "trades": global_total_trades,
+                "growth_pct": global_net_pnl_pct,
+                "net_pnl_usd": global_final_capital - global_initial_capital,
+                "production_gate": "PASSED" if (
+                    global_net_pnl_pct >= config.strategy.MIN_PRODUCTION_TEST_GROWTH_PCT
+                    and global_total_trades >= config.strategy.MIN_PRODUCTION_TRADES
+                ) else "BLOCKED",
+            },
+            "relaxed_diagnostic": diagnostic_summary_payload,
+            "test_metrics": {
+                key: value
+                for key, value in test_metrics.items()
+                if key != "classification_report_text"
+            },
+            "charts": [path for path in chart_paths if path],
+            "feature_relevance_csv": feature_relevance_csv,
+        },
+        diagnostics_dir,
+    )
+    console.print(f"[success]Saved diagnostic charts to {diagnostics_dir}[/success]")
+    console.print(f"[success]Saved diagnostic summary JSON to {summary_json_path}[/success]")
 
         
     # -----------------------------------------------------------------------
@@ -410,6 +647,19 @@ def main() -> None:
     final_summary_table.add_row("Overall Win Rate", f"{global_win_rate:.1f}%")
     final_summary_table.add_row("Total Fees Paid", f"${global_total_fees:.2f}")
 
+    production_gate_passed = (
+        global_net_pnl_pct >= config.strategy.MIN_PRODUCTION_TEST_GROWTH_PCT
+        and global_total_trades >= config.strategy.MIN_PRODUCTION_TRADES
+    )
+    final_summary_table.add_row(
+        "Production Gate",
+        "PASSED" if production_gate_passed else "BLOCKED",
+    )
+    final_summary_table.add_row(
+        "Required Test Growth",
+        f">= {config.strategy.MIN_PRODUCTION_TEST_GROWTH_PCT:.1f}%",
+    )
+
     console.print("\n")
     console.print(final_summary_table)
 
@@ -422,17 +672,10 @@ def main() -> None:
 
     demo_symbol = next((symbol for symbol in symbols if symbol in symbol_frames), None)
     if demo_symbol is not None:
-        test_row_count = config.training.TEST_DAYS * bars_per_day
-        cleaned_tail = (
-            symbol_frames[demo_symbol]
-            .iloc[-test_row_count:]
-            .copy()
-            .replace([np.inf, -np.inf], np.nan)
-            .ffill()
-            .bfill()
-            .fillna(0)
-        )
-        scaled_matrix = feature_scaler.transform(cleaned_tail[feature_names])
+        test_row_count = config.training.TEST_DAYS * interval_bars_per_day
+        cleaned_tail = sanitize_partition(symbol_frames[demo_symbol].iloc[-test_row_count:])
+        symbol_scaler = symbol_scalers[demo_symbol]
+        scaled_matrix = symbol_scaler.transform(cleaned_tail[feature_names])
         tail_targets = build_target_arrays(cleaned_tail)
         demo_windows, _ = create_sequences(
             scaled_matrix, tail_targets, sequence_length=config.model.SEQ_LEN
@@ -442,10 +685,17 @@ def main() -> None:
         model_output_map = predict_model_outputs_for_single_window(
             trained_model, last_feature_window, device
         )
-        console.print("\n[highlight]Production-style preview (last test candle)[/highlight]")
-        console.print(
-            describe_last_candle_and_model_outputs(last_candle_row, model_output_map)
-        )
+        if production_gate_passed:
+            console.print("\n[highlight]Production-style preview (last test candle)[/highlight]")
+            console.print(
+                describe_last_candle_and_model_outputs(last_candle_row, model_output_map)
+            )
+        else:
+            console.print(
+                "\n[warning]Production-style preview blocked: held-out test performance "
+                f"did not reach {config.strategy.MIN_PRODUCTION_TEST_GROWTH_PCT:.1f}% "
+                "growth with enough trades. Treat this model as research-only.[/warning]"
+            )
         console.print(
             "\n[info]Online 'learn from last mistake' is not applied inside one training run; "
             "the model learns average TP/SL from labels. Use periodic retraining or a "
