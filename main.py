@@ -7,6 +7,7 @@ from features import create_full_feature_set
 from paper_trading import run_paper_portfolio_on_signals
 from ui_utils import console, print_banner, Table
 from visuals import save_backtest_results
+from rich.panel import Panel
 
 def main() -> None:
     symbols = config.data.SYMBOLS
@@ -30,6 +31,7 @@ def main() -> None:
     
     all_trade_records = []
     equity_curves = {}
+    all_candles = {}
 
     for symbol in symbols:
         console.print(f"\n[info]Processing [bold]{symbol}[/bold]...[/info]")
@@ -60,6 +62,7 @@ def main() -> None:
         
         all_trade_records.extend(trade_records)
         equity_curves[symbol] = df["paper_equity_curve"].values
+        all_candles[symbol] = df
 
         # --- SYMBOL SPECIFIC REPORT ---
         df_trades = pd.DataFrame([vars(t) for t in trade_records])
@@ -72,18 +75,37 @@ def main() -> None:
             wins_sym = df_trades[df_trades['pnl_net_usd'] > 0]
             total_fees = df_trades['fees_usd'].sum()
             total_slippage = df_trades['slippage_usd'].sum()
-            gross_pnl = df_trades['pnl_gross_usd'].sum()
             
-            console.print(f"\n[bold cyan]📊 {symbol} DETAILED INSIGHTS (REAL-WORLD MODE)[/bold cyan]")
+            # LONG/SHORT split for symbol
+            long_trades = df_trades[df_trades['side'] == 'LONG']
+            short_trades = df_trades[df_trades['side'] == 'SHORT']
+            
+            long_wins = len(long_trades[long_trades['pnl_net_usd'] > 0])
+            short_wins = len(short_trades[short_trades['pnl_net_usd'] > 0])
+            
+            long_pnl = long_trades['pnl_net_usd'].sum()
+            short_pnl = short_trades['pnl_net_usd'].sum()
+
+            console.print(f"\n[bold cyan]📊 {symbol} DETAILED INSIGHTS[/bold cyan]")
             sym_table = Table(show_header=False, box=None)
-            sym_table.add_row("Total Trades:", f"{len(df_trades)}")
-            sym_table.add_row("Avg Trades/Day:", f"{trades_per_day:.1f}")
-            sym_table.add_row("Win Rate:", f"[bold green]{(len(wins_sym)/len(df_trades)*100):.1f}%[/bold green]")
-            sym_table.add_row("-" * 30, "-" * 10)
-            sym_table.add_row("Gross PnL:", f"[green]${gross_pnl:.2f}[/green]")
+            sym_table.add_row("Total Trades:", f"{len(df_trades)} (Avg {trades_per_day:.1f}/day)")
+            sym_table.add_row("Overall Win Rate:", f"[bold green]{(len(wins_sym)/len(df_trades)*100):.1f}%[/bold green]")
+            sym_table.add_row("-" * 40, "-" * 10)
+            
+            sym_table.add_row("[bold green]🟢 BUY (LONG) Side:[/bold green]", "")
+            sym_table.add_row("   Trades:", f"{len(long_trades)}")
+            sym_table.add_row("   Wins:", f"{long_wins}")
+            sym_table.add_row("   Net PnL:", f"[green]${long_pnl:.2f}[/green]")
+            
+            sym_table.add_row("[bold red]🔴 SELL (SHORT) Side:[/bold red]", "")
+            sym_table.add_row("   Trades:", f"{len(short_trades)}")
+            sym_table.add_row("   Wins:", f"{short_wins}")
+            sym_table.add_row("   Net PnL:", f"[green]${short_pnl:.2f}[/green]")
+            
+            sym_table.add_row("-" * 40, "-" * 10)
             sym_table.add_row("Total Fees Paid:", f"[red]${total_fees:.2f}[/red]")
-            sym_table.add_row("Total Slippage Loss:", f"[red]${total_slippage:.2f}[/red]")
-            sym_table.add_row("Net PnL (Final):", f"[bold green]${summary['total_pnl_net_usd']:.2f}[/bold green]")
+            sym_table.add_row("Total Slippage:", f"[red]${total_slippage:.2f}[/red]")
+            sym_table.add_row("Symbol Final Net PnL:", f"[bold green]${summary['total_pnl_net_usd']:.2f}[/bold green]")
             console.print(sym_table)
 
         summary_table.add_row(
@@ -104,31 +126,51 @@ def main() -> None:
     console.print(f"\n[bold gold]TOTAL CAPITAL GROWTH: {growth:.2f}%[/bold gold]")
     
     # Save results
-    save_backtest_results(all_trade_records, equity_curves)
+    save_backtest_results(all_trade_records, equity_curves, all_candles)
     
     # --- GLOBAL DEEP DIVE REPORT ---
     if all_trade_records:
         df_all_trades = pd.DataFrame([vars(t) for t in all_trade_records])
         
         total_trades = len(df_all_trades)
-        wins = df_all_trades[df_all_trades['pnl_net_usd'] > 0]
-        losses = df_all_trades[df_all_trades['pnl_net_usd'] <= 0]
-        
-        global_win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0
+        wins = len(df_all_trades[df_all_trades['pnl_net_usd'] > 0])
+        global_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
         
         total_fees = df_all_trades['fees_usd'].sum()
         total_slippage = df_all_trades['slippage_usd'].sum()
         max_profit = df_all_trades['pnl_net_usd'].max()
+
+        # LONG side stats
+        long_trades = df_all_trades[df_all_trades['side'] == 'LONG']
+        long_wins = len(long_trades[long_trades['pnl_net_usd'] > 0])
+        long_losses = len(long_trades[long_trades['pnl_net_usd'] <= 0])
+        long_win_rate = (long_wins / len(long_trades) * 100) if not long_trades.empty else 0
         
+        # SHORT side stats
+        short_trades = df_all_trades[df_all_trades['side'] == 'SHORT']
+        short_wins = len(short_trades[short_trades['pnl_net_usd'] > 0])
+        short_losses = len(short_trades[short_trades['pnl_net_usd'] <= 0])
+        short_win_rate = (short_wins / len(short_trades) * 100) if not short_trades.empty else 0
+
         console.print("\n" + "="*50)
         console.print("[bold gold]🌍 GLOBAL REAL-WORLD SUMMARY (ALL SYMBOLS)[/bold gold]")
         console.print("="*50)
         
         insight_table = Table(show_header=False, box=None)
         insight_table.add_row("Total Combined Trades:", f"[bold]{total_trades}[/bold]")
-        insight_table.add_row("Total Wins:", f"[green]{len(wins)}[/green]")
-        insight_table.add_row("Total Losses:", f"[red]{len(losses)}[/red]")
         insight_table.add_row("Global Win Rate:", f"[bold cyan]{global_win_rate:.1f}%[/bold cyan]")
+        insight_table.add_row("-" * 30, "-" * 10)
+        
+        insight_table.add_row("[bold green]🟢 BUY (LONG) TRADES:[/bold green]", f"[bold]{len(long_trades)}[/bold]")
+        insight_table.add_row("   Wins:", f"[green]{long_wins}[/green]")
+        insight_table.add_row("   Losses:", f"[red]{long_losses}[/red]")
+        insight_table.add_row("   Win Rate:", f"{long_win_rate:.1f}%")
+        
+        insight_table.add_row("[bold red]🔴 SELL (SHORT) TRADES:[/bold red]", f"[bold]{len(short_trades)}[/bold]")
+        insight_table.add_row("   Wins:", f"[green]{short_wins}[/green]")
+        insight_table.add_row("   Losses:", f"[red]{short_losses}[/red]")
+        insight_table.add_row("   Win Rate:", f"{short_win_rate:.1f}%")
+        
         insight_table.add_row("-" * 30, "-" * 10)
         insight_table.add_row("Total Portfolio Fees:", f"[red]${total_fees:.2f}[/red]")
         insight_table.add_row("Total Portfolio Slippage:", f"[red]${total_slippage:.2f}[/red]")
@@ -140,8 +182,10 @@ def main() -> None:
         
         console.print(insight_table)
         console.print("="*50)
-        
-    console.print(f"\n[info]Simulation complete. Results saved in 'results' folder.[/info]\n")
+
+
+    console.print(f"\n[bold green]Simulation complete. Results saved in 'results' folder.[/bold green]")
+
 
 if __name__ == "__main__":
     main()

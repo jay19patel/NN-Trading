@@ -96,11 +96,13 @@ def add_oracle_target_labels(df: pd.DataFrame) -> pd.DataFrame:
     downside_adj = ((entry_price_short - future_min_low) / entry_price_short) * 100.0
     
     # Use adjusted upside for TP targets
-    oracle_tp_long = np.maximum(upside_adj * strategy.ORACLE_TP_CAPTURE_RATIO, 1e-6)
-    oracle_sl_long = np.full(row_count, strategy.ORACLE_MIN_SL_PCT) # Simple SL for sync
+    oracle_tp_long = np.maximum(upside_adj * strategy.ORACLE_TP_CAPTURE_RATIO, strategy.ORACLE_MIN_TP_PCT)
+    # Set SL to exactly half of TP to maintain 1:2 RR (Risk 1 unit for 2 units reward)
+    oracle_sl_long = oracle_tp_long / 2.0
     
-    oracle_tp_short = np.maximum(downside_adj * strategy.ORACLE_TP_CAPTURE_RATIO, 1e-6)
-    oracle_sl_short = np.full(row_count, strategy.ORACLE_MIN_SL_PCT)
+    oracle_tp_short = np.maximum(downside_adj * strategy.ORACLE_TP_CAPTURE_RATIO, strategy.ORACLE_MIN_TP_PCT)
+    # Set SL to exactly half of TP to maintain 1:2 RR
+    oracle_sl_short = oracle_tp_short / 2.0
 
     # RR Check
     oracle_rr_long = oracle_tp_long / oracle_sl_long

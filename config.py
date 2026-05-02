@@ -16,7 +16,7 @@ class FeatureConfig:
 
 @dataclass
 class StrategyConfig:
-    INITIAL_CAPITAL_USD: float = 1000.0
+    INITIAL_CAPITAL_USD: float = 50.0
     RISK_PER_TRADE_PCT_OF_EQUITY: float = 2.0
     MAX_POSITION_NOTIONAL_PCT_OF_EQUITY: float = 0.95
     ROUND_TRIP_FEE_PCT: float = 0.05   # Realistic crypto fees
@@ -29,7 +29,7 @@ class StrategyConfig:
     ORACLE_MAX_SL_PCT: float = 2.0
     ORACLE_TP_CAPTURE_RATIO: float = 0.80 # Buffer for slippage
     ORACLE_SL_CAPTURE_RATIO: float = 0.01 
-    ORACLE_MIN_RR: float = 3.0
+    ORACLE_MIN_RR: float = 2.0
     ORACLE_MIN_UPSIDE_PCT: float = 1.0    # Strict upside
     ORACLE_MIN_DOWNSIDE_PCT: float = 1.0  # Strict downside
     
@@ -47,7 +47,7 @@ class StrategyConfig:
     USE_ORACLE_LABELS: bool = True
     TARGET_PROFIT_PCT: float = 1.0
     STOP_LOSS_PCT: float = 0.5
-    MIN_REWARD_RISK_RATIO: float = 1.0
+    MIN_REWARD_RISK_RATIO: float = 2.0
     MIN_DIRECTIONAL_EDGE: float = 0.0
     AI_CONFIDENCE_THRESHOLD: float = 0.0
 

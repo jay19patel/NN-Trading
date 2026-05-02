@@ -27,6 +27,8 @@ class PaperTradeRecord:
     notional_usd: float
     take_profit_pct: float
     stop_loss_pct: float
+    tp_price: float
+    sl_price: float
     ai_confidence: float
     ai_qty_ratio: float
     outcome: str
@@ -231,6 +233,8 @@ def run_paper_portfolio_on_signals(
                         notional_usd=t["notional_usd"],
                         take_profit_pct=t["tp_pct"],
                         stop_loss_pct=t["sl_pct"],
+                        tp_price=t["tp_price"],
+                        sl_price=t["sl_price_initial"],
                         ai_confidence=t["confidence"],
                         ai_qty_ratio=t["qty_ratio"],
                         outcome=realized_outcome,
