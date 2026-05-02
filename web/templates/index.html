@@ -285,7 +285,20 @@
 </div>
 
 <div id="bookTab" class="tab-content">
-    <div class="trade-book-view">
+    <div class="trade-book-view" style="display:flex; flex-direction:column; width:100%; padding:20px; gap:20px; overflow-y:auto;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div style="font-weight: 800; font-size: 14px; color: var(--accent); text-transform: uppercase; letter-spacing: 1px;">Execution Ledger</div>
+            <div style="display:flex; gap:10px;">
+                <select id="bookSymbolPicker" onchange="renderTradeBook()" style="background:#21262d; color:#fff; border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:11px; font-weight: 700;">
+                    <option value="ALL">ALL ASSETS</option>
+                </select>
+                <select id="bookSidePicker" onchange="renderTradeBook()" style="background:#21262d; color:#fff; border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:11px; font-weight: 700;">
+                    <option value="ALL">ALL SIDES</option>
+                    <option value="LONG">BUY ONLY</option>
+                    <option value="SHORT">SELL ONLY</option>
+                </select>
+            </div>
+        </div>
         <div class="table-container">
             <table id="tradeBookTable">
                 <thead>
@@ -344,7 +357,11 @@
         document.getElementById('nav-pnl-pct').style.color = color;
 
         // Populate Pickers
-        const symPickers = [document.getElementById('symbolPicker'), document.getElementById('analysisAssetPicker')];
+        const symPickers = [
+            document.getElementById('symbolPicker'), 
+            document.getElementById('analysisAssetPicker'),
+            document.getElementById('bookSymbolPicker')
+        ];
         symPickers.forEach(p => {
             const val = p.value;
             p.innerHTML = '<option value="ALL">ALL ASSETS</option>';
@@ -394,8 +411,17 @@
 
     function renderTradeBook() {
         const body = document.getElementById('tradeBookBody');
+        const targetSym = document.getElementById('bookSymbolPicker').value;
+        const targetSide = document.getElementById('bookSidePicker').value;
+        
         body.innerHTML = '';
-        masterData.trades.forEach(t => {
+        const filtered = masterData.trades.filter(t => {
+            const symMatch = (targetSym === 'ALL' || t.symbol === targetSym);
+            const sideMatch = (targetSide === 'ALL' || t.side === targetSide);
+            return symMatch && sideMatch;
+        });
+
+        filtered.forEach(t => {
             const pnl_col = t.pnl_net_usd > 0 ? "var(--success)" : "var(--danger)";
             const id = t.entry_datetime + t.symbol;
             const row = document.createElement('tr');
@@ -524,6 +550,12 @@
             return parseFloat(b.getAttribute('data-pnl')) - parseFloat(a.getAttribute('data-pnl'));
         }).forEach(c => container.appendChild(c));
         if (currentSym !== 'ALL') loadSymbol(currentSym);
+        
+        // Also update the analytics and book if they are currently visible or for consistency
+        renderTradeBook();
+        if (document.getElementById('analyticsTab').classList.contains('active')) {
+            renderAnalytics();
+        }
     }
 
     function loadSymbol(symbol, zoomTrade = null) {

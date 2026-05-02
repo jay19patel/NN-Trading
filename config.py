@@ -4,9 +4,9 @@ import os
 
 @dataclass
 class DataConfig:
-    SYMBOLS: list[str] = ("BTCUSD", "ETHUSD")
-    INTERVAL: str = "1m"
-    TOTAL_DAYS: int = 30
+    SYMBOLS: list[str] = ("ETHUSD",)
+    INTERVAL: str = "15m"
+    TOTAL_DAYS: int = 365
     CACHE_VALID_MINS: int = 0  # Rebuild every time for 100% accuracy
 
 @dataclass
