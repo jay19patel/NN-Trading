@@ -6,7 +6,7 @@ import os
 class DataConfig:
     SYMBOLS: list[str] = ("ETHUSD",)
     INTERVAL: str = "15m"
-    TOTAL_DAYS: int = 365
+    TOTAL_DAYS: int = 30
     CACHE_VALID_MINS: int = 0  # Rebuild every time for 100% accuracy
 
 @dataclass
@@ -52,14 +52,33 @@ class StrategyConfig:
     AI_CONFIDENCE_THRESHOLD: float = 0.0
 
 @dataclass
+class ModelConfig:
+    HIDDEN_DIM: int = 128
+    NUM_HEADS: int = 4
+    NUM_LAYERS: int = 3
+    DROPOUT: float = 0.2
+    MAX_SEQ_LEN: int = 128
+    WINDOW_SIZE: int = 48  # Number of past bars to look at
+
+@dataclass
+class TrainingConfig:
+    BATCH_SIZE: int = 64
+    EPOCHS: int = 50
+    LR: float = 0.0005
+    FOCAL_NEUTRAL_VIOLATION_SCALE: float = 2.0
+    
+@dataclass
 class TradingConfig:
     data: DataConfig = field(default_factory=DataConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
     
     @property
     def DEVICE(self):
-        return "cpu"
+        import torch
+        return "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 config = TradingConfig()
 
