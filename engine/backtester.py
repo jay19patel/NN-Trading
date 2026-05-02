@@ -273,6 +273,13 @@ def run_paper_portfolio_on_signals(
         ):
             verdict = int(row["ai_verdict"])
             if verdict != 1:  # 0=BUY, 2=SELL
+                side = "LONG" if verdict == 0 else "SHORT"
+                
+                # RULE: No duplicate side for same symbol
+                is_side_active = any(t["symbol"] == symbol and t["side"] == side for t in active_trades)
+                if is_side_active:
+                    continue
+
                 tp_pct = float(row["ai_take_profit_pct"])
                 sl_pct = float(row["ai_stop_loss_pct"])
                 directional_edge = float(row.get("ai_directional_edge", 0.0))
@@ -312,6 +319,7 @@ def run_paper_portfolio_on_signals(
 
                 if quantity > 0:
                     active_trades.append({
+                        "symbol": symbol,
                         "side": side,
                         "raw_entry_price": raw_entry_price,
                         "entry_price": entry_price,

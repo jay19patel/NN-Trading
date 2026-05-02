@@ -61,8 +61,16 @@ def main():
     for strategy in strategies_to_run:
         run_strategy_backtest(strategy, all_candles)
 
-    console.rule("[bold green]ALL SIMULATIONS COMPLETE")
-    console.print(f"Check the [bold cyan]results/[/bold cyan] folder for strategy reports.")
+    # 4. Final summary
+    console.print("\n[bold green]───────────────────────── ALL SIMULATIONS COMPLETE ──────────────────────────[/bold green]")
+    console.print("Check the [bold]results/[/bold] folder for raw data.")
+    
+    # 5. Start Dashboard Server
+    console.print("\n[bold cyan]🚀 Starting Dynamic Analytics Dashboard...[/bold cyan]")
+    console.print("[info]Access your results at: [bold underline]http://127.0.0.1:5001[/bold underline][/info]\n")
+    
+    from web.app import app
+    app.run(debug=False, port=5001)
 
 if __name__ == "__main__":
     main()

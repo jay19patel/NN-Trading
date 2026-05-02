@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock LLM - Advanced Backtesting Terminal</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0d1117;
+            --card-bg: #161b22;
+            --accent: #58a6ff;
+            --text: #c9d1d9;
+            --success: #3fb950;
+            --danger: #f85149;
+            --border: #30363d;
+            --header-height: 60px;
+        }
+        body {
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: 'Outfit', sans-serif;
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .navbar {
+            height: var(--header-height);
+            background: rgba(22, 27, 34, 0.8);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 30px;
+            flex-shrink: 0;
+            z-index: 100;
+        }
+        .nav-stats { display: flex; gap: 25px; align-items: center; }
+        .nav-item { display: flex; flex-direction: column; align-items: flex-end; }
+        .nav-label { font-size: 10px; opacity: 0.5; text-transform: uppercase; font-weight: 800; letter-spacing: 0.5px; }
+        .nav-value { font-size: 14px; font-weight: 700; }
+
+        .tabs-container {
+            display: flex;
+            gap: 8px;
+            padding: 12px 30px;
+            background: #0d1117;
+            border-bottom: 1px solid var(--border);
+        }
+        .tab-btn {
+            padding: 10px 20px;
+            background: #21262d;
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            transition: all 0.2s ease;
+        }
+        .tab-btn:hover { background: #30363d; border-color: var(--accent); }
+        .tab-btn.active { background: var(--accent); color: #000; border-color: var(--accent); box-shadow: 0 0 15px rgba(88, 166, 255, 0.3); }
+        
+        .tab-content { display: none; flex-grow: 1; overflow: hidden; }
+        .tab-content.active { display: flex; }
+        
+        .sidebar {
+            width: 320px;
+            background: var(--card-bg);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+        .sidebar-header {
+            padding: 15px 20px;
+            font-size: 11px;
+            font-weight: 800;
+            border-bottom: 1px solid var(--border);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--accent);
+        }
+        .filter-section {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .filter-group { display: flex; gap: 6px; }
+        .filter-btn {
+            flex: 1;
+            padding: 8px;
+            font-size: 11px;
+            background: #21262d;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text);
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .filter-btn.active { background: var(--accent); color: #000; border-color: var(--accent); }
+        
+        .main-view {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 15px;
+            gap: 15px;
+            position: relative;
+        }
+        
+        .trades-container { overflow-y: auto; flex-grow: 1; padding: 5px; }
+        .trade-card { 
+            padding: 12px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 10px; 
+            cursor: pointer; display: flex; flex-direction: column; gap: 4px; background: rgba(255,255,255,0.02);
+            transition: all 0.2s ease;
+        }
+        .trade-card.hidden { display: none; }
+        .trade-card:hover { border-color: var(--accent); background: rgba(255,255,255,0.05); transform: translateX(5px); }
+        .trade-card.active { border-color: var(--accent); background: rgba(88, 166, 255, 0.1); border-left: 5px solid var(--accent); }
+        
+        .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+        .long-badge { background: #3fb95022; color: var(--success); }
+        .short-badge { background: #f8514922; color: var(--danger); }
+        
+        .trade-overlay {
+            position: absolute; bottom: 25px; right: 25px;
+            width: 320px; background: rgba(22, 27, 34, 0.95); border: 1px solid var(--accent);
+            border-radius: 16px; padding: 20px; z-index: 50; display: none;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.8);
+            backdrop-filter: blur(15px);
+        }
+        
+        .analytics-view { flex-grow: 1; padding: 25px; overflow-y: auto; display: flex; flex-direction: column; gap: 25px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+        .stat-card { 
+            background: var(--card-bg); border: 1px solid var(--border); padding: 15px; border-radius: 10px; 
+            text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            transition: transform 0.2s ease;
+        }
+        .stat-card:hover { transform: translateY(-3px); border-color: var(--accent); }
+        .stat-card .val { font-size: 18px; font-weight: 800; margin-bottom: 2px; }
+        .stat-card .lab { font-size: 9px; opacity: 0.5; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
+        
+        .table-container { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+        table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        th { text-align: left; background: #21262d; padding: 12px; border-bottom: 2px solid var(--border); color: var(--accent); font-weight: 800; text-transform: uppercase; }
+        td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+        tr:hover { background: rgba(255, 255, 255, 0.03); }
+
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+        
+        select { 
+            appearance: none; 
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e"); 
+            background-repeat: no-repeat; background-position: right 10px center; background-size: 12px; 
+            padding-right: 30px !important;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+<div id="loadingScreen" class="loading-screen" style="position:fixed; top:0; left:0; width:100%; height:100%; background:var(--bg); display:flex; flex-direction:column; justify-content:center; align-items:center; z-index:1000;">
+    <div class="spinner" style="width:50px; height:50px; border:5px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 1s linear infinite;"></div>
+    <div style="margin-top: 25px; font-weight: 600; font-size: 16px; letter-spacing: 1px; color: var(--accent);">SYNCHRONIZING ANALYTICS...</div>
+</div>
+
+<div class="navbar">
+    <div style="display: flex; align-items: center; gap: 20px;">
+        <div style="font-weight: 800; color: var(--accent); font-size: 20px; letter-spacing: -0.5px;">STOCK LLM</div>
+        <select id="strategyPicker" onchange="loadStrategy(this.value)" style="background:#21262d; color:#fff; border:1px solid var(--border); border-radius:8px; padding:8px 12px; font-size:12px; font-weight: 700;">
+        </select>
+    </div>
+    
+    <div class="nav-stats">
+        <div class="nav-item">
+            <span class="nav-label">Initial Capital</span>
+            <span id="nav-initial" class="nav-value">$0.00</span>
+        </div>
+        <div class="nav-item">
+            <span class="nav-label">Current Balance</span>
+            <span id="nav-balance" class="nav-value">$0.00</span>
+        </div>
+        <div class="nav-item">
+            <span class="nav-label">Net Profit / Loss</span>
+            <div style="display: flex; gap: 8px; align-items: baseline;">
+                <span id="nav-pnl-usd" class="nav-value">$0.00</span>
+                <span id="nav-pnl-pct" style="font-size: 11px; font-weight: 800;">(0.00%)</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="tabs-container">
+    <button class="tab-btn active" onclick="switchTab('trading')">Terminal View</button>
+    <button class="tab-btn" onclick="switchTab('analytics')">Performance Analytics</button>
+    <button class="tab-btn" onclick="switchTab('book')">Trade Ledger</button>
+</div>
+
+<div id="tradingTab" class="tab-content active">
+    <div class="sidebar">
+        <div class="sidebar-header">Command Center</div>
+        <div class="filter-section">
+            <div class="nav-label">Asset Selection</div>
+            <select id="symbolPicker" onchange="updateFilters()" style="width:100%; background:#0d1117; color:#fff; border:1px solid var(--border); border-radius:8px; padding:10px; font-size:13px; font-weight: 600;">
+                <option value="ALL">ALL ASSETS</option>
+            </select>
+            
+            <div class="nav-label" style="margin-top:5px;">Execution Side</div>
+            <div class="filter-group">
+                <button id="filter-ALL" class="filter-btn active" onclick="setSideFilter('ALL')">ALL</button>
+                <button id="filter-LONG" class="filter-btn" onclick="setSideFilter('LONG')">LONG</button>
+                <button id="filter-SHORT" class="filter-btn" onclick="setSideFilter('SHORT')">SHORT</button>
+            </div>
+            
+            <div class="nav-label" style="margin-top:5px;">Ordering</div>
+            <div class="filter-group">
+                <button id="sort-TIME" class="filter-btn active" onclick="setSort('TIME')">CHRONO</button>
+                <button id="sort-PNL" class="filter-btn" onclick="setSort('PNL')">PROFIT</button>
+            </div>
+        </div>
+
+        <div id="tradesContainer" class="trades-container"></div>
+    </div>
+    <div class="main-view">
+        <div id="mainChart" style="flex-grow: 1; background: var(--card-bg); border-radius: 12px; border: 1px solid var(--border); overflow: hidden;"></div>
+        
+        <div class="trade-overlay" id="tradeOverlay">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; border-bottom:1px solid var(--border); padding-bottom:10px;">
+                <span style="font-weight:800; font-size:12px; color:var(--accent); letter-spacing:1px;">EXECUTION RECEIPT</span>
+                <span style="font-size:18px; color:#fff; cursor:pointer; font-weight:800;" onclick="clearSelectedTrade()">×</span>
+            </div>
+            <div id="overlayContent" style="font-size:12px; display:flex; flex-direction:column; gap:10px;"></div>
+        </div>
+    </div>
+</div>
+
+<div id="analyticsTab" class="tab-content">
+    <div class="analytics-view">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+            <div style="font-weight: 800; font-size: 12px; color: var(--accent); text-transform: uppercase; letter-spacing: 1px;">Performance Overview</div>
+            <select id="analysisAssetPicker" onchange="renderAnalytics()" style="background:#21262d; color:#fff; border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:11px; font-weight: 700;">
+                <option value="ALL">ALL ASSETS</option>
+            </select>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card"><div id="stat-growth" class="val" style="color:var(--success)">0.00%</div><div class="lab">Cumulative Growth</div></div>
+            <div class="stat-card"><div id="stat-mdd" class="val" style="color:var(--danger)">0.00%</div><div class="lab">Risk (Max Drawdown)</div></div>
+            <div class="stat-card"><div id="stat-trades" class="val">0</div><div class="lab">Executed Trades</div></div>
+            <div class="stat-card"><div id="stat-wr" class="val">0.0%</div><div class="lab">Strategy Win Rate</div></div>
+            <div class="stat-card"><div id="stat-avg-pnl" class="val">$0.00</div><div class="lab">Avg PnL / Trade</div></div>
+        </div>
+
+        <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 25px; box-shadow: 0 10px 40px rgba(0,0,0,0.4);">
+            <div style="font-weight: 800; font-size: 14px; margin-bottom: 20px; color: var(--accent); text-transform: uppercase; letter-spacing: 1px;">Equity Trajectory</div>
+            <div id="bigEquityChart" style="height: 400px;"></div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+            <div class="table-container">
+                <table style="width: 100%;">
+                    <thead><tr><th colspan="2">Execution Breakdown</th></tr></thead>
+                    <tbody id="detailedStatsBody">
+                    </tbody>
+                </table>
+            </div>
+            <div class="table-container">
+                <table style="width: 100%;">
+                    <thead><tr><th colspan="2">Risk & Reward Profile</th></tr></thead>
+                    <tbody id="riskRewardBody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="bookTab" class="tab-content">
+    <div class="trade-book-view">
+        <div class="table-container">
+            <table id="tradeBookTable">
+                <thead>
+                    <tr>
+                        <th>EXECUTION TIME</th>
+                        <th>ASSET</th>
+                        <th>SIDE</th>
+                        <th>ENTRY</th>
+                        <th>EXIT</th>
+                        <th>UNITS</th>
+                        <th>POSITION</th>
+                        <th>NET PNL</th>
+                        <th>RESULT</th>
+                    </tr>
+                </thead>
+                <tbody id="tradeBookBody"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+    let masterData = null;
+    let currentSym = 'ALL';
+    let currentSide = 'ALL';
+    let currentSort = 'TIME';
+    let selectedTradeIdx = -1;
+
+    async function init() {
+        const response = await fetch('/api/strategies');
+        const strategies = await response.json();
+        const picker = document.getElementById('strategyPicker');
+        strategies.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s; opt.textContent = s.toUpperCase(); picker.appendChild(opt);
+        });
+        if (strategies.length > 0) loadStrategy(strategies[0]);
+        setTimeout(() => document.getElementById('loadingScreen').style.display = 'none', 500);
+    }
+
+    async function loadStrategy(name) {
+        const response = await fetch(`/api/results/${name}`);
+        masterData = await response.json();
+        
+        // Update Nav Stats
+        const pnl = masterData.stats.total_pnl;
+        const initial = masterData.stats.initial_capital;
+        const currentBalance = initial + pnl;
+        const pnl_pct = (pnl / initial * 100);
+        document.getElementById('nav-initial').textContent = `$${initial.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+        document.getElementById('nav-balance').textContent = `$${currentBalance.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+        document.getElementById('nav-pnl-usd').textContent = `$${pnl.toLocaleString(undefined, {minimumFractionDigits: 2})}`;
+        document.getElementById('nav-pnl-pct').textContent = `(${pnl_pct >= 0 ? '+' : ''}${pnl_pct.toFixed(2)}%)`;
+        const color = pnl >= 0 ? 'var(--success)' : 'var(--danger)';
+        document.getElementById('nav-pnl-usd').style.color = color;
+        document.getElementById('nav-pnl-pct').style.color = color;
+
+        // Populate Pickers
+        const symPickers = [document.getElementById('symbolPicker'), document.getElementById('analysisAssetPicker')];
+        symPickers.forEach(p => {
+            const val = p.value;
+            p.innerHTML = '<option value="ALL">ALL ASSETS</option>';
+            Object.keys(masterData.candles).sort().forEach(s => {
+                const opt = document.createElement('option');
+                opt.value = s; opt.textContent = s; p.appendChild(opt);
+            });
+            p.value = val || 'ALL';
+        });
+
+        clearSelectedTrade();
+        renderTradeList();
+        renderTradeBook();
+        updateFilters();
+        
+        const firstSym = Object.keys(masterData.candles)[0];
+        if (firstSym) loadSymbol(firstSym);
+    }
+
+    function renderTradeList() {
+        const container = document.getElementById('tradesContainer');
+        container.innerHTML = '';
+        masterData.trades.forEach((t, i) => {
+            const pnl_col = t.pnl_net_usd > 0 ? "var(--success)" : "var(--danger)";
+            const id = t.entry_datetime + t.symbol;
+            const card = document.createElement('div');
+            card.className = 'trade-card';
+            card.setAttribute('data-symbol', t.symbol);
+            card.setAttribute('data-side', t.side);
+            card.setAttribute('data-time', t.entry_datetime);
+            card.setAttribute('data-pnl', t.pnl_net_usd);
+            card.setAttribute('data-id', id);
+            card.onclick = () => selectTrade(id);
+            card.innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-weight:800; color:#fff; font-size:12px;">${t.symbol}</span>
+                    <span style="color:${pnl_col}; font-weight:800; font-size:12px;">$${t.pnl_net_usd.toFixed(2)}</span>
+                </div>
+                <div style="margin-top:4px; font-size:9px; display:flex; justify-content:space-between; opacity:0.7;">
+                    <span><span class="badge ${t.side === 'LONG' ? 'long-badge' : 'short-badge'}">${t.side}</span> <span style="margin-left:5px;">Qty: ${t.quantity.toFixed(4)}</span></span>
+                    <span>${t.entry_datetime.split(' ')[1]}</span>
+                </div>
+            `;
+            container.appendChild(card);
+        });
+    }
+
+    function renderTradeBook() {
+        const body = document.getElementById('tradeBookBody');
+        body.innerHTML = '';
+        masterData.trades.forEach(t => {
+            const pnl_col = t.pnl_net_usd > 0 ? "var(--success)" : "var(--danger)";
+            const id = t.entry_datetime + t.symbol;
+            const row = document.createElement('tr');
+            row.style.cursor = 'pointer';
+            row.onclick = () => selectTrade(id);
+            row.innerHTML = `
+                <td style="opacity:0.6;">${t.entry_datetime}</td>
+                <td style="font-weight:800; color:var(--accent);">${t.symbol}</td>
+                <td><span class="badge ${t.side === 'LONG' ? 'long-badge' : 'short-badge'}">${t.side}</span></td>
+                <td>$${t.entry_price.toFixed(2)}</td>
+                <td>$${t.exit_price.toFixed(2)}</td>
+                <td style="font-weight:600;">${t.quantity.toFixed(4)}</td>
+                <td>$${t.notional_usd.toFixed(2)}</td>
+                <td style="color:${pnl_col}; font-weight:800;">$${t.pnl_net_usd.toFixed(2)}</td>
+                <td><span class="badge" style="background:${t.outcome === 'SUCCESS' ? '#3fb95022' : '#f8514922'}; color:${t.outcome === 'SUCCESS' ? 'var(--success)' : 'var(--danger)'};">${t.outcome}</span></td>
+            `;
+            body.appendChild(row);
+        });
+    }
+
+    function switchTab(tab) {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        if (tab === 'trading') {
+            document.querySelector('.tab-btn[onclick*="trading"]').classList.add('active');
+            document.getElementById('tradingTab').classList.add('active');
+            Plotly.Plots.resize('mainChart');
+        } else if (tab === 'analytics') {
+            document.querySelector('.tab-btn[onclick*="analytics"]').classList.add('active');
+            document.getElementById('analyticsTab').classList.add('active');
+            renderAnalytics();
+        } else {
+            document.querySelector('.tab-btn[onclick*="book"]').classList.add('active');
+            document.getElementById('bookTab').classList.add('active');
+        }
+    }
+
+    function renderAnalytics() {
+        const targetSym = document.getElementById('analysisAssetPicker').value;
+        const filteredTrades = targetSym === 'ALL' ? masterData.trades : masterData.trades.filter(t => t.symbol === targetSym);
+        const pe = targetSym === 'ALL' ? masterData.equity["GLOBAL"] : masterData.equity[targetSym];
+
+        // 1. Basic Stats
+        const total = filteredTrades.length;
+        const wins = filteredTrades.filter(t => t.pnl_net_usd > 0).length;
+        const netPnl = filteredTrades.reduce((acc, t) => acc + t.pnl_net_usd, 0);
+        const initial = targetSym === 'ALL' ? masterData.stats.initial_capital : 100; // approximation for single sym
+        const growth = targetSym === 'ALL' ? ((pe[pe.length-1] - pe[0])/pe[0]*100) : ((pe[pe.length-1]-pe[0])/pe[0]*100);
+        
+        document.getElementById('stat-growth').textContent = `${growth.toFixed(2)}%`;
+        document.getElementById('stat-trades').textContent = total;
+        document.getElementById('stat-wr').textContent = `${(wins/Math.max(1, total)*100).toFixed(1)}%`;
+        document.getElementById('stat-avg-pnl').textContent = `$${(netPnl/Math.max(1, total)).toFixed(2)}`;
+
+        let peak = pe[0]; let maxDD = 0;
+        pe.forEach(v => { if(v > peak) peak = v; let dd = (peak - v)/peak; if(dd > maxDD) maxDD = dd; });
+        document.getElementById('stat-mdd').textContent = `${(maxDD*100).toFixed(2)}%`;
+
+        // 2. Equity Chart
+        const traces = [];
+        traces.push({ x: masterData.timeline, y: pe, name: targetSym === 'ALL' ? "PORTFOLIO" : targetSym, type: 'scatter', mode: 'lines', line: { width: 4, color: '#58a6ff' }, fill: 'tozeroy', fillcolor: 'rgba(88, 166, 255, 0.05)' });
+        if (targetSym === 'ALL') {
+            for (const s in masterData.equity) { 
+                if (s === "GLOBAL") continue; 
+                traces.push({ x: masterData.timeline, y: masterData.equity[s], name: s, type: 'scatter', mode: 'lines', line: { width: 2 }, opacity: 0.25 }); 
+            }
+        }
+        Plotly.newPlot('bigEquityChart', traces, { 
+            template: 'plotly_dark', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: { t: 10, b: 60, l: 60, r: 20 }, legend: { orientation: 'h', y: -0.2 },
+            xaxis: { showgrid: false, zeroline: false, showline: false }, yaxis: { showgrid: false, zeroline: false, showline: false }
+        });
+
+        // 3. Detailed Stats
+        const longs = filteredTrades.filter(t => t.side === 'LONG');
+        const shorts = filteredTrades.filter(t => t.side === 'SHORT');
+        const longWins = longs.filter(t => t.pnl_net_usd > 0).length;
+        const shortWins = shorts.filter(t => t.pnl_net_usd > 0).length;
+        
+        document.getElementById('detailedStatsBody').innerHTML = `
+            <tr><td>Total Buy Entries</td><td style="text-align:right; font-weight:800; color:var(--success);">${longs.length}</td></tr>
+            <tr><td>Total Sell Entries</td><td style="text-align:right; font-weight:800; color:var(--danger);">${shorts.length}</td></tr>
+            <tr><td>Buy Win Rate</td><td style="text-align:right; font-weight:800;">${(longWins/Math.max(1, longs.length)*100).toFixed(1)}%</td></tr>
+            <tr><td>Sell Win Rate</td><td style="text-align:right; font-weight:800;">${(shortWins/Math.max(1, shorts.length)*100).toFixed(1)}%</td></tr>
+            <tr><td>Net Buy Profit</td><td style="text-align:right; font-weight:800;">$${longs.reduce((a,b)=>a+b.pnl_net_usd,0).toFixed(2)}</td></tr>
+            <tr><td>Net Sell Profit</td><td style="text-align:right; font-weight:800;">$${shorts.reduce((a,b)=>a+b.pnl_net_usd,0).toFixed(2)}</td></tr>
+        `;
+
+        const maxWin = Math.max(...filteredTrades.map(t => t.pnl_net_usd), 0);
+        const maxLoss = Math.min(...filteredTrades.map(t => t.pnl_net_usd), 0);
+        const totalFees = filteredTrades.reduce((a,b) => a + b.fees_usd, 0);
+
+        document.getElementById('riskRewardBody').innerHTML = `
+            <tr><td>Largest Win</td><td style="text-align:right; font-weight:800; color:var(--success);">$${maxWin.toFixed(2)}</td></tr>
+            <tr><td>Largest Loss</td><td style="text-align:right; font-weight:800; color:var(--danger);">$${maxLoss.toFixed(2)}</td></tr>
+            <tr><td>Total Commisions</td><td style="text-align:right; font-weight:800;">$${totalFees.toFixed(2)}</td></tr>
+            <tr><td>Profit Factor</td><td style="text-align:right; font-weight:800;">${(Math.abs(filteredTrades.filter(t=>t.pnl_net_usd>0).reduce((a,b)=>a+b.pnl_net_usd,0)/Math.max(1, Math.abs(filteredTrades.filter(t=>t.pnl_net_usd<0).reduce((a,b)=>a+b.pnl_net_usd,0))))).toFixed(2)}</td></tr>
+            <tr><td>Avg Hold Time</td><td style="text-align:right; font-weight:800;">${(filteredTrades.reduce((a,b)=>a+b.holding_duration_mins,0)/Math.max(1, total)).toFixed(1)} mins</td></tr>
+        `;
+    }
+
+    function setSideFilter(side) {
+        currentSide = side;
+        document.querySelectorAll('[id^="filter-"]').forEach(b => b.classList.remove('active'));
+        document.getElementById('filter-' + side).classList.add('active');
+        updateFilters();
+    }
+
+    function setSort(sort) {
+        currentSort = sort;
+        document.querySelectorAll('[id^="sort-"]').forEach(b => b.classList.remove('active'));
+        document.getElementById('sort-' + sort).classList.add('active');
+        updateFilters();
+    }
+
+    function updateFilters() {
+        currentSym = document.getElementById('symbolPicker').value;
+        const cards = document.querySelectorAll('.trade-card');
+        cards.forEach(c => {
+            const sym = c.getAttribute('data-symbol');
+            const side = c.getAttribute('data-side');
+            c.classList.toggle('hidden', !((currentSym === 'ALL' || currentSym === sym) && (currentSide === 'ALL' || currentSide === side)));
+        });
+        const container = document.getElementById('tradesContainer');
+        Array.from(cards).sort((a, b) => {
+            if (currentSort === 'TIME') return b.getAttribute('data-time').localeCompare(a.getAttribute('data-time'));
+            return parseFloat(b.getAttribute('data-pnl')) - parseFloat(a.getAttribute('data-pnl'));
+        }).forEach(c => container.appendChild(c));
+        if (currentSym !== 'ALL') loadSymbol(currentSym);
+    }
+
+    function loadSymbol(symbol, zoomTrade = null) {
+        const df = masterData.candles[symbol];
+        const traces = [{ x: df.map(c => c.Date), open: df.map(c => c.Open), high: df.map(c => c.High), low: df.map(c => c.Low), close: df.map(c => c.Close), type: 'candlestick', name: symbol, increasing: { line: { color: '#3fb950' } }, decreasing: { line: { color: '#f85149' } } }];
+        const layout = { dragmode: 'pan', template: 'plotly_dark', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: { t: 10, b: 30, l: 60, r: 10 }, xaxis: { rangeslider: { visible: false }, gridcolor: '#30363d' }, yaxis: { gridcolor: '#30363d' }, shapes: [], annotations: [] };
+        if (zoomTrade) {
+            const start = Math.max(0, zoomTrade.entry_index - 30);
+            const end = Math.min(df.length - 1, zoomTrade.entry_index + 100);
+            layout.xaxis.range = [df[start].Date, df[end].Date];
+            const window = df.slice(start, end);
+            const high = Math.max(...window.map(c => c.High));
+            const low = Math.min(...window.map(c => c.Low));
+            const pad = (high - low) * 0.2;
+            layout.yaxis.range = [low - pad, high + pad];
+            traces.push({ x: [zoomTrade.entry_datetime], y: [zoomTrade.entry_price], mode: 'markers+text', type: 'scatter', name: 'ENTRY', marker: { symbol: 'triangle-right', size: 14, color: '#58a6ff', line: { color: '#fff', width: 1 } }, text: ['ENTRY'], textposition: 'top center' });
+            traces.push({ x: [zoomTrade.exit_datetime], y: [zoomTrade.exit_price], mode: 'markers+text', type: 'scatter', name: 'EXIT', marker: { symbol: 'x', size: 12, color: '#fff' }, text: ['EXIT'], textposition: 'bottom center' });
+            layout.shapes.push({ type: 'line', x0: zoomTrade.entry_datetime, x1: zoomTrade.exit_datetime, y0: zoomTrade.entry_price, y1: zoomTrade.entry_price, line: { color: '#58a6ff', width: 2, dash: 'dot' } });
+            layout.shapes.push({ type: 'line', x0: zoomTrade.entry_datetime, x1: zoomTrade.exit_datetime, y0: zoomTrade.tp_price, y1: zoomTrade.tp_price, line: { color: '#3fb950', width: 2, dash: 'dash' } });
+            layout.shapes.push({ type: 'line', x0: zoomTrade.entry_datetime, x1: zoomTrade.exit_datetime, y0: zoomTrade.sl_price, y1: zoomTrade.sl_price, line: { color: '#f85149', width: 2, dash: 'dash' } });
+            document.getElementById('tradeOverlay').style.display = 'block';
+            document.getElementById('overlayContent').innerHTML = `
+                <div style="display:flex; justify-content:space-between;"><span>Execution Price:</span> <span style="color:#fff; font-weight:700;">$${zoomTrade.entry_price.toFixed(2)}</span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Units Traded:</span> <span style="color:var(--accent); font-weight:800;">${zoomTrade.quantity.toFixed(4)} units</span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Position Size:</span> <span style="color:#fff;">$${zoomTrade.notional_usd.toFixed(2)}</span></div>
+                <div style="display:flex; justify-content:space-between; margin-top:8px;"><span>Take Profit:</span> <span style="color:var(--success); font-weight:800;">$${zoomTrade.tp_price.toFixed(2)} (${zoomTrade.take_profit_pct.toFixed(2)}%)</span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Stop Loss:</span> <span style="color:var(--danger); font-weight:800;">$${zoomTrade.sl_price.toFixed(2)} (${zoomTrade.stop_loss_pct.toFixed(2)}%)</span></div>
+                <div style="display:flex; justify-content:space-between; border-top:1px solid var(--border); padding-top:10px; margin-top:10px; font-size:14px;"><span>PNL REALIZED:</span> <span style="color:${zoomTrade.pnl_net_usd >= 0 ? 'var(--success)' : 'var(--danger)'}; font-weight:800;">$${zoomTrade.pnl_net_usd.toFixed(2)}</span></div>
+            `;
+        }
+        Plotly.newPlot('mainChart', traces, layout, { scrollZoom: true, displayModeBar: true, responsive: true });
+    }
+
+    function selectTrade(tradeId) {
+        const cards = document.querySelectorAll('.trade-card');
+        const card = Array.from(cards).find(c => c.getAttribute('data-id') == tradeId);
+        const idx = masterData.trades.findIndex(t => t.entry_datetime + t.symbol == tradeId);
+        if (selectedTradeIdx === idx) { clearSelectedTrade(); } else {
+            selectedTradeIdx = idx; const trade = masterData.trades[idx];
+            document.getElementById('symbolPicker').value = trade.symbol; loadSymbol(trade.symbol, trade);
+            cards.forEach(c => c.classList.remove('active')); if(card) card.classList.add('active'); switchTab('trading');
+        }
+    }
+
+    function clearSelectedTrade() {
+        selectedTradeIdx = -1; document.getElementById('tradeOverlay').style.display = 'none';
+        document.querySelectorAll('.trade-card').forEach(c => c.classList.remove('active'));
+        const sym = document.getElementById('symbolPicker').value; if(sym !== 'ALL') loadSymbol(sym);
+    }
+
+    init();
+</script>
+
+</body>
+</html>
