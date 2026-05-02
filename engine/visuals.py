@@ -140,23 +140,34 @@ def _generate_tabbed_platform_html(df_trades: pd.DataFrame, equity_curves: dict,
             flex-direction: column;
             flex-shrink: 0;
         }}
+        .sidebar-header {{
+            padding: 12px 15px;
+            font-size: 11px;
+            font-weight: 800;
+            border-bottom: 1px solid var(--border);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
         .filter-section {{
             padding: 10px 15px;
             border-bottom: 1px solid var(--border);
             display: flex;
-            gap: 5px;
+            flex-direction: column;
+            gap: 8px;
         }}
+        .filter-group {{ display: flex; gap: 5px; }}
         .filter-btn {{
             flex: 1;
-            padding: 4px;
+            padding: 6px;
             font-size: 10px;
             background: #21262d;
             border: 1px solid var(--border);
             border-radius: 4px;
             color: var(--text);
             cursor: pointer;
+            font-weight: 600;
         }}
-        .filter-btn.active {{ background: var(--accent); color: #000; }}
+        .filter-btn.active {{ background: var(--accent); color: #000; border-color: var(--accent); }}
         
         .main-view {{
             flex-grow: 1;
@@ -167,13 +178,7 @@ def _generate_tabbed_platform_html(df_trades: pd.DataFrame, equity_curves: dict,
             position: relative;
         }}
         
-        .analytics-view {{ flex-grow: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }}
-        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; }}
-        .stat-card {{ background: var(--card-bg); border: 1px solid var(--border); padding: 15px; border-radius: 8px; text-align: center; }}
-        .stat-card .val {{ font-size: 18px; font-weight: 800; color: #fff; }}
-        .stat-card .lab {{ font-size: 10px; opacity: 0.5; text-transform: uppercase; margin-top: 4px; }}
-        
-        .trade-card {{ padding: 10px 15px; border-bottom: 1px solid var(--border); cursor: pointer; display: block; }}
+        .trade-card {{ padding: 12px 15px; border-bottom: 1px solid var(--border); cursor: pointer; display: flex; flex-direction: column; gap: 4px; }}
         .trade-card.hidden {{ display: none; }}
         .trade-card:hover {{ background: #ffffff05; }}
         .trade-card.active {{ background: #58a6ff15; border-left: 4px solid var(--accent); }}
@@ -196,29 +201,40 @@ def _generate_tabbed_platform_html(df_trades: pd.DataFrame, equity_curves: dict,
 <body>
 
 <div class="navbar">
-    <div style="font-weight: 800; color: var(--accent); font-size: 16px;">{strategy_name.upper()} ENGINE</div>
+    <div style="font-weight: 800; color: var(--accent); font-size: 16px;">{strategy_name.upper()} TERMINAL</div>
     <div style="font-size: 12px;">Net Portfolio PnL: <span style="color:var(--success); font-weight:800;">${total_pnl:,.2f}</span></div>
 </div>
 
 <div class="tabs-container">
-    <button class="tab-btn active" onclick="switchTab('trading')">Trading Terminal</button>
+    <button class="tab-btn active" onclick="switchTab('trading')">Terminal View</button>
     <button class="tab-btn" onclick="switchTab('analytics')">Portfolio Metrics</button>
 </div>
 
 <div id="tradingTab" class="tab-content active">
     <div class="sidebar">
-        <div style="padding: 12px 15px; font-size: 11px; font-weight: 800; border-bottom: 1px solid var(--border);">SYMBOL SELECTOR</div>
-        <select id="symbolPicker" onchange="loadSymbol(this.value)" style="margin: 8px 15px; background:#0d1117; color:#fff; border:1px solid var(--border); border-radius:4px; padding:5px; font-size:12px;">
-            {_generate_symbol_options(all_candles)}
-        </select>
-        
+        <div class="sidebar-header">Filters & Sorting</div>
         <div class="filter-section">
-            <button class="filter-btn active" onclick="applyFilter('ALL', this)">ALL</button>
-            <button class="filter-btn" onclick="applyFilter('LONG', this)">LONG</button>
-            <button class="filter-btn" onclick="applyFilter('SHORT', this)">SHORT</button>
+            <div style="font-size: 10px; opacity: 0.5;">SYMBOL</div>
+            <select id="symbolPicker" onchange="updateFilters()" style="width:100%; background:#0d1117; color:#fff; border:1px solid var(--border); border-radius:4px; padding:6px; font-size:12px;">
+                <option value="ALL">ALL SYMBOLS</option>
+                {_generate_symbol_options(all_candles)}
+            </select>
+            
+            <div style="font-size: 10px; opacity: 0.5; margin-top:5px;">SIDE</div>
+            <div class="filter-group">
+                <button id="filter-ALL" class="filter-btn active" onclick="setSideFilter('ALL')">ALL</button>
+                <button id="filter-LONG" class="filter-btn" onclick="setSideFilter('LONG')">LONG</button>
+                <button id="filter-SHORT" class="filter-btn" onclick="setSideFilter('SHORT')">SHORT</button>
+            </div>
+            
+            <div style="font-size: 10px; opacity: 0.5; margin-top:5px;">SORT BY</div>
+            <div class="filter-group">
+                <button id="sort-TIME" class="filter-btn active" onclick="setSort('TIME')">TIME</button>
+                <button id="sort-PNL" class="filter-btn" onclick="setSort('PNL')">PNL</button>
+            </div>
         </div>
 
-        <div class="trades-container" style="overflow-y: auto; flex-grow: 1;">
+        <div id="tradesContainer" class="trades-container" style="overflow-y: auto; flex-grow: 1;">
             {_generate_trade_cards(df_trades)}
         </div>
     </div>
@@ -251,10 +267,12 @@ def _generate_tabbed_platform_html(df_trades: pd.DataFrame, equity_curves: dict,
 
 <script>
     const candlesData = {json.dumps(candles_json)};
-    const tradesData = {json.dumps(trades_json)};
+    let tradesData = {json.dumps(trades_json)};
     const equityData = {json.dumps(equity_json)};
 
-    let currentSym = '';
+    let currentSym = 'ALL';
+    let currentSide = 'ALL';
+    let currentSort = 'TIME';
     let selectedTradeIdx = -1;
 
     function switchTab(tab) {{
@@ -271,29 +289,65 @@ def _generate_tabbed_platform_html(df_trades: pd.DataFrame, equity_curves: dict,
         }}
     }}
 
-    function applyFilter(side, btn) {{
-        document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
+    function setSideFilter(side) {{
+        currentSide = side;
+        document.querySelectorAll('[id^="filter-"]').forEach(b => b.classList.remove('active'));
+        document.getElementById('filter-' + side).classList.add('active');
+        updateFilters();
+    }}
+
+    function setSort(sort) {{
+        currentSort = sort;
+        document.querySelectorAll('[id^="sort-"]').forEach(b => b.classList.remove('active'));
+        document.getElementById('sort-' + sort).classList.add('active');
+        updateFilters();
+    }}
+
+    function updateFilters() {{
+        currentSym = document.getElementById('symbolPicker').value;
         const cards = document.querySelectorAll('.trade-card');
+        
+        // 1. Filtering
         cards.forEach(c => {{
-            if (side === 'ALL' || c.getAttribute('data-side') === side) {{
+            const sym = c.getAttribute('data-symbol');
+            const side = c.getAttribute('data-side');
+            const matchSym = (currentSym === 'ALL' || currentSym === sym);
+            const matchSide = (currentSide === 'ALL' || currentSide === side);
+            
+            if (matchSym && matchSide) {{
                 c.classList.remove('hidden');
             }} else {{
                 c.classList.add('hidden');
             }}
         }});
+        
+        // 2. Sorting
+        const container = document.getElementById('tradesContainer');
+        const visibleCards = Array.from(cards);
+        visibleCards.sort((a, b) => {{
+            if (currentSort === 'TIME') {{
+                return b.getAttribute('data-time').localeCompare(a.getAttribute('data-time'));
+            }} else {{
+                return parseFloat(b.getAttribute('data-pnl')) - parseFloat(a.getAttribute('data-pnl'));
+            }}
+        }});
+        visibleCards.forEach(c => container.appendChild(c));
+        
+        // Update Chart if symbol changed
+        if (currentSym !== 'ALL') {{
+            loadSymbol(currentSym);
+        }}
     }}
 
     function renderBigEquity() {{
         const traces = [];
-        if (equityData["GLOBAL"]) traces.push({{ y: equityData["GLOBAL"], name: "TOTAL PORTFOLIO", type: 'scatter', mode: 'lines', line: {{ width: 4, color: '#fff' }}, fill: 'tozeroy', fillcolor: 'rgba(255, 255, 255, 0.05)' }});
+        if (equityData["GLOBAL"]) traces.push({{ y: equityData["GLOBAL"], name: "PORTFOLIO", type: 'scatter', mode: 'lines', line: {{ width: 4, color: '#fff' }}, fill: 'tozeroy', fillcolor: 'rgba(255, 255, 255, 0.05)' }});
         for (const s in equityData) {{ if (s === "GLOBAL") continue; traces.push({{ y: equityData[s], name: s, type: 'scatter', mode: 'lines', line: {{ width: 2 }}, opacity: 0.6 }}); }}
-        Plotly.newPlot('bigEquityChart', traces, {{ title: 'Equity Breakdown', template: 'plotly_dark', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 40, b: 60, l: 60, r: 20 }}, legend: {{ orientation: 'h', y: -0.2 }} }});
+        Plotly.newPlot('bigEquityChart', traces, {{ title: 'Global Growth', template: 'plotly_dark', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 40, b: 60, l: 60, r: 20 }}, legend: {{ orientation: 'h', y: -0.2 }} }});
     }}
 
     function loadSymbol(symbol, zoomTrade = null) {{
-        currentSym = symbol;
-        const df = candlesData[symbol];
+        const df = candlesData[symbol] || candlesData[Object.keys(candlesData)[0]];
         const traces = [{{ x: df.map(c => c.Date), open: df.map(c => c.Open), high: df.map(c => c.High), low: df.map(c => c.Low), close: df.map(c => c.Close), type: 'candlestick', name: symbol, increasing: {{ line: {{ color: '#3fb950' }} }}, decreasing: {{ line: {{ color: '#f85149' }} }} }}];
         const layout = {{ dragmode: 'pan', template: 'plotly_dark', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: {{ t: 10, b: 30, l: 50, r: 10 }}, xaxis: {{ rangeslider: {{ visible: false }}, gridcolor: '#30363d' }}, yaxis: {{ gridcolor: '#30363d' }}, shapes: [], annotations: [] }};
 
@@ -307,11 +361,9 @@ def _generate_tabbed_platform_html(df_trades: pd.DataFrame, equity_curves: dict,
             const pad = (high - low) * 0.2;
             layout.yaxis.range = [low - pad, high + pad];
             
-            // ENTRY/EXIT MARKERS
             traces.push({{ x: [zoomTrade.entry_datetime], y: [zoomTrade.entry_price], mode: 'markers+text', type: 'scatter', name: 'ENTRY', marker: {{ symbol: 'triangle-right', size: 12, color: '#58a6ff' }}, text: ['ENTRY'], textposition: 'top center' }});
             traces.push({{ x: [zoomTrade.exit_datetime], y: [zoomTrade.exit_price], mode: 'markers+text', type: 'scatter', name: 'EXIT', marker: {{ symbol: 'x', size: 10, color: '#fff' }}, text: ['EXIT'], textposition: 'bottom center' }});
 
-            // LINES
             layout.shapes.push({{ type: 'line', x0: zoomTrade.entry_datetime, x1: zoomTrade.exit_datetime, y0: zoomTrade.entry_price, y1: zoomTrade.entry_price, line: {{ color: '#58a6ff', width: 2, dash: 'dot' }} }});
             layout.shapes.push({{ type: 'line', x0: zoomTrade.entry_datetime, x1: zoomTrade.exit_datetime, y0: zoomTrade.tp_price, y1: zoomTrade.tp_price, line: {{ color: '#3fb950', width: 2, dash: 'dash' }} }});
             layout.shapes.push({{ type: 'line', x0: zoomTrade.entry_datetime, x1: zoomTrade.exit_datetime, y0: zoomTrade.sl_price, y1: zoomTrade.sl_price, line: {{ color: '#f85149', width: 2, dash: 'dash' }} }});
@@ -331,25 +383,29 @@ def _generate_tabbed_platform_html(df_trades: pd.DataFrame, equity_curves: dict,
         Plotly.newPlot('mainChart', traces, layout, {{ scrollZoom: true, displayModeBar: true }});
     }}
 
-    function selectTrade(idx) {{
+    function selectTrade(tradeId) {{
         const cards = document.querySelectorAll('.trade-card');
+        const card = Array.from(cards).find(c => c.getAttribute('data-id') == tradeId);
+        const idx = tradesData.findIndex(t => t.entry_datetime + t.symbol == tradeId); // unique enough
+        
         if (selectedTradeIdx === idx) {{
             selectedTradeIdx = -1;
             cards.forEach(c => c.classList.remove('active'));
-            loadSymbol(currentSym);
+            if (currentSym !== 'ALL') loadSymbol(currentSym);
         }} else {{
             selectedTradeIdx = idx;
             const trade = tradesData[idx];
             document.getElementById('symbolPicker').value = trade.symbol;
             loadSymbol(trade.symbol, trade);
             cards.forEach(c => c.classList.remove('active'));
-            cards[idx].classList.add('active');
+            card.classList.add('active');
         }}
     }}
 
+    // Initial load
+    updateFilters();
     const first = Object.keys(candlesData)[0];
     if (first) loadSymbol(first);
-    document.querySelectorAll('.trade-card').forEach((c, i) => c.onclick = () => selectTrade(i));
 </script>
 
 </body>
@@ -362,8 +418,9 @@ def _generate_trade_cards(df: pd.DataFrame) -> str:
     for i, row in df.iterrows():
         pnl_col = "var(--success)" if row['pnl_net_usd'] > 0 else "var(--danger)"
         badge = "long-badge" if row['side'] == 'LONG' else "short-badge"
+        trade_id = f"{row['entry_datetime']}{row['symbol']}"
         cards.append(f"""
-            <div class="trade-card" data-side="{row['side']}">
+            <div class="trade-card" data-symbol="{row['symbol']}" data-side="{row['side']}" data-time="{row['entry_datetime']}" data-pnl="{row['pnl_net_usd']}" data-id="{trade_id}" onclick="selectTrade('{trade_id}')">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <span style="font-weight:800; color:#fff; font-size:12px;">{row['symbol']}</span>
                     <span style="color:{pnl_col}; font-weight:800; font-size:12px;">${row['pnl_net_usd']:.2f}</span>
