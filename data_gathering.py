@@ -18,17 +18,8 @@ def fetch_data(symbol: str = "ADAUSD", total_days: int = 100, interval: str = "1
     os.makedirs(data_dir, exist_ok=True)
     filename = os.path.join(data_dir, f"data_{symbol}_{interval}.csv")
 
-    # Check if CSV exists and is fresh (less than 15 mins old)
-    if os.path.exists(filename):
-        file_age_mins = (time.time() - os.path.getmtime(filename)) / 60
-        if file_age_mins < 60:
-            console.print(f"[success]✅ Loading FRESH data from local cache:[/success] {filename} (Age: {file_age_mins:.1f} mins)")
-            df = pd.read_csv(filename, index_col=0, parse_dates=True)
-            return df
-        else:
-            console.print(f"[warning]⏳ Cache EXPIRED[/warning] (Age: {file_age_mins:.1f} mins). Fetching new data...")
-
-    console.print(f"[info]Local CSV not found. Fetching data from API for [bold]{symbol}[/bold]...[/info]")
+    # Always fetch from API (Caching disabled per user request)
+    console.print(f"[info]Fetching fresh data from API for [bold]{symbol}[/bold]...[/info]")
 
     api_url = "https://api.india.delta.exchange/v2/history/candles"
     headers = {'Accept': 'application/json'}

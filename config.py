@@ -12,26 +12,26 @@ class DataConfig:
 @dataclass
 class FeatureConfig:
     LOOKAHEAD_BARS: int = 60
-    FEATURE_CACHE_VERSION: int = 99
+    FEATURE_CACHE_VERSION: int = 100
 
 @dataclass
 class StrategyConfig:
     INITIAL_CAPITAL_USD: float = 1000.0
     RISK_PER_TRADE_PCT_OF_EQUITY: float = 2.0
     MAX_POSITION_NOTIONAL_PCT_OF_EQUITY: float = 0.95
-    ROUND_TRIP_FEE_PCT: float = 0.0    # Set to 0 for 100% WinRate test
-    SLIPPAGE_PCT: float = 0.0          # Set to 0 for 100% WinRate test
+    ROUND_TRIP_FEE_PCT: float = 0.05   # Realistic crypto fees
+    SLIPPAGE_PCT: float = 0.02         # Realistic slippage
     
     # Oracle Filter Settings
-    ORACLE_MIN_TP_PCT: float = 0.10
-    ORACLE_MIN_SL_PCT: float = 0.05
-    ORACLE_MAX_TP_PCT: float = 1.0
-    ORACLE_MAX_SL_PCT: float = 0.5
-    ORACLE_TP_CAPTURE_RATIO: float = 0.85 
+    ORACLE_MIN_TP_PCT: float = 0.80   # Strong moves
+    ORACLE_MIN_SL_PCT: float = 0.20
+    ORACLE_MAX_TP_PCT: float = 5.0
+    ORACLE_MAX_SL_PCT: float = 2.0
+    ORACLE_TP_CAPTURE_RATIO: float = 0.80 # Buffer for slippage
     ORACLE_SL_CAPTURE_RATIO: float = 0.01 
-    ORACLE_MIN_RR: float = 2.0
-    ORACLE_MIN_UPSIDE_PCT: float = 0.10
-    ORACLE_MIN_DOWNSIDE_PCT: float = 0.10
+    ORACLE_MIN_RR: float = 3.0
+    ORACLE_MIN_UPSIDE_PCT: float = 1.0    # Strict upside
+    ORACLE_MIN_DOWNSIDE_PCT: float = 1.0  # Strict downside
     
     # Execution Logic
     PARALLEL_SLOTS: int = 100
@@ -39,9 +39,9 @@ class StrategyConfig:
     COOLDOWN_BARS: int = 0
     MAX_CONSECUTIVE_LOSSES: int = 10
     DAILY_STOP_LOSS_PCT: float = 10.0
-    BREAK_EVEN_AFTER_R: float = 0.5
-    TRAIL_STOP_AFTER_R: float = 1.0
-    TRAIL_STOP_R_MULTIPLE: float = 0.5
+    BREAK_EVEN_AFTER_R: float = 1000.0   # Set very high to disable
+    TRAIL_STOP_AFTER_R: float = 1000.0   # Set very high to disable
+    TRAIL_STOP_R_MULTIPLE: float = 2.0
     
     # Required for the script to run
     USE_ORACLE_LABELS: bool = True

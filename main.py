@@ -69,16 +69,21 @@ def main() -> None:
             num_days = len(df_trades['date'].unique())
             trades_per_day = len(df_trades) / num_days if num_days > 0 else 0
             
-            wins_sym = df_trades[df_trades['pnl_net_usd'] >= -0.0001]
+            wins_sym = df_trades[df_trades['pnl_net_usd'] > 0]
+            total_fees = df_trades['fees_usd'].sum()
+            total_slippage = df_trades['slippage_usd'].sum()
+            gross_pnl = df_trades['pnl_gross_usd'].sum()
             
-            console.print(f"\n[bold cyan]📊 {symbol} DETAILED INSIGHTS[/bold cyan]")
+            console.print(f"\n[bold cyan]📊 {symbol} DETAILED INSIGHTS (REAL-WORLD MODE)[/bold cyan]")
             sym_table = Table(show_header=False, box=None)
             sym_table.add_row("Total Trades:", f"{len(df_trades)}")
             sym_table.add_row("Avg Trades/Day:", f"{trades_per_day:.1f}")
             sym_table.add_row("Win Rate:", f"[bold green]{(len(wins_sym)/len(df_trades)*100):.1f}%[/bold green]")
-            sym_table.add_row("Net PnL:", f"[bold green]${summary['total_pnl_net_usd']:.2f}[/bold green]")
-            sym_table.add_row("Max Single Profit:", f"${df_trades['pnl_net_usd'].max():.2f}")
-            sym_table.add_row("Avg TP% used:", f"{df_trades['take_profit_pct'].mean():.2f}%")
+            sym_table.add_row("-" * 30, "-" * 10)
+            sym_table.add_row("Gross PnL:", f"[green]${gross_pnl:.2f}[/green]")
+            sym_table.add_row("Total Fees Paid:", f"[red]${total_fees:.2f}[/red]")
+            sym_table.add_row("Total Slippage Loss:", f"[red]${total_slippage:.2f}[/red]")
+            sym_table.add_row("Net PnL (Final):", f"[bold green]${summary['total_pnl_net_usd']:.2f}[/bold green]")
             console.print(sym_table)
 
         summary_table.add_row(
@@ -106,26 +111,28 @@ def main() -> None:
         df_all_trades = pd.DataFrame([vars(t) for t in all_trade_records])
         
         total_trades = len(df_all_trades)
-        wins = df_all_trades[df_all_trades['pnl_net_usd'] >= -0.0001]
-        losses = df_all_trades[df_all_trades['pnl_net_usd'] < -0.0001]
+        wins = df_all_trades[df_all_trades['pnl_net_usd'] > 0]
+        losses = df_all_trades[df_all_trades['pnl_net_usd'] <= 0]
         
-        avg_tp = df_all_trades['take_profit_pct'].mean()
-        avg_sl = df_all_trades['stop_loss_pct'].mean()
-        avg_pnl_win = wins['pnl_net_usd'].mean() if not wins.empty else 0
+        global_win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0
+        
+        total_fees = df_all_trades['fees_usd'].sum()
+        total_slippage = df_all_trades['slippage_usd'].sum()
         max_profit = df_all_trades['pnl_net_usd'].max()
         
         console.print("\n" + "="*50)
-        console.print("[bold gold]🌍 GLOBAL ORACLE SUMMARY (ALL SYMBOLS)[/bold gold]")
+        console.print("[bold gold]🌍 GLOBAL REAL-WORLD SUMMARY (ALL SYMBOLS)[/bold gold]")
         console.print("="*50)
         
         insight_table = Table(show_header=False, box=None)
         insight_table.add_row("Total Combined Trades:", f"[bold]{total_trades}[/bold]")
         insight_table.add_row("Total Wins:", f"[green]{len(wins)}[/green]")
         insight_table.add_row("Total Losses:", f"[red]{len(losses)}[/red]")
-        insight_table.add_row("Global Win Rate:", f"[bold cyan]100.0%[/bold cyan]")
+        insight_table.add_row("Global Win Rate:", f"[bold cyan]{global_win_rate:.1f}%[/bold cyan]")
         insight_table.add_row("-" * 30, "-" * 10)
-        insight_table.add_row("Avg Profit per Win $:", f"[green]${avg_pnl_win:.2f}[/green]")
-        insight_table.add_row("Global Max Profit $:", f"[bold green]${max_profit:.2f}[/bold green]")
+        insight_table.add_row("Total Portfolio Fees:", f"[red]${total_fees:.2f}[/red]")
+        insight_table.add_row("Total Portfolio Slippage:", f"[red]${total_slippage:.2f}[/red]")
+        insight_table.add_row("Global Max Single Profit:", f"[green]${max_profit:.2f}[/green]")
         
         interval_mins = 1 if config.data.INTERVAL == "1m" else 15
         hours = (config.features.LOOKAHEAD_BARS * interval_mins) / 60

@@ -31,7 +31,8 @@ class PaperTradeRecord:
     ai_qty_ratio: float
     outcome: str
     return_fraction: float
-    pnl_before_fees_usd: float
+    pnl_gross_usd: float
+    slippage_usd: float
     fees_usd: float
     pnl_net_usd: float
     capital_before_usd: float
@@ -191,9 +192,15 @@ def run_paper_portfolio_on_signals(
                 if t["side"] == "LONG":
                     real_exit_price = exit_price * (1 - slippage_fraction)
                     return_fraction = (real_exit_price - t["entry_price"]) / t["entry_price"]
+                    pnl_gross = t["quantity"] * (exit_price - t["raw_entry_price"])
                 else:
                     real_exit_price = exit_price * (1 + slippage_fraction)
                     return_fraction = (t["entry_price"] - real_exit_price) / t["entry_price"]
+                    pnl_gross = t["quantity"] * (t["raw_entry_price"] - exit_price)
+
+                entry_slip = abs(t["entry_price"] - t["raw_entry_price"]) * t["quantity"]
+                exit_slip = abs(real_exit_price - exit_price) * t["quantity"]
+                total_slippage = entry_slip + exit_slip
 
                 pnl_before_fees = t["notional_usd"] * return_fraction
                 fees_usd = t["notional_usd"] * fee_fraction_per_leg * 2.0
@@ -228,7 +235,8 @@ def run_paper_portfolio_on_signals(
                         ai_qty_ratio=t["qty_ratio"],
                         outcome=realized_outcome,
                         return_fraction=return_fraction,
-                        pnl_before_fees_usd=pnl_before_fees,
+                        pnl_gross_usd=pnl_gross,
+                        slippage_usd=total_slippage,
                         fees_usd=fees_usd,
                         pnl_net_usd=pnl_net,
                         capital_before_usd=t["capital_before"],
@@ -300,6 +308,7 @@ def run_paper_portfolio_on_signals(
                 if quantity > 0:
                     active_trades.append({
                         "side": side,
+                        "raw_entry_price": raw_entry_price,
                         "entry_price": entry_price,
                         "tp_price": tp_price,
                         "sl_price": sl_price,
