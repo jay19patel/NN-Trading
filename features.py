@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import pandas_ta as ta
 from scipy import stats
+import numba
 from config import config
 from ui_utils import console, get_progress
 
@@ -23,6 +24,7 @@ def _daily_vwap(df: pd.DataFrame) -> pd.Series:
     return cumulative_pv / cumulative_volume.replace(0, np.nan)
 
 
+@numba.njit
 def _simulate_trade_path(
     close_prices: np.ndarray,
     high_prices: np.ndarray,
@@ -31,41 +33,43 @@ def _simulate_trade_path(
     lookahead: int,
     take_profit_pct: float,
     stop_loss_pct: float,
-    direction: str,
-) -> tuple[str, float]:
-    """Return first-hit path outcome and signed pnl percent for a candidate trade."""
-    entry_price = float(close_prices[row_index])
-    final_close = float(close_prices[row_index + lookahead])
+    direction_is_long: bool,
+) -> tuple[int, float]:
+    """
+    Return first-hit path outcome and signed pnl percent for a candidate trade.
+    Outcome codes: 0 = SUCCESS, 1 = FAILED, 2 = TIMEOUT
+    """
+    entry_price = close_prices[row_index]
+    final_close = close_prices[row_index + lookahead]
 
-    if direction == "long":
-        take_profit_price = entry_price * (1 + take_profit_pct / 100.0)
-        stop_loss_price = entry_price * (1 - stop_loss_pct / 100.0)
+    if direction_is_long:
+        take_profit_price = entry_price * (1.0 + take_profit_pct / 100.0)
+        stop_loss_price = entry_price * (1.0 - stop_loss_pct / 100.0)
     else:
-        take_profit_price = entry_price * (1 - take_profit_pct / 100.0)
-        stop_loss_price = entry_price * (1 + stop_loss_pct / 100.0)
+        take_profit_price = entry_price * (1.0 - take_profit_pct / 100.0)
+        stop_loss_price = entry_price * (1.0 + stop_loss_pct / 100.0)
 
     for step in range(1, lookahead + 1):
-        bar_high = float(high_prices[row_index + step])
-        bar_low = float(low_prices[row_index + step])
-        if direction == "long":
+        bar_high = high_prices[row_index + step]
+        bar_low = low_prices[row_index + step]
+        if direction_is_long:
             hit_stop = bar_low <= stop_loss_price
             hit_target = bar_high >= take_profit_price
         else:
             hit_stop = bar_high >= stop_loss_price
             hit_target = bar_low <= take_profit_price
 
-        if hit_stop and hit_target:
-            return "FAILED", -stop_loss_pct
         if hit_stop:
-            return "FAILED", -stop_loss_pct
+            # Consistently assume stop is hit first in same-bar touches
+            return 1, -stop_loss_pct
         if hit_target:
-            return "SUCCESS", take_profit_pct
+            return 0, take_profit_pct
 
-    if direction == "long":
+    if direction_is_long:
         timeout_pnl = ((final_close - entry_price) / entry_price) * 100.0
     else:
         timeout_pnl = ((entry_price - final_close) / entry_price) * 100.0
-    return "TIMEOUT", timeout_pnl
+    return 2, timeout_pnl
 
 
 def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -311,17 +315,8 @@ def add_risk_reward_features(df: pd.DataFrame, lookahead: int = 192) -> pd.DataF
     lows = df['Low'].values
     closes = df['Close'].values
     
-    future_max_high = np.full(n, np.nan)
-    future_min_low = np.full(n, np.nan)
-    
-    # Accurate lookahead window without data leakage
-    for i in range(n):
-        # We look from i+1 up to i+1+lookahead
-        # This ensures current bar 'i' doesn't know about bars it shouldn't
-        end_idx = min(i + 1 + lookahead, n)
-        if i + 1 < end_idx:
-            future_max_high[i] = np.max(highs[i+1 : end_idx])
-            future_min_low[i] = np.min(lows[i+1 : end_idx])
+    # Vectorized lookahead via JIT
+    future_max_high, future_min_low = _calculate_future_excursions_jit(highs, lows, lookahead)
             
     new_features = pd.DataFrame(index=df.index)
     new_features['upside_pct'] = ((future_max_high - closes) / closes) * 100
@@ -344,6 +339,84 @@ def add_interaction_features(df: pd.DataFrame) -> pd.DataFrame:
     new_features['adx_volume'] = df['ADX_14'] * (df['volume_ratio'] if 'volume_ratio' in df else 1.0)
     new_features['bb_rsi'] = df['BB_position'] * df['RSI_14']
     new_features['vol_atr_ratio'] = (df['volume_ratio'] if 'volume_ratio' in df else 1.0) / (df['ATR_pct'] + 0.0001)
+    return pd.concat([df, new_features], axis=1)
+
+
+# ? DELTA-OF-DELTA (ACCELERATION) FEATURES — capture inflection points the
+# ? raw return features miss. Returns measure velocity; their differences
+# ? measure acceleration. This is the strongest non-leaking edge for short bars.
+def add_acceleration_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Second-order momentum: acceleration of price, RSI, and volatility."""
+    new_features = pd.DataFrame(index=df.index)
+
+    # ? PRICE ACCELERATION — change in 5-bar return (jerk)
+    new_features["return_accel_5"] = df["return_5"].diff()
+    new_features["return_accel_10"] = df["return_10"].diff(5)
+    # ? CUMULATIVE 3-BAR ACCELERATION — smooths single-bar noise
+    new_features["return_accel_smooth"] = df["return_5"].diff().rolling(3).mean()
+
+    # ? RSI ACCELERATION — captures momentum exhaustion before price reversal
+    if "RSI_14" in df.columns:
+        new_features["rsi_velocity"] = df["RSI_14"].diff()
+        new_features["rsi_accel"] = df["RSI_14"].diff().diff()
+
+    # ? VOLATILITY ACCELERATION — distinguishes "blow-off" from steady moves
+    if "volatility_10" in df.columns:
+        new_features["vol_velocity"] = df["volatility_10"].diff()
+        new_features["vol_accel"] = df["volatility_10"].diff().diff()
+
+    # ? MACD ACCELERATION — derivative of an already-derivative feature
+    if "MACD_hist_pct" in df.columns:
+        new_features["macd_velocity"] = df["MACD_hist_pct"].diff()
+        new_features["macd_accel"] = df["MACD_hist_pct"].diff().diff()
+
+    return pd.concat([df, new_features], axis=1)
+
+
+# ? CROSS-ASSET / REGIME FEATURES — single-symbol proxies that synthesize
+# ? "market mode" from the available bars. When BTC and ETH both spike, we can
+# ? join them later via prepare_multi_symbol_data; until then we encode self-
+# ? regime so the model has a stable conditioning signal across symbols.
+def add_cross_asset_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Self-regime features that make magnitude-only signals directional."""
+    new_features = pd.DataFrame(index=df.index)
+
+    # ? HIGHER-TIMEFRAME TREND PROXY — 96 bars = ~24h on 15m
+    higher_tf_window = 96
+    new_features["htf_return_pct"] = df["Close"].pct_change(higher_tf_window) * 100.0
+    new_features["htf_trend_sign"] = np.sign(new_features["htf_return_pct"]).fillna(0)
+
+    # ? VOLATILITY REGIME — current vol vs trailing 7d mean (672 bars on 15m)
+    if "volatility_10" in df.columns:
+        long_vol_mean = df["volatility_10"].rolling(672, min_periods=96).mean()
+        new_features["vol_regime_ratio"] = df["volatility_10"] / (long_vol_mean + 1e-9)
+
+    # ? SIGNED VOLATILITY — direction-aware volatility (key fix for the flip)
+    new_features["signed_volatility_10"] = (
+        df.get("volatility_10", pd.Series(0.0, index=df.index)) * np.sign(df["return_1"])
+    )
+    new_features["signed_atr_pct"] = (
+        df.get("ATR_pct", pd.Series(0.0, index=df.index)) * np.sign(df["return_5"].fillna(0))
+    )
+    new_features["signed_bb_width"] = (
+        df.get("BB_width", pd.Series(0.0, index=df.index)) * np.sign(df.get("return_10", df["return_1"]).fillna(0))
+    )
+
+    # ? SIGNED VOLUME PRESSURE — volume only matters if direction is also clear
+    new_features["signed_volume_ratio"] = (
+        df.get("volume_ratio", pd.Series(1.0, index=df.index)) * np.sign(df["return_1"].fillna(0))
+    )
+
+    # ? RSI vs ITS OWN TREND — tells whether momentum is rising or fading
+    if "RSI_14" in df.columns:
+        rsi_baseline = df["RSI_14"].rolling(48, min_periods=12).mean()
+        new_features["rsi_excess"] = df["RSI_14"] - rsi_baseline
+
+    # ? PRICE LOCATION RELATIVE TO HTF ANCHORS — directional, scale-invariant
+    if "EMA_200" in df.columns:
+        new_features["above_htf_ema"] = (df["Close"] > df["EMA_200"]).astype(float)
+        new_features["htf_ema_distance"] = (df["Close"] - df["EMA_200"]) / df["Close"]
+
     return pd.concat([df, new_features], axis=1)
 
 
@@ -511,74 +584,17 @@ def add_oracle_target_labels(df: pd.DataFrame) -> pd.DataFrame:
     )
     oracle_rr_short = oracle_tp_short / (oracle_sl_short + 1e-6)
 
-    labels = np.ones(row_count, dtype=np.float64)
-    label_tp_pct = np.full(row_count, strategy.ORACLE_MIN_TP_PCT, dtype=np.float64)
-    label_sl_pct = np.full(row_count, strategy.ORACLE_MIN_SL_PCT, dtype=np.float64)
-    actual_pnl_pct_arr = np.zeros(row_count, dtype=np.float64)
-    winning_rr = np.ones(row_count, dtype=np.float64)
-    best_capacity = np.zeros(row_count, dtype=np.float64)
-
-    for row_index in range(row_count - lookahead):
-        long_outcome, long_pnl = _simulate_trade_path(
-            close_prices,
-            high_prices,
-            low_prices,
-            row_index,
-            lookahead,
-            float(oracle_tp_long[row_index]),
-            float(oracle_sl_long[row_index]),
-            "long",
-        )
-        short_outcome, short_pnl = _simulate_trade_path(
-            close_prices,
-            high_prices,
-            low_prices,
-            row_index,
-            lookahead,
-            float(oracle_tp_short[row_index]),
-            float(oracle_sl_short[row_index]),
-            "short",
-        )
-
-        long_eligible = (
-            upside_pct[row_index] >= strategy.ORACLE_MIN_UPSIDE_PCT
-            and oracle_rr_long[row_index] >= strategy.ORACLE_MIN_RR
-            and oracle_tp_long[row_index] >= estimated_trade_cost_pct
-            and long_outcome == "SUCCESS"
-            and (
-                not strategy.REQUIRE_PATTERN_SETUP_FOR_ORACLE
-                or long_setup_score[row_index] >= strategy.MIN_ORACLE_SETUP_SCORE
-            )
-        )
-        short_eligible = (
-            abs_down_pct[row_index] >= strategy.ORACLE_MIN_DOWNSIDE_PCT
-            and oracle_rr_short[row_index] >= strategy.ORACLE_MIN_RR
-            and oracle_tp_short[row_index] >= estimated_trade_cost_pct
-            and short_outcome == "SUCCESS"
-            and (
-                not strategy.REQUIRE_PATTERN_SETUP_FOR_ORACLE
-                or short_setup_score[row_index] >= strategy.MIN_ORACLE_SETUP_SCORE
-            )
-        )
-
-        if long_eligible and (
-            not short_eligible
-            or long_pnl > short_pnl
-            or (np.isclose(long_pnl, short_pnl) and oracle_rr_long[row_index] >= oracle_rr_short[row_index])
-        ):
-            labels[row_index] = 0.0
-            label_tp_pct[row_index] = oracle_tp_long[row_index]
-            label_sl_pct[row_index] = oracle_sl_long[row_index]
-            actual_pnl_pct_arr[row_index] = long_pnl - estimated_trade_cost_pct
-            winning_rr[row_index] = oracle_rr_long[row_index]
-            best_capacity[row_index] = upside_pct[row_index]
-        elif short_eligible:
-            labels[row_index] = 2.0
-            label_tp_pct[row_index] = oracle_tp_short[row_index]
-            label_sl_pct[row_index] = oracle_sl_short[row_index]
-            actual_pnl_pct_arr[row_index] = short_pnl - estimated_trade_cost_pct
-            winning_rr[row_index] = oracle_rr_short[row_index]
-            best_capacity[row_index] = abs_down_pct[row_index]
+    # Move labeling loop to JIT for 100x speedup
+    labels, label_tp_pct, label_sl_pct, actual_pnl_pct_arr, winning_rr, best_capacity = _compute_oracle_labels_jit(
+        row_count, lookahead, close_prices, high_prices, low_prices,
+        upside_pct, abs_down_pct, long_setup_score, short_setup_score,
+        oracle_tp_long, oracle_sl_long, oracle_rr_long,
+        oracle_tp_short, oracle_sl_short, oracle_rr_short,
+        estimated_trade_cost_pct,
+        strategy.ORACLE_MIN_UPSIDE_PCT, strategy.ORACLE_MIN_DOWNSIDE_PCT, strategy.ORACLE_MIN_RR,
+        strategy.REQUIRE_PATTERN_SETUP_FOR_ORACLE, strategy.MIN_ORACLE_SETUP_SCORE,
+        strategy.ORACLE_MIN_TP_PCT, strategy.ORACLE_MIN_SL_PCT
+    )
 
     # ------------------------------------------------------------------
     # Capacity score — how much "room" exists in the winning direction
@@ -711,6 +727,9 @@ def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFra
         ("Entropy/Info Theory", add_information_theory_features),
         ("Microstructure", add_microstructure_features),
         ("Market Regime (Chop)", add_regime_features),
+        # ? ACCELERATION + CROSS-ASSET MUST RUN AFTER MOMENTUM/VOL FEATURES THEY CONSUME
+        ("Acceleration (delta-of-delta)", add_acceleration_features),
+        ("Cross-Asset / Regime", add_cross_asset_features),
         ("Risk-Reward Profile", lambda d: add_risk_reward_features(d, lookahead)),
         ("Interactions", add_interaction_features),
         ("Pattern Setups", add_pattern_setup_features),
@@ -732,3 +751,89 @@ def create_full_feature_set(df: pd.DataFrame, lookahead: int = 10) -> pd.DataFra
     df = df.ffill().fillna(0)
     console.print(f"[success]✅ Feature engineering complete![/success] Total features: [bold]{len(df.columns)}[/bold]")
     return df
+
+
+@numba.njit
+def _calculate_future_excursions_jit(highs: np.ndarray, lows: np.ndarray, lookahead: int):
+    n = len(highs)
+    future_max_high = np.full(n, np.nan)
+    future_min_low = np.full(n, np.nan)
+    for i in range(n):
+        end_idx = min(i + 1 + lookahead, n)
+        if i + 1 < end_idx:
+            # Manually find max/min to keep it pure JIT
+            cur_max = -1e18
+            cur_min = 1e18
+            for j in range(i + 1, end_idx):
+                if highs[j] > cur_max: cur_max = highs[j]
+                if lows[j] < cur_min: cur_min = lows[j]
+            future_max_high[i] = cur_max
+            future_min_low[i] = cur_min
+    return future_max_high, future_min_low
+
+
+@numba.njit
+def _compute_oracle_labels_jit(
+    row_count, lookahead, close_prices, high_prices, low_prices,
+    upside_pct, abs_down_pct, long_setup_score, short_setup_score,
+    oracle_tp_long, oracle_sl_long, oracle_rr_long,
+    oracle_tp_short, oracle_sl_short, oracle_rr_short,
+    estimated_trade_cost_pct,
+    min_upside, min_downside, min_rr,
+    require_pattern, min_setup_score,
+    min_tp_label, min_sl_label
+):
+    labels = np.ones(row_count)
+    label_tp_pct = np.full(row_count, min_tp_label)
+    label_sl_pct = np.full(row_count, min_sl_label)
+    actual_pnl_pct_arr = np.zeros(row_count)
+    winning_rr = np.ones(row_count)
+    best_capacity = np.zeros(row_count)
+
+    for row_index in range(row_count - lookahead):
+        # Long simulation
+        long_code, long_pnl = _simulate_trade_path(
+            close_prices, high_prices, low_prices, row_index, lookahead,
+            oracle_tp_long[row_index], oracle_sl_long[row_index], True
+        )
+        # Short simulation
+        short_code, short_pnl = _simulate_trade_path(
+            close_prices, high_prices, low_prices, row_index, lookahead,
+            oracle_tp_short[row_index], oracle_sl_short[row_index], False
+        )
+
+        long_eligible = (
+            upside_pct[row_index] >= min_upside
+            and oracle_rr_long[row_index] >= min_rr
+            and oracle_tp_long[row_index] >= estimated_trade_cost_pct
+            and long_code == 0 # SUCCESS
+            and (not require_pattern or long_setup_score[row_index] >= min_setup_score)
+        )
+        short_eligible = (
+            abs_down_pct[row_index] >= min_downside
+            and oracle_rr_short[row_index] >= min_rr
+            and oracle_tp_short[row_index] >= estimated_trade_cost_pct
+            and short_code == 0 # SUCCESS
+            and (not require_pattern or short_setup_score[row_index] >= min_setup_score)
+        )
+
+        if long_eligible and (
+            not short_eligible
+            or long_pnl > short_pnl
+            or (abs(long_pnl - short_pnl) < 1e-7 and oracle_rr_long[row_index] >= oracle_rr_short[row_index])
+        ):
+            labels[row_index] = 0.0
+            label_tp_pct[row_index] = oracle_tp_long[row_index]
+            label_sl_pct[row_index] = oracle_sl_long[row_index]
+            actual_pnl_pct_arr[row_index] = long_pnl - estimated_trade_cost_pct
+            winning_rr[row_index] = oracle_rr_long[row_index]
+            best_capacity[row_index] = upside_pct[row_index]
+        elif short_eligible:
+            labels[row_index] = 2.0
+            label_tp_pct[row_index] = oracle_tp_short[row_index]
+            label_sl_pct[row_index] = oracle_sl_short[row_index]
+            actual_pnl_pct_arr[row_index] = short_pnl - estimated_trade_cost_pct
+            winning_rr[row_index] = oracle_rr_short[row_index]
+            best_capacity[row_index] = abs_down_pct[row_index]
+
+    return labels, label_tp_pct, label_sl_pct, actual_pnl_pct_arr, winning_rr, best_capacity

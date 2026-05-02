@@ -9,6 +9,7 @@ from typing import Dict, Tuple
 
 import numpy as np
 import torch
+from models import direction_logits_to_probabilities
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -88,17 +89,28 @@ def classification_metrics_numpy(
         zero_division=0,
     )
     confusion = confusion_matrix(true_direction, predicted_direction, labels=[0, 1, 2])
+    trade_signal_mask = (predicted_direction == 0) | (predicted_direction == 2)
+    trade_signal_count = int(trade_signal_mask.sum())
+    if trade_signal_count > 0:
+        trading_signal_precision = float(
+            (true_direction[trade_signal_mask] == predicted_direction[trade_signal_mask]).mean()
+        )
+    else:
+        trading_signal_precision = float("nan")
+
     return {
         "f1_macro": float(macro_f1),
         "f1_weighted": float(weighted_f1),
         "balanced_accuracy": float(balanced_acc),
         "majority_class_baseline_accuracy": float(majority_baseline),
+        "trading_signal_precision": trading_signal_precision,
+        "trading_signal_count": float(trade_signal_count),
         "classification_report_text": report,
         "confusion_matrix_3x3": confusion.tolist(),
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate_model_on_split(
     model: torch.nn.Module,
     features: np.ndarray,
@@ -106,20 +118,50 @@ def evaluate_model_on_split(
     device: torch.device,
 ) -> Dict[str, float | str]:
     """Run model on numpy arrays and aggregate sklearn / numpy metrics."""
+    from config import config as eval_config
+
     model.eval()
-    batch_tensor = torch.FloatTensor(features).to(device)
-    predictions = model(batch_tensor)
-    pred_dir = torch.argmax(predictions["direction"], dim=1).cpu().numpy()
+    chunk_rows = getattr(eval_config.training, "EVAL_CHUNK_SIZE", 4096)
+    pred_dir_parts: list[np.ndarray] = []
+    pred_qty_parts: list[np.ndarray] = []
+    pred_tp_parts: list[np.ndarray] = []
+    pred_sl_parts: list[np.ndarray] = []
+    n_samples = int(features.shape[0])
+
+    for start in range(0, n_samples, chunk_rows):
+        end = min(start + chunk_rows, n_samples)
+        batch_tensor = torch.as_tensor(
+            features[start:end], dtype=torch.float32, device=device
+        )
+        if device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                predictions = model(batch_tensor)
+        else:
+            # MPS: avoid autocast — mixed fp16/fp32 in downstream metrics path breaks Metal
+            predictions = model(batch_tensor)
+        pred_dir_parts.append(
+            torch.argmax(direction_logits_to_probabilities(predictions["direction"]), dim=1).cpu().numpy()
+        )
+        sizing = predictions["sizing"].float().cpu().numpy()
+        pred_qty_parts.append(sizing[:, 0])
+        pred_tp_parts.append(sizing[:, 1])
+        pred_sl_parts.append(sizing[:, 2])
+
+    pred_dir = np.concatenate(pred_dir_parts, axis=0)
+    sizing = np.stack(
+        [
+            np.concatenate(pred_qty_parts),
+            np.concatenate(pred_tp_parts),
+            np.concatenate(pred_sl_parts),
+        ],
+        axis=1,
+    )
     targets_direction = targets["direction"]
 
     # Decode sizing head [qty_ratio, tp_raw, sl_raw]
-    sizing = predictions["sizing"].cpu().numpy()
     pred_qty = sizing[:, 0]
-    
-    # Needs config for scaling, so we'll import it
-    from config import config
-    pred_tp = sizing[:, 1] * config.strategy.LABEL_TP_PCT_MAX
-    pred_sl = sizing[:, 2] * config.strategy.LABEL_SL_PCT_MAX
+    pred_tp = sizing[:, 1] * eval_config.strategy.LABEL_TP_PCT_MAX
+    pred_sl = sizing[:, 2] * eval_config.strategy.LABEL_SL_PCT_MAX
     
     true_qty = targets["qty_ratio"]
     true_tp = targets["take_profit_pct"]

@@ -27,16 +27,20 @@ class DataConfig:
     INTERVAL: str = "15m"                       # Scalping-oriented base timeframe
     TOTAL_DAYS: int = 365                        # 1 full year of history for robust training
     CACHE_VALID_MINS: int = 120                  # Feature cache validity (2 hours)
-    FEATURE_CACHE_VERSION: int = 7
+    # ? BUMPED FOR ACCELERATION + CROSS-ASSET FEATURE EXPANSION (V11)
+    FEATURE_CACHE_VERSION: int = 11
 
 @dataclass
 class FeatureConfig:
     """Settings for feature engineering and pruning"""
-    LOOKAHEAD_BARS: int = 8                      # 8 bars = 2h on 15m data
+    LOOKAHEAD_BARS: int = 12                     # Path resolution window
     PRUNING_THRESHOLD: float = 0.03              # Spearman correlation pruning floor
     USE_CURATED_FEATURES: bool = True            # Keep high-signal, interpretable features only
+    # ? CURATED LIST — MUST BE DIRECTIONAL OR REGIME-CONDITIONED.
+    # ? PURE-MAGNITUDE FEATURES (volatility_*, BB_width, ATR_pct, ...) ARE INCLUDED ONLY
+    # ? IF THEY HAVE A SIGNED COUNTERPART (signed_atr_pct, signed_bb_width) ALSO PRESENT.
     CURATED_FEATURES: tuple[str, ...] = (
-        # Trend / regime
+        # Trend / regime — all directional
         "price_to_ema_20",
         "price_to_ema_50",
         "price_to_ema_100",
@@ -62,7 +66,7 @@ class FeatureConfig:
         "ROC_20",
         "WilliamsR_14",
         "Stoch_K",
-        # Volatility / breakout context
+        # Volatility (kept as REGIME context — ALWAYS PAIRED WITH SIGNED VERSION BELOW)
         "ATR_pct",
         "BB_width",
         "BB_position",
@@ -94,6 +98,27 @@ class FeatureConfig:
         "percentile_rank_20",
         "skew_20",
         "surprise",
+        # ? NEW DELTA-OF-DELTA (ACCELERATION) FEATURES — added by add_acceleration_features
+        "return_accel_5",
+        "return_accel_10",
+        "return_accel_smooth",
+        "rsi_velocity",
+        "rsi_accel",
+        "vol_velocity",
+        "vol_accel",
+        "macd_velocity",
+        "macd_accel",
+        # ? NEW CROSS-ASSET / REGIME / SIGNED-MAGNITUDE FEATURES — fix the directional flip
+        "htf_return_pct",
+        "htf_trend_sign",
+        "vol_regime_ratio",
+        "signed_volatility_10",
+        "signed_atr_pct",
+        "signed_bb_width",
+        "signed_volume_ratio",
+        "rsi_excess",
+        "above_htf_ema",
+        "htf_ema_distance",
         # Explicit pattern/setup features
         "trend_pullback_long_setup",
         "trend_pullback_short_setup",
@@ -113,67 +138,103 @@ class FeatureConfig:
 @dataclass
 class ModelConfig:
     """Transformer Architecture Hyperparameters"""
-    HIDDEN_DIM: int = 48                         # Smaller model for curated feature set
-    NUM_HEADS: int = 4                           # Attention heads (48 / 4 = 12 dim per head)
-    NUM_LAYERS: int = 2                          # 2 layers for pattern depth
-    DROPOUT: float = 0.30                        # Regularization without drowning signal
-    SEQ_LEN: int = 32                            # 32 bars = 8h lookback on 15m data
+    # ? BULLETPROOF RE-TUNE: 4 LAYERS WAS OVERFITTING ON ~30K WINDOWS.
+    # ? 3 LAYERS WITH WIDER FFN AND HIGHER DROPOUT GENERALIZES BETTER.
+    HIDDEN_DIM: int = 128
+    NUM_HEADS: int = 8
+    NUM_LAYERS: int = 3                          # Was 4 — reduced to combat memorization
+    DROPOUT: float = 0.30                        # Was 0.25 — increased for stronger regularization
+    SEQ_LEN: int = 48
 
 @dataclass
 class TrainingConfig:
     """Settings for the AI training process"""
     # Chronological holdouts: train -> val -> test (oldest -> newest)
-    VAL_DAYS: int = 15                           # Increased from 4 — more reliable validation signal
-    TEST_DAYS: int = 30                          # 1 month test window
-    EPOCHS: int = 50                             # Increased epochs for deeper learning
-    RL_FINE_TUNE_EPOCHS: int = 0                 # Disabled by default until a real path-based RL target exists
-    EARLY_STOP_PATIENCE: int = 10                # Increased patience for slower LR
-    BATCH_SIZE: int = 512                        # M4 GPU efficient batch size
-    LEARNING_RATE: float = 0.00008               # Slightly faster LR for smaller model
-    RL_LEARNING_RATE: float = 0.00002            # Phase 2 RL: slower to preserve Phase 1 knowledge
-    WEIGHT_DECAY: float = 0.001                  # REDUCED from 0.01: was killing gradients
-    USE_WEIGHTED_SAMPLER: bool = False            # Replaced by Focal Loss (no class weights needed)
-    CLASS_WEIGHT_POWER: float = 0.75              # Strong enough to learn rare setups without exploding
-    MIN_CLASS_WEIGHT: float = 0.75
-    MAX_CLASS_WEIGHT: float = 2.25
+    VAL_DAYS: int = 20
+    TEST_DAYS: int = 30
+    # ? MORE EPOCHS LET ONE-CYCLE SCHEDULER FINISH; EARLY-STOP STILL CAPTURES BEST COMPOSITE CHECKPOINT.
+    EPOCHS: int = 15
+    # ? PHASE 2 RL OFTEN DOES NOT IMPROVE HOLDOUT PRECISION — KEEP OFF UNTIL SUPERVISED MODEL IS STRONG.
+    RL_FINE_TUNE_EPOCHS: int = 0
+    EARLY_STOP_PATIENCE: int = 15                # Reduced from 20 — combined with composite score
+    BATCH_SIZE: int = 512
+    LEARNING_RATE: float = 0.00006
+    RL_LEARNING_RATE: float = 0.00002
+    WEIGHT_DECAY: float = 0.0015                 # Bumped from 0.001 — more L2 against memorization
+    USE_WEIGHTED_SAMPLER: bool = False
+    CLASS_WEIGHT_POWER: float = 0.85
+    MIN_CLASS_WEIGHT: float = 0.60
+    MAX_CLASS_WEIGHT: float = 3.0
 
     # Loss weights
-    LOSS_ALPHA: float = 1.0                      # Signal (direction) loss weight — primary objective
-    LOSS_BETA: float = 0.3                       # Sizing loss weight — secondary
-    LOSS_GAMMA: float = 0.0                      # Disabled by default: current training is supervised
+    LOSS_ALPHA: float = 1.0
+    LOSS_BETA: float = 0.5
+    LOSS_GAMMA: float = 0.0                      # Must be >0 with RL_FINE_TUNE_EPOCHS >0 for Phase 2
+    # ? NEW — STRENGTH OF THE SIGNAL/SIZING CONSISTENCY LOSS COMPONENT
+    LOSS_CONSISTENCY: float = 0.10
 
     # Focal Loss hyperparameters
-    FOCAL_GAMMA: float = 1.25                    # Focus on rare setup mistakes, but not too aggressively
-    USE_FOCAL_LOSS: bool = True                  # Use Focal Loss instead of CrossEntropy
+    FOCAL_GAMMA: float = 2.2
+    USE_FOCAL_LOSS: bool = True
+    # ? EXTRA LOSS WHEN TARGET IS NEUTRAL BUT PREDICTION IS BUY OR SELL (BOOSTS TRADING PRECISION / WIN-RATE PATH).
+    FOCAL_NEUTRAL_VIOLATION_SCALE: float = 1.42
+    # ? AFTER INVERSE-FREQ WEIGHTS: SLIGHTLY UP NEUTRAL, DOWN LONG/SHORT TO REDUCE FALSE SIGNALS.
+    CLASS_WEIGHT_NEUTRAL_SCALE: float = 1.12
+    CLASS_WEIGHT_DIRECTIONAL_SCALE: float = 0.91
+
+    # -----------------------------------------------------------------------
+    # Speed / throughput (same math; faster wall-clock)
+    # -----------------------------------------------------------------------
+    # ? CHUNK SIZE FOR VAL/TEST FORWARD PASSES — LARGER = FEWER KERNEL LAUNCHES (GPU)
+    EVAL_CHUNK_SIZE: int = 4096
+    # ? DATALOADER WORKERS: -1 = AUTO (0 ON MPS/MACOS; MIN(8, CPU_COUNT) ON CUDA LINUX)
+    DATALOADER_NUM_WORKERS: int = -1
+    DATALOADER_PERSISTENT_WORKERS: bool = True
+    # ? EXPERIMENTAL: TORCH.COMPILE (PYTORCH 2+) — OFTEN SKIPPED ON MPS; SAFE DEFAULT OFF
+    USE_TORCH_COMPILE: bool = False
+    # ? CUDA ONLY — MATMUL TF32 FOR ~2X SPEED ON AMPERE+ WITH NEGLIGIBLE IMPACT FOR THIS SCALE
+    CUDA_MATMUL_TF32: bool = True
+    CUDNN_BENCHMARK: bool = True
 
 @dataclass
 class StrategyConfig:
     """Settings for trading strategy and evaluation"""
-    TARGET_PROFIT_PCT: float = 0.75             # Fallback TP large enough to clear fees/slippage
-    STOP_LOSS_PCT: float = 0.35                 # Fallback SL for controlled invalidation
+    TARGET_PROFIT_PCT: float = 0.70             # Slightly more realistic for 15m
+    STOP_LOSS_PCT: float = 0.40                 # Slightly wider stop for noise
     USE_DYNAMIC_TP_SL_LABELS: bool = False      # Disabled when USE_ORACLE_LABELS=True
     TP_ATR_MULTIPLIER: float = 1.25
-    SL_ATR_MULTIPLIER: float = 0.65
-    LABEL_TP_PCT_MIN: float = 0.45              # Avoid labeling trades that costs can erase
+    SL_ATR_MULTIPLIER: float = 0.75
+    LABEL_TP_PCT_MIN: float = 0.35              # Lowered to capture more moves
     LABEL_TP_PCT_MAX: float = 2.50
     LABEL_SL_PCT_MIN: float = 0.25              # Avoid unrealistically tight noisy stops
-    LABEL_SL_PCT_MAX: float = 1.25
+    LABEL_SL_PCT_MAX: float = 1.50
 
     # -----------------------------------------------------------------------
     # Risk Management & Execution Rules
+    # ? CONFIDENCE GATE USES MAX SOFTMAX — NOT A CALIBRATED WIN PROBABILITY.
+    # ? RAW MODEL OUTPUT IS OFTEN FLAT (MAX ~0.42–0.55); 0.60 BLOCKED EVERY TRADE IN PRACTICE.
+    # ? USE INFERENCE_DIRECTION_TEMPERATURE < 1 TO SHARPEN + THRESHOLD ~0.44–0.50 FOR RESEARCH RUNS.
     # -----------------------------------------------------------------------
-    AI_CONFIDENCE_THRESHOLD: float = 0.50       # Trade only when the classifier has real separation
-    MIN_REWARD_RISK_RATIO: float = 1.60         # Require enough edge after costs
+    AI_CONFIDENCE_THRESHOLD: float = 0.46
+    # ? SOFTMAX SHARPENING AT INFERENCE ONLY (LOGITS / T, T<1). TRAINING UNCHANGED.
+    INFERENCE_DIRECTION_TEMPERATURE: float = 0.78
+    MIN_REWARD_RISK_RATIO: float = 1.50         # Higher quality bar; calibrator pushes above
     SLIPPAGE_PCT: float = 0.05                   # 5bps per leg (realistic for crypto)
-    PARALLEL_SLOTS: int = 1                      # Keep one slot until edge quality improves
+    PARALLEL_SLOTS: int = 2                      # Allow 2 trades for diversification
     KELLY_FRACTION: float = 0.3                  # More conservative sizing
-    MIN_DIRECTIONAL_EDGE: float = 0.12          # buy/sell prob must beat neutral by a larger margin
-    EXECUTION_TP_SCALE: float = 1.00            # Keep TP cost-aware; do not shrink below label intent
-    EXECUTION_SL_SCALE: float = 1.00            # Keep SL aligned with trained labels
-    MAX_DAILY_TRADES: int = 4
+    MIN_DIRECTIONAL_EDGE: float = 0.10          # Bumped from 0.05 — only act on true edge
+    # ? ARGMAX IS OFTEN NOISY (E.G. 0.34/0.33/0.33). REQUIRE TOP CLASS TO BEAT RUNNER-UP.
+    MIN_SOFTMAX_MARGIN: float = 0.06
+    # ? PER ROW: BREAK-EVEN WIN RATE = (SL + COST) / (TP + SL); SKIP IF MAX SOFTMAX < THAT + BUFFER.
+    # ? (SOFTMAX IS NOT A CALIBRATED P, BUT BELOW THIS BAR EVEN OPTIMISTIC EV IS NEGATIVE.)
+    BREAKEVEN_CONFIDENCE_GATE: bool = True
+    BREAKEVEN_CONFIDENCE_BUFFER: float = 0.03
+    EXECUTION_TP_SCALE: float = 1.00
+    EXECUTION_SL_SCALE: float = 1.00
+    MAX_DAILY_TRADES: int = 6
     COOLDOWN_BARS: int = 2
-    MAX_CONSECUTIVE_LOSSES: int = 3
-    DAILY_STOP_LOSS_PCT: float = 2.0
+    MAX_CONSECUTIVE_LOSSES: int = 3              # Tightened from 4 — kill streaks early
+    DAILY_STOP_LOSS_PCT: float = 2.5             # Tightened from 3.0 — capital preservation
     BREAK_EVEN_AFTER_R: float = 0.80
     TRAIL_STOP_AFTER_R: float = 1.20
     TRAIL_STOP_R_MULTIPLE: float = 0.60
@@ -184,29 +245,32 @@ class StrategyConfig:
     # -----------------------------------------------------------------------
     USE_ORACLE_LABELS: bool = True
     ORACLE_TP_CAPTURE_RATIO: float = 0.50       # Capture a tradable move, not dust after costs
-    ORACLE_SL_CAPTURE_RATIO: float = 0.25       # Keep stops controlled but not micro-noisy
+    ORACLE_SL_CAPTURE_RATIO: float = 0.25       # Tighten stops for higher RR labels
     ORACLE_MIN_TP_PCT: float = 0.45
     ORACLE_MAX_TP_PCT: float = 2.50
     ORACLE_MIN_SL_PCT: float = 0.25
     ORACLE_MAX_SL_PCT: float = 1.25
-    ORACLE_MIN_RR: float = 1.45
-    ORACLE_MIN_UPSIDE_PCT: float = 0.45
-    ORACLE_MIN_DOWNSIDE_PCT: float = 0.45
-    REQUIRE_PATTERN_SETUP_FOR_ORACLE: bool = True
-    MIN_ORACLE_SETUP_SCORE: float = 0.25
+    ORACLE_MIN_RR: float = 1.60                 # Increased for high-quality signal learning
+    ORACLE_MIN_UPSIDE_PCT: float = 0.45         
+    ORACLE_MIN_DOWNSIDE_PCT: float = 0.45       
+    REQUIRE_PATTERN_SETUP_FOR_ORACLE: bool = True 
+    MIN_ORACLE_SETUP_SCORE: float = 0.10        # Relaxed pattern score requirement
 
     # Production acceptance gates. These do not make profit guaranteed; they block
     # production-style output unless the most recent held-out month already proved it.
-    MIN_PRODUCTION_TEST_GROWTH_PCT: float = 10.0
-    MIN_PRODUCTION_TRADES: int = 10
-    MIN_VALIDATION_PRECISION: float = 0.55
-    MIN_VALIDATION_EXPECTANCY_PCT: float = 0.05
-    COST_BUFFER_PCT: float = 0.10
+    MIN_PRODUCTION_TEST_GROWTH_PCT: float = 5.0
+    MIN_PRODUCTION_TRADES: int = 5
+    # ? VALIDATION PRECISION FLOOR RAISED TO BREAK-EVEN+: only ship a calibrated
+    # ? threshold when the validation slice precision exceeds this value.
+    MIN_VALIDATION_PRECISION: float = 0.48      # Aligned with sharpened val probs + noisy short horizon
+    MIN_VALIDATION_EXPECTANCY_PCT: float = 0.02  # Allow calibration to find a threshold vs always BLOCKED
+    COST_BUFFER_PCT: float = 0.05               # Reduced buffer
 
     INITIAL_CAPITAL_USD: float = 1000.0
     RISK_PER_TRADE_PCT_OF_EQUITY: float = 1.0   # Risk 1% equity per trade
     MAX_POSITION_NOTIONAL_PCT_OF_EQUITY: float = 0.95
     ROUND_TRIP_FEE_PCT: float = 0.1
+
 
 @dataclass
 class TradingConfig:

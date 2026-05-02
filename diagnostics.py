@@ -70,17 +70,21 @@ def _plot_line(
     label: str,
     y_min: float | None = None,
     y_max: float | None = None,
+    draw_box: bool = True,
 ) -> None:
     x0, y0, x1, y1 = box
-    draw.rectangle(box, fill=PANEL, outline=GRID)
+    if draw_box:
+        draw.rectangle(box, fill=PANEL, outline=GRID)
+        for i in range(5):
+            yy = y0 + int((y1 - y0) * i / 4)
+            draw.line((x0, yy, x1, yy), fill=GRID)
+
     if len(values) < 2:
         draw.text((x0 + 16, y0 + 16), f"{label}: insufficient points", fill=MUTED, font=_font(16))
         return
     if y_min is None or y_max is None:
         y_min, y_max = _safe_range(values)
-    for i in range(5):
-        yy = y0 + int((y1 - y0) * i / 4)
-        draw.line((x0, yy, x1, yy), fill=GRID)
+    
     points = []
     for i, value in enumerate(values):
         x = x0 + int((x1 - x0) * i / max(len(values) - 1, 1))
@@ -88,6 +92,8 @@ def _plot_line(
         y = y1 - int((y1 - y0) * ratio)
         points.append((x, y))
     draw.line(points, fill=color, width=3)
+    
+    # Legend/Label on the chart itself
     draw.text((x0 + 14, y0 + 10), label, fill=color, font=_font(17, bold=True))
     draw.text((x0 + 14, y1 - 28), f"min {min(values):.4f}  max {max(values):.4f}", fill=MUTED, font=_font(14))
 
@@ -101,9 +107,9 @@ def save_training_history_chart(history: list[dict[str, Any]], output_dir: str) 
     val_loss = [float(row.get("val_loss", np.nan)) for row in history]
     val_acc = [float(row.get("val_direction_accuracy_pct", np.nan)) for row in history]
     loss_min, loss_max = _safe_range(train_loss + val_loss)
-    _plot_line(draw, (70, 100, 1130, 390), train_loss, BLUE, "Train loss", loss_min, loss_max)
-    _plot_line(draw, (70, 100, 1130, 390), val_loss, AMBER, "Val loss", loss_min, loss_max)
-    _plot_line(draw, (70, 460, 1130, 710), val_acc, GREEN, "Validation direction accuracy (%)", 0.0, 100.0)
+    _plot_line(draw, (70, 100, 1130, 390), train_loss, BLUE, "Train loss", loss_min, loss_max, draw_box=True)
+    _plot_line(draw, (70, 100, 1130, 390), val_loss, AMBER, "Val loss", loss_min, loss_max, draw_box=False)
+    _plot_line(draw, (70, 460, 1130, 710), val_acc, GREEN, "Validation direction accuracy (%)", 0.0, 100.0, draw_box=True)
     draw.text((70, 730), f"Epochs completed: {epochs[-1]}", fill=MUTED, font=_font(16))
     return _save(image, output_dir, "training_history.png")
 
@@ -188,12 +194,23 @@ def save_equity_curve_chart(equity_curves: dict[str, dict[str, Any]], output_dir
     all_values: list[float] = []
     for payload in equity_curves.values():
         all_values.extend([float(v) for v in payload.get("equity", [])])
+    
     y_min, y_max = _safe_range(all_values or [1000.0])
     colors = [BLUE, GREEN, AMBER, PURPLE, RED]
+    
+    # Draw the background box once
+    draw.rectangle(box, fill=PANEL, outline=GRID)
+    x0, y0, x1, y1 = box
+    for i in range(5):
+        yy = y0 + int((y1 - y0) * i / 4)
+        draw.line((x0, yy, x1, yy), fill=GRID)
+
     for idx, (symbol, payload) in enumerate(equity_curves.items()):
         values = [float(v) for v in payload.get("equity", [])]
-        _plot_line(draw, box, values, colors[idx % len(colors)], symbol, y_min, y_max)
+        # Plot series without redrawing the box
+        _plot_line(draw, box, values, colors[idx % len(colors)], symbol, y_min, y_max, draw_box=False)
         draw.text((90 + idx * 190, 645), f"{symbol}: ${values[-1]:.2f}" if values else symbol, fill=colors[idx % len(colors)], font=_font(17, bold=True))
+    
     return _save(image, output_dir, filename)
 
 
@@ -274,6 +291,171 @@ def save_feature_relevance_chart(
     draw.text((70, 820), "Low values mean the OHLCV indicators have weak standalone relation to future labels.", fill=MUTED, font=_font(17))
     image_path = _save(image, output_dir, "feature_relevance.png")
     return image_path, csv_path
+
+
+# ? NEW DIAGNOSTIC #1 — TRADE LENGTH VS PNL SCATTER
+# ? ANSWERS THE QUESTION: ARE WE HOLDING LOSERS TOO LONG AND CUTTING WINNERS SHORT?
+def save_trade_length_vs_pnl_chart(trades: list[Any], output_dir: str, filename: str = "trade_length_vs_pnl.png") -> str:
+    """Scatter of trade duration (entry_index → exit_index) vs net PnL ($)."""
+    image, draw = _canvas(1200, 720, "Trade Length vs Net PnL")
+    if not trades:
+        draw.rectangle((70, 140, 1130, 560), fill=PANEL, outline=GRID)
+        draw.text((120, 320), "No trades to plot.", fill=TEXT, font=_font(28, bold=True))
+        return _save(image, output_dir, filename)
+
+    # ? COMPUTE DURATION (BARS HELD) FROM ENTRY/EXIT TIMESTAMPS WHEN AVAILABLE,
+    # ? FALLBACK TO ENTRY_INDEX → EXIT_INDEX DELTA ESTIMATE.
+    durations: list[int] = []
+    pnls: list[float] = []
+    for trade in trades:
+        entry_dt = getattr(trade, "entry_datetime", None)
+        exit_dt = getattr(trade, "exit_datetime", None)
+        bars = None
+        try:
+            if entry_dt and exit_dt:
+                delta = pd.to_datetime(exit_dt) - pd.to_datetime(entry_dt)
+                bars = max(int(delta.total_seconds() // (15 * 60)), 1)
+        except Exception:
+            bars = None
+        if bars is None:
+            bars = 1
+        durations.append(int(bars))
+        pnls.append(float(getattr(trade, "pnl_net_usd", 0.0)))
+
+    if not durations:
+        return _save(image, output_dir, filename)
+
+    box = (90, 140, 1130, 580)
+    draw.rectangle(box, fill=PANEL, outline=GRID)
+    x0, y0, x1, y1 = box
+
+    max_dur = max(durations + [1])
+    pnl_lo, pnl_hi = _safe_range(pnls)
+    zero_y = y1 - int((y1 - y0) * ((0 - pnl_lo) / max(pnl_hi - pnl_lo, 1e-9)))
+    draw.line((x0, zero_y, x1, zero_y), fill=MUTED, width=2)
+
+    for dur, pnl in zip(durations, pnls):
+        x = x0 + int((x1 - x0) * dur / max(max_dur, 1))
+        ratio = (pnl - pnl_lo) / max(pnl_hi - pnl_lo, 1e-9)
+        y = y1 - int((y1 - y0) * ratio)
+        color = GREEN if pnl >= 0 else RED
+        draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color, outline=color)
+
+    avg_win_dur = float(np.mean([d for d, p in zip(durations, pnls) if p > 0])) if any(p > 0 for p in pnls) else 0.0
+    avg_loss_dur = float(np.mean([d for d, p in zip(durations, pnls) if p < 0])) if any(p < 0 for p in pnls) else 0.0
+    draw.text(
+        (90, 600),
+        f"Avg winner duration: {avg_win_dur:.1f} bars   |   Avg loser duration: {avg_loss_dur:.1f} bars",
+        fill=TEXT,
+        font=_font(18, bold=True),
+    )
+    insight = "Holding losers longer than winners — tighten SL or trail earlier." if avg_loss_dur > avg_win_dur * 1.1 else "Win/loss durations are balanced."
+    draw.text((90, 635), insight, fill=AMBER if "tighten" in insight else GREEN, font=_font(17))
+    draw.text((90, 670), f"X axis: bars held   Y axis: net PnL ($)   n={len(durations)} trades", fill=MUTED, font=_font(15))
+    return _save(image, output_dir, filename)
+
+
+# ? NEW DIAGNOSTIC #2 — FEATURE GROUP IMPORTANCE (TREND vs MOMENTUM vs VOL vs ACCEL ...)
+# ? ANSWERS THE QUESTION: WHICH FAMILY OF SIGNALS DRIVES THE EDGE?
+FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
+    "Trend": (
+        "price_to_ema_", "price_to_sma_", "ema_", "supertrend", "ADX_", "directional_bias",
+        "bars_since_flip", "efficiency_ratio", "trend_persistence", "trend_strength",
+        "is_trending", "is_choppy", "above_htf_ema", "htf_ema_distance",
+    ),
+    "Momentum": (
+        "RSI_", "MACD_", "ROC_", "WilliamsR_", "Stoch_", "rsi_excess",
+    ),
+    "Acceleration": (
+        "return_accel_", "rsi_velocity", "rsi_accel", "vol_velocity", "vol_accel",
+        "macd_velocity", "macd_accel",
+    ),
+    "Volatility": (
+        "ATR_", "BB_width", "BB_position", "volatility_", "chop_index",
+        "range_compression", "signed_volatility", "signed_atr_pct", "signed_bb_width",
+        "vol_regime_ratio",
+    ),
+    "Volume": (
+        "volume_", "OBV_", "CMF", "MFI", "signed_volume_ratio",
+    ),
+    "Cross-Asset": (
+        "htf_return_pct", "htf_trend_sign",
+    ),
+    "Pattern Setup": (
+        "trend_pullback_", "breakout_", "reversal_", "long_setup_score",
+        "short_setup_score", "setup_score_spread", "compression_breakout_score",
+    ),
+    "Price Action": (
+        "return_", "daily_range", "range_pct", "wick_", "close_position",
+        "candle_strength", "buy_pressure", "stop_hunt_proxy",
+    ),
+    "Statistical": (
+        "zscore_", "percentile_rank_", "skew_", "surprise",
+    ),
+}
+
+
+def _classify_feature_group(feature_name: str) -> str:
+    for group, prefixes in FEATURE_GROUPS.items():
+        for prefix in prefixes:
+            if feature_name.startswith(prefix) or feature_name == prefix.rstrip("_"):
+                return group
+    return "Other"
+
+
+def save_feature_group_importance_chart(
+    relevance_csv_path: str,
+    output_dir: str,
+    filename: str = "feature_group_importance.png",
+) -> str | None:
+    """
+    Aggregate per-feature Spearman correlations into FEATURE GROUPS and
+    plot which family contributes most to the directional edge.
+    """
+    if not relevance_csv_path or not os.path.exists(relevance_csv_path):
+        return None
+    df = pd.read_csv(relevance_csv_path)
+    if df.empty or "feature" not in df.columns or "spearman_abs" not in df.columns:
+        return None
+
+    df["group"] = df["feature"].astype(str).apply(_classify_feature_group)
+    grouped = (
+        df.groupby("group")
+        .agg(
+            mean_abs_corr=("spearman_abs", "mean"),
+            sum_abs_corr=("spearman_abs", "sum"),
+            n_features=("feature", "count"),
+            mean_signed=("spearman_signed", "mean"),
+        )
+        .sort_values("mean_abs_corr", ascending=False)
+    )
+    if grouped.empty:
+        return None
+
+    image, draw = _canvas(1200, 760, "Feature Group Importance — Mean |Spearman| vs Direction")
+    x0, y0, width, row_h = 380, 130, 620, 56
+    max_score = max(float(grouped["mean_abs_corr"].max()), 1e-6)
+    for idx, (group, row) in enumerate(grouped.iterrows()):
+        y = y0 + idx * row_h
+        signed = float(row["mean_signed"])
+        color = GREEN if signed >= 0 else RED
+        draw.text((70, y + 8), f"{group} (n={int(row['n_features'])})", fill=TEXT, font=_font(18, bold=True))
+        draw.rectangle((x0, y + 10, x0 + width, y + 38), fill=PANEL, outline=GRID)
+        bar_w = int(width * float(row["mean_abs_corr"]) / max_score)
+        draw.rectangle((x0, y + 10, x0 + bar_w, y + 38), fill=color)
+        draw.text(
+            (x0 + width + 18, y + 7),
+            f"|μ|={row['mean_abs_corr']:.4f}   Σ={row['sum_abs_corr']:.3f}",
+            fill=TEXT,
+            font=_font(16, bold=True),
+        )
+    draw.text(
+        (70, y0 + len(grouped) * row_h + 20),
+        "Higher mean |Spearman| = more directional information. Use to prune low-signal groups.",
+        fill=MUTED,
+        font=_font(17),
+    )
+    return _save(image, output_dir, filename)
 
 
 def save_diagnostic_summary(payload: dict[str, Any], output_dir: str) -> str:

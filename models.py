@@ -45,15 +45,25 @@ class PositionalEncoding(nn.Module):
 
 class AttentionPool(nn.Module):
     """
-    Learnable attention-weighted pooling over the temporal dimension.
+    Multi-statistic attention pooling.
 
-    Instead of taking only the last timestep (which throws away pattern info),
-    this learns which timesteps matter for prediction and computes a weighted sum.
+    The previous version learned a single attention weight per timestep and
+    could collapse to "look only at the last 1-2 bars" (verified by feature
+    relevance audit: the model effectively ignored mid-window context).
+
+    This version concatenates THREE views over the window:
+      1. Attention-weighted sum (LEARNED EMPHASIS)
+      2. Mean over all timesteps (UNBIASED CONTEXT — forces use of full window)
+      3. Last timestep (CURRENT BAR — preserves the most recent state)
+
+    Output is projected back to hidden_dim so downstream heads remain unchanged.
     """
 
     def __init__(self, hidden_dim: int):
         super().__init__()
         self.attention_weights = nn.Linear(hidden_dim, 1)
+        # ? PROJECT THE 3-STATISTIC CONCAT BACK TO HIDDEN_DIM
+        self.fuse = nn.Linear(hidden_dim * 3, hidden_dim)
 
     def forward(self, sequence: torch.Tensor) -> torch.Tensor:
         """
@@ -62,12 +72,19 @@ class AttentionPool(nn.Module):
         Returns:
             pooled: [batch, hidden_dim]
         """
-        # Compute attention scores per timestep
-        scores = self.attention_weights(sequence)  # [batch, seq_len, 1]
-        weights = functional.softmax(scores, dim=1)  # [batch, seq_len, 1]
-        # Weighted sum over temporal dimension
-        pooled = (weights * sequence).sum(dim=1)  # [batch, hidden_dim]
-        return pooled
+        # ? ATTENTION-WEIGHTED SUM — learned focus
+        scores = self.attention_weights(sequence)
+        weights = functional.softmax(scores, dim=1)
+        attn_pooled = (weights * sequence).sum(dim=1)
+
+        # ? MEAN POOLING — guaranteed full-window coverage
+        mean_pooled = sequence.mean(dim=1)
+
+        # ? LAST TIMESTEP — preserves immediate state
+        last_pooled = sequence[:, -1, :]
+
+        fused = torch.cat([attn_pooled, mean_pooled, last_pooled], dim=-1)
+        return self.fuse(fused)
 
 
 class MultiHeadTradingModel(nn.Module):
@@ -180,6 +197,20 @@ class MultiHeadTradingModel(nn.Module):
         }
 
 
+def direction_logits_to_probabilities(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Apply inference softmax temperature (config.strategy.INFERENCE_DIRECTION_TEMPERATURE).
+
+    Raw 3-class logits are often too flat; max softmax stays below confidence gates (e.g. 0.60)
+    on almost every row. Dividing logits by T<1 before softmax sharpens the distribution so
+    gates match real trading-filter semantics. Training loss still uses raw logits.
+    """
+    temperature = float(config.strategy.INFERENCE_DIRECTION_TEMPERATURE)
+    if temperature > 1e-6 and abs(temperature - 1.0) > 1e-6:
+        logits = logits / temperature
+    return functional.softmax(logits, dim=1)
+
+
 class FocalLoss(nn.Module):
     """
     Focal Loss (Lin et al., 2017) — down-weights easy examples to focus on hard ones.
@@ -227,12 +258,44 @@ class FocalLoss(nn.Module):
         # Focal modulation: (1 - p_correct)^gamma
         focal_weight = (1.0 - target_probs) ** self.gamma
 
+        # ? DIRECTIONAL PENALTY (HARDENED)
+        # ? IF TARGET IS BUY(0) AND WE PREDICT SELL(2), OR VICE VERSA, APPLY A 4.0X PENALTY.
+        # ? PREVIOUS 2.5X WAS NOT ENOUGH — CONFUSION MATRIX SHOWED 41% FLIP RATE.
+        # ? WE ALSO ADD A SOFT-PROBABILITY OPPOSITE PENALTY SO THE MODEL IS PUNISHED
+        # ? PROPORTIONALLY TO HOW CONFIDENT THE WRONG DIRECTIONAL PROB IS.
+        pred_labels = torch.argmax(logits, dim=1)
+        is_opposite = ((targets == 0) & (pred_labels == 2)) | ((targets == 2) & (pred_labels == 0))
+        directional_multiplier = torch.ones_like(focal_weight)
+        directional_multiplier[is_opposite] = 4.0
+
+        # ? SOFT OPPOSITE-PROBABILITY PENALTY — DIFFERENTIABLE COMPONENT
+        # ? FOR LONG TARGETS, PENALIZE PROB OF SELL; FOR SHORT TARGETS, PENALIZE PROB OF LONG.
+        opposite_prob = torch.zeros_like(target_probs)
+        long_mask = (targets == 0)
+        short_mask = (targets == 2)
+        if long_mask.any():
+            opposite_prob[long_mask] = probabilities[long_mask, 2]
+        if short_mask.any():
+            opposite_prob[short_mask] = probabilities[short_mask, 0]
+        # ? ADDED AS A DIFFERENTIABLE FACTOR (1 + 2 * P_OPPOSITE) — SCALES WITH WRONG CONFIDENCE
+        directional_multiplier = directional_multiplier * (1.0 + 2.0 * opposite_prob)
+
+        # ? TRUE LABEL IS NEUTRAL BUT MODEL OUTPUTS LONG OR SHORT — MAIN DRIVER OF LOW BUY/SELL PRECISION
+        false_trade_signal_on_neutral = (targets == 1) & (pred_labels != 1)
+        neutral_violation_scale = float(config.training.FOCAL_NEUTRAL_VIOLATION_SCALE)
+        if neutral_violation_scale > 1.0:
+            directional_multiplier = torch.where(
+                false_trade_signal_on_neutral,
+                directional_multiplier * neutral_violation_scale,
+                directional_multiplier,
+            )
+
         # Per-class alpha weighting (optional)
         if self.alpha is not None:
             alpha_weight = self.alpha.gather(0, targets)
             focal_weight = focal_weight * alpha_weight
 
-        focal_loss = focal_weight * ce_loss
+        focal_loss = focal_weight * ce_loss * directional_multiplier
 
         if self.reduction == "mean":
             return focal_loss.mean()
@@ -262,11 +325,14 @@ class TradingLoss(nn.Module):
     def __init__(self, alpha: float = 1.0, beta: float = 0.3, gamma: float = 0.05,
                  class_weights: torch.Tensor | None = None,
                  focal_gamma: float = 2.0,
-                 use_focal: bool = True):
+                 use_focal: bool = True,
+                 consistency_weight: float = 0.10):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        # ? CONSISTENCY WEIGHT — STRENGTH OF THE SIGNAL/SIZING SYNC TERM (NEW)
+        self.consistency_weight = consistency_weight
 
         if use_focal:
             self.direction_loss = FocalLoss(gamma=focal_gamma, alpha=class_weights)
@@ -322,10 +388,21 @@ class TradingLoss(nn.Module):
         # Clamp per-sample before mean to prevent any single bad sample from exploding loss
         pnl_effect = per_sample_pnl_effect.clamp(-1.0, 1.0).mean()
 
+        # ? CONSISTENCY LOSS — IF SIGNAL HEAD IS UNCERTAIN (HIGH NEUTRAL PROB),
+        # ? SIZING HEAD SHOULD PROPOSE SMALL POSITIONS, AND VICE VERSA.
+        # ? FORMULATION: ENCOURAGE PRED_QTY ≈ DIRECTIONAL_EDGE.
+        # ? DIRECTIONAL_EDGE = MAX(P_LONG, P_SHORT) - P_NEUTRAL ∈ [-1, 1].
+        with_softmax = functional.softmax(signal_logits, dim=1)
+        directional_edge = torch.maximum(with_softmax[:, 0], with_softmax[:, 2]) - with_softmax[:, 1]
+        # ? CLAMP TO [0, 1] AND USE AS THE SIZING TARGET (DIFFERENTIABLE)
+        target_qty_from_signal = directional_edge.clamp(0.0, 1.0)
+        consistency_loss = self.mse(sizing_out[:, 0], target_qty_from_signal.detach())
+
         total = (
             self.alpha * signal_loss
             + self.beta * sizing_loss
             + self.gamma * pnl_effect
+            + self.consistency_weight * consistency_loss
         )
 
         return {
@@ -333,4 +410,5 @@ class TradingLoss(nn.Module):
             "signal_loss": signal_loss,
             "sizing_loss": sizing_loss,
             "pnl_effect": pnl_effect,
+            "consistency_loss": consistency_loss,
         }

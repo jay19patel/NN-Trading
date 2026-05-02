@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
+import contextlib
 import logging
+import os
+import sys
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -15,8 +18,63 @@ from ui_utils import console
 from rich.live import Live
 from rich.table import Table
 
-from models import MultiHeadTradingModel, TradingLoss
+from models import MultiHeadTradingModel, TradingLoss, direction_logits_to_probabilities
 from evaluation_metrics import evaluate_model_on_split
+
+
+def _configure_backends_for_device(device: torch.device) -> None:
+    """Best-effort MatMul / cuDNN settings for faster training (no label changes)."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        if getattr(config.training, "CUDA_MATMUL_TF32", True):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        if getattr(config.training, "CUDNN_BENCHMARK", True):
+            torch.backends.cudnn.benchmark = True
+
+
+def _dataloader_worker_count(device: torch.device) -> int:
+    configured = getattr(config.training, "DATALOADER_NUM_WORKERS", -1)
+    if configured is not None and configured >= 0:
+        return int(configured)
+    if device.type == "mps" or sys.platform == "darwin":
+        return 0
+    if device.type == "cuda":
+        return min(8, max(2, (os.cpu_count() or 4) // 2))
+    return 0
+
+
+def _dataloader_pin_memory(device: torch.device) -> bool:
+    return device.type == "cuda"
+
+
+@contextlib.contextmanager
+def _training_autocast(device: torch.device):
+    """
+    Mixed precision where it is safe.
+
+    MPS + autocast(fp16) mixes fp16 logits with fp32 loss buffers (class weights,
+    CE internals) and triggers MetalGraph failures:
+      mps.subtract(f16, f32) — same element type required.
+    So we run full FP32 on MPS; CUDA still uses fp16 autocast.
+    """
+    if device.type == "cuda":
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            yield
+    else:
+        yield
+
+
+def _maybe_torch_compile(model: nn.Module, device: torch.device) -> nn.Module:
+    if not getattr(config.training, "USE_TORCH_COMPILE", False):
+        return model
+    if device.type == "mps":
+        logger.info("torch.compile skipped on MPS (often unsupported or slower)")
+        return model
+    try:
+        return torch.compile(model, mode="default")  # type: ignore[assignment]
+    except Exception as exc:
+        logger.warning("torch.compile failed (%s); continuing without compile", exc)
+        return model
 
 
 class TradingDataset(torch.utils.data.Dataset):
@@ -26,10 +84,15 @@ class TradingDataset(torch.utils.data.Dataset):
     float_target_tensors: dict[str, torch.Tensor]
 
     def __init__(self, feature_windows: np.ndarray, task_targets: dict[str, np.ndarray]):
-        self.feature_windows = torch.FloatTensor(feature_windows)
-        self.direction_targets = torch.LongTensor(task_targets["direction"])
+        # ? ZERO-COPY FROM NUMPY WHEN CONTIGUOUS FLOAT32 — HUGE VS FloatTensor(COPY)
+        feature_contiguous = np.ascontiguousarray(feature_windows, dtype=np.float32)
+        self.feature_windows = torch.from_numpy(feature_contiguous)
+        direction_arr = np.ascontiguousarray(task_targets["direction"].astype(np.int64))
+        self.direction_targets = torch.from_numpy(direction_arr)
         self.float_target_tensors = {
-            target_name: torch.FloatTensor(task_targets[target_name])
+            target_name: torch.from_numpy(
+                np.ascontiguousarray(task_targets[target_name], dtype=np.float32)
+            )
             for target_name in task_targets.keys()
             if target_name != "direction"
         }
@@ -52,21 +115,47 @@ def create_sequences(
     sequence_length: int = 32,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
-    Build sliding windows and use the last bar inside each window as the target row.
-
-    For each end_index in [sequence_length, len), appends
-    X[end_index-sequence_length:end_index] and y[end_index-1].
+    Build sliding windows efficiently using NumPy stride tricks.
+    
+    VECTORIZED via numpy.lib.stride_tricks.sliding_window_view — O(1) memory view
+    creation instead of a Python loop over ~70k rows.
     """
-    window_list: List[np.ndarray] = []
-    target_sequences: Dict[str, List] = {key: [] for key in task_targets.keys()}
+    n_rows, n_feat = feature_matrix.shape
+    if n_rows <= sequence_length:
+        empty_x = np.empty((0, sequence_length, n_feat), dtype=np.float32)
+        empty_y: Dict[str, np.ndarray] = {}
+        for key in task_targets.keys():
+            dtype = np.int64 if key == "direction" else np.float32
+            empty_y[key] = np.empty((0,), dtype=dtype)
+        return empty_x, empty_y
 
-    for end_index in range(sequence_length, len(feature_matrix)):
-        window_list.append(feature_matrix[end_index - sequence_length : end_index])
-        for target_name in task_targets.keys():
-            target_sequences[target_name].append(task_targets[target_name][end_index - 1])
-
-    stacked_windows = np.stack(window_list, axis=0)
-    stacked_targets = {key: np.asarray(values) for key, values in target_sequences.items()}
+    # Sliding window view: [N-W+1, W, n_feat]
+    # We use ascontiguousarray to ensure stride tricks work optimally
+    windows = np.lib.stride_tricks.sliding_window_view(
+        np.ascontiguousarray(feature_matrix, dtype=np.float32), 
+        (sequence_length, n_feat)
+    ).squeeze(1)
+    
+    # The original loop logic:
+    # for end_index in range(sequence_length, len(feature_matrix)):
+    #   window = feature_matrix[end_index - sequence_length : end_index]
+    #   target = task_targets[end_index - 1]
+    #
+    # This means for range(48, 1000):
+    # - first window: 0:48, target: 47
+    # - last window: 951:999, target: 998
+    # Total windows: 1000 - 48 = 952.
+    # sliding_window_view(1000) with window 48 gives 1000 - 48 + 1 = 953 windows.
+    # So we drop the last window to match legacy behavior.
+    
+    stacked_windows = windows[:-1]
+    target_slice = slice(sequence_length - 1, n_rows - 1)
+    
+    stacked_targets: Dict[str, np.ndarray] = {}
+    for key in task_targets.keys():
+        dtype = np.int64 if key == "direction" else np.float32
+        stacked_targets[key] = np.asarray(task_targets[key][target_slice], dtype=dtype)
+        
     return stacked_windows, stacked_targets
 
 
@@ -131,6 +220,24 @@ def get_feature_cols(dataframe: pd.DataFrame) -> List[str]:
 def sanitize_partition(frame: pd.DataFrame) -> pd.DataFrame:
     """Clean a split without backward-filling future values into earlier rows."""
     return frame.copy().replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+
+
+def drop_lookahead_boundary(frame: pd.DataFrame, lookahead_bars: int) -> pd.DataFrame:
+    """
+    Remove the last `lookahead_bars` rows of a partition.
+
+    ? CRITICAL LEAKAGE FIX:
+    ? add_risk_reward_features and add_oracle_target_labels look up to LOOKAHEAD_BARS bars
+    ? into the FUTURE of every row to compute upside_pct/downside_pct/direction_label.
+    ? If we slice train|val|test on the raw frame WITHOUT trimming, the last `lookahead_bars`
+    ? rows of the train slice have labels computed from val data, and the last `lookahead_bars`
+    ? rows of val have labels computed from test data. That is a direct future-data leak
+    ? into supervised training.
+    ? This helper trims the boundary and is now applied per partition before scaling.
+    """
+    if lookahead_bars <= 0 or len(frame) <= lookahead_bars:
+        return frame.copy()
+    return frame.iloc[: -lookahead_bars].copy()
 
 
 def build_target_arrays(dataframe: pd.DataFrame) -> Dict[str, np.ndarray]:
@@ -207,15 +314,28 @@ def prepare_multi_symbol_data(
     validation_frames: Dict[str, pd.DataFrame] = {}
     test_frames: Dict[str, pd.DataFrame] = {}
 
+    # ? LEAKAGE-SAFE BOUNDARY TRIMMING:
+    # ? THE LAST `LOOKAHEAD_BARS` ROWS OF TRAIN AND VAL ARE LABELED USING FUTURE VALIDATION/TEST
+    # ? PRICES BY add_oracle_target_labels. WE DROP THEM TO ELIMINATE BOUNDARY LEAKAGE.
+    lookahead_bars = config.features.LOOKAHEAD_BARS
+
     train_feature_pool: List[pd.DataFrame] = []
     for symbol, raw_frame in symbol_dataframes.items():
         train_slice = raw_frame.iloc[: -(val_row_count + test_row_count)]
         val_slice = raw_frame.iloc[-(val_row_count + test_row_count) : -test_row_count]
         test_slice = raw_frame.iloc[-test_row_count:]
+        # ? TRIM TRAIN AND VAL BOUNDARY (TEST DOES NOT NEED TRIMMING — WE ONLY EVALUATE,
+        # ? AND THE LABELS OF THE LAST FEW ROWS ARE NEUTRAL DUE TO OUT-OF-RANGE LOOKAHEAD).
+        train_slice = drop_lookahead_boundary(train_slice, lookahead_bars)
+        val_slice = drop_lookahead_boundary(val_slice, lookahead_bars)
         train_frames[symbol] = sanitize_partition(train_slice)
         validation_frames[symbol] = sanitize_partition(val_slice)
         test_frames[symbol] = sanitize_partition(test_slice)
         train_feature_pool.append(train_frames[symbol][feature_columns])
+
+    console.print(
+        f"[info]Boundary leakage fix: dropped last {lookahead_bars} rows from each train and val partition[/info]"
+    )
 
     global_train_feature_frame = pd.concat(train_feature_pool, axis=0)
     scaler = StandardScaler()
@@ -265,12 +385,6 @@ def prepare_multi_symbol_data(
     train_target_parts: Dict[str, List[np.ndarray]] = {name: [] for name in build_target_arrays(first_frame)}
     val_target_parts: Dict[str, List[np.ndarray]] = {name: [] for name in train_target_parts}
     test_target_parts: Dict[str, List[np.ndarray]] = {name: [] for name in train_target_parts}
-
-    # Use per-symbol scaling to handle different price magnitudes (BTC vs ETH)
-    # We still keep one global scaler for the final model (fit on first symbol as a proxy, 
-    # but the real normalization happens per-symbol below)
-    global_scaler = StandardScaler()
-    global_scaler.fit(global_train_pruned)
 
     for symbol in symbol_dataframes:
         # Fit scaler on THIS symbol's training data only
@@ -333,11 +447,37 @@ def train_model(
     epochs: int = 50,
 ) -> Tuple[MultiHeadTradingModel, Dict[str, float]]:
     """Train with optional validation early stopping; report held-out test metrics once at the end."""
+    _configure_backends_for_device(device)
+
     model = MultiHeadTradingModel(input_dim=input_dim).to(device)
+    model = _maybe_torch_compile(model, device)
     parameter_count = count_trainable_parameters(model)
     console.print(
         f"[info]Model: inputs={input_dim}, parameters={parameter_count:,}, device={device}[/info]"
     )
+
+    eval_chunk = getattr(config.training, "EVAL_CHUNK_SIZE", 4096)
+    num_workers = _dataloader_worker_count(device)
+    pin_memory = _dataloader_pin_memory(device)
+    console.print(
+        f"[info]Throughput: dataloader_workers={num_workers}, pin_memory={pin_memory}, "
+        f"eval_chunk={eval_chunk}, autocast={'fp16 (cuda only)' if device.type == 'cuda' else 'off (fp32 on mps/cpu)'}[/info]"
+    )
+
+    val_tensors_device: Optional[Dict[str, torch.Tensor]] = None
+    if val_features is not None and val_targets is not None:
+        # ? HOIST VAL DATA TO GPU ONCE — AVOID RE-COPYING EVERY EPOCH (100× SPEEDUP ON THAT PATH)
+        val_tensors_device = {
+            "X": torch.as_tensor(val_features, dtype=torch.float32, device=device),
+            "direction": torch.as_tensor(val_targets["direction"].astype(np.int64), dtype=torch.long, device=device),
+            "upside": torch.as_tensor(val_targets["upside"], dtype=torch.float32, device=device),
+            "downside": torch.as_tensor(val_targets["downside"], dtype=torch.float32, device=device),
+            "drawdown": torch.as_tensor(val_targets["drawdown"], dtype=torch.float32, device=device),
+            "take_profit_pct": torch.as_tensor(val_targets["take_profit_pct"], dtype=torch.float32, device=device),
+            "stop_loss_pct": torch.as_tensor(val_targets["stop_loss_pct"], dtype=torch.float32, device=device),
+            "actual_pnl_pct": torch.as_tensor(val_targets["actual_pnl_pct"], dtype=torch.float32, device=device),
+            "qty_ratio": torch.as_tensor(val_targets["qty_ratio"], dtype=torch.float32, device=device),
+        }
 
     # Compute class weights from actual label distribution instead of WeightedSampler.
     # WeightedSampler causes train/val distribution mismatch (val < train loss at epoch 1)
@@ -352,9 +492,17 @@ def train_model(
         config.training.MIN_CLASS_WEIGHT,
         config.training.MAX_CLASS_WEIGHT,
     )
+    class_weights_np[0] *= config.training.CLASS_WEIGHT_DIRECTIONAL_SCALE
+    class_weights_np[2] *= config.training.CLASS_WEIGHT_DIRECTIONAL_SCALE
+    class_weights_np[1] *= config.training.CLASS_WEIGHT_NEUTRAL_SCALE
+    class_weights_np = np.clip(
+        class_weights_np,
+        config.training.MIN_CLASS_WEIGHT,
+        config.training.MAX_CLASS_WEIGHT,
+    )
     class_weight_tensor = torch.FloatTensor(class_weights_np).to(device)
     console.print(
-        f"[info]Class weights: LONG={class_weights_np[0]:.2f}, "
+        f"[info]Class weights (precision-tuned): LONG={class_weights_np[0]:.2f}, "
         f"NEUTRAL={class_weights_np[1]:.2f}, SHORT={class_weights_np[2]:.2f}[/info]"
     )
 
@@ -366,6 +514,7 @@ def train_model(
         class_weights=class_weight_tensor,
         focal_gamma=config.training.FOCAL_GAMMA,
         use_focal=config.training.USE_FOCAL_LOSS,
+        consistency_weight=config.training.LOSS_CONSISTENCY,
     ).to(device)
     console.print(f"[info]Loss: {'FocalLoss(γ=' + str(config.training.FOCAL_GAMMA) + ')' if config.training.USE_FOCAL_LOSS else 'CrossEntropy'}[/info]")
 
@@ -376,16 +525,16 @@ def train_model(
     )
 
     train_dataset = TradingDataset(train_features, train_targets)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.training.BATCH_SIZE,
-        shuffle=True,
-        drop_last=False,
-        # num_workers=0 is correct for MPS — macOS multiprocessing with GPU is unreliable
-        # pin_memory=False for MPS — only helps CUDA, wastes memory on Apple Silicon
-        num_workers=0,
-        pin_memory=False,
-    )
+    loader_kwargs: Dict[str, object] = {
+        "batch_size": config.training.BATCH_SIZE,
+        "shuffle": True,
+        "drop_last": False,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0 and getattr(config.training, "DATALOADER_PERSISTENT_WORKERS", True):
+        loader_kwargs["persistent_workers"] = True
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
 
     # OneCycleLR: linear warmup (10%) + cosine annealing. Much more stable than ReduceLROnPlateau.
     # ReduceLROnPlateau was reducing LR too late to prevent the val loss spike at epoch 2.
@@ -401,8 +550,11 @@ def train_model(
     )
 
     best_val_loss = float("inf")
+    best_composite_score = float("-inf")
     best_state: Optional[Dict] = None
     patience_left = config.training.EARLY_STOP_PATIENCE
+    plateau_strikes = 0
+    plateau_threshold = 5
     training_history: List[Dict[str, float | int | str]] = []
 
     metrics_table = Table(show_header=True, header_style="bold magenta", border_style="bright_black")
@@ -419,13 +571,16 @@ def train_model(
             # Accumulate loss as GPU tensor — avoid .item() per batch (each .item() = GPU-CPU sync)
             running_loss_tensor = torch.tensor(0.0, device=device)
             batch_count = 0
+            non_blocking = pin_memory
             for batch_features, batch_targets in train_loader:
-                batch_features = batch_features.to(device)
-                batch_targets = {name: tensor.to(device) for name, tensor in batch_targets.items()}
+                batch_features = batch_features.to(device, non_blocking=non_blocking)
+                batch_targets = {
+                    name: tensor.to(device, non_blocking=non_blocking)
+                    for name, tensor in batch_targets.items()
+                }
                 optimizer.zero_grad(set_to_none=True)
                 
-                # MPS Autocast for M4 speed boost (Mixed Precision)
-                with torch.autocast(device_type="mps" if "mps" in str(device) else "cpu", enabled=True):
+                with _training_autocast(device):
                     outputs = model(batch_features)
                     loss_dict = loss_fn(outputs, batch_targets)
                     loss = loss_dict["total"]
@@ -442,36 +597,30 @@ def train_model(
 
             val_loss_value = float("nan")
             val_direction_accuracy = float("nan")
-            if val_features is not None and val_targets is not None:
+            if val_tensors_device is not None:
                 model.eval()
                 val_loss_sum = 0.0
                 val_batches = 0
                 correct_direction = 0
                 total_direction = 0
-                with torch.no_grad():
-                    val_tensor = torch.FloatTensor(val_features).to(device)
-                    direction_actual = torch.LongTensor(val_targets["direction"]).to(device)
-                    chunk_size = 2048
-                    for start in range(0, val_tensor.size(0), chunk_size):
-                        end = min(start + chunk_size, val_tensor.size(0))
+                val_tensor = val_tensors_device["X"]
+                direction_actual = val_tensors_device["direction"]
+                with torch.inference_mode():
+                    for start in range(0, val_tensor.size(0), eval_chunk):
+                        end = min(start + eval_chunk, val_tensor.size(0))
                         batch_X = val_tensor[start:end]
                         batch_y_dir = direction_actual[start:end]
-                        val_outputs = model(batch_X)
+                        with _training_autocast(device):
+                            val_outputs = model(batch_X)
                         val_chunk_targets = {
-                            "upside": torch.FloatTensor(val_targets["upside"][start:end]).to(device),
-                            "downside": torch.FloatTensor(val_targets["downside"][start:end]).to(device),
-                            "future_drawdown": torch.FloatTensor(
-                                val_targets["drawdown"][start:end]
-                            ).to(device),
-                            "take_profit_pct": torch.FloatTensor(
-                                val_targets["take_profit_pct"][start:end]
-                            ).to(device),
-                            "stop_loss_pct": torch.FloatTensor(
-                                val_targets["stop_loss_pct"][start:end]
-                            ).to(device),
+                            "upside": val_tensors_device["upside"][start:end],
+                            "downside": val_tensors_device["downside"][start:end],
+                            "future_drawdown": val_tensors_device["drawdown"][start:end],
+                            "take_profit_pct": val_tensors_device["take_profit_pct"][start:end],
+                            "stop_loss_pct": val_tensors_device["stop_loss_pct"][start:end],
                             "direction": batch_y_dir,
-                            "actual_pnl_pct": torch.FloatTensor(val_targets["actual_pnl_pct"][start:end]).to(device),
-                            "qty_ratio": torch.FloatTensor(val_targets["qty_ratio"][start:end]).to(device),
+                            "actual_pnl_pct": val_tensors_device["actual_pnl_pct"][start:end],
+                            "qty_ratio": val_tensors_device["qty_ratio"][start:end],
                         }
                         batch_loss = loss_fn(val_outputs, val_chunk_targets)["total"]
                         val_loss_sum += batch_loss.item()
@@ -483,15 +632,39 @@ def train_model(
                 val_direction_accuracy = (correct_direction / max(total_direction, 1)) * 100.0
                 # OneCycleLR is step-based — do NOT call scheduler.step() here
 
-                if val_loss_value < best_val_loss - 1e-6:
-                    best_val_loss = val_loss_value
+                # ? COMPOSITE EARLY-STOP SCORE — REWARDS BOTH LOWER LOSS AND HIGHER DIR ACC.
+                # ? PURE VAL_LOSS PLATEAUS BEFORE DIRECTIONAL ACCURACY DOES (THE TWO ARE
+                # ? RELATED BUT NOT IDENTICAL UNDER FOCAL LOSS WITH DIRECTIONAL PENALTY).
+                composite_score = -val_loss_value + 0.01 * val_direction_accuracy
+                improved_loss = val_loss_value < best_val_loss - 1e-6
+                improved_composite = composite_score > best_composite_score + 1e-6
+
+                if improved_loss or improved_composite:
+                    if improved_loss:
+                        best_val_loss = val_loss_value
+                    if improved_composite:
+                        best_composite_score = composite_score
                     best_state = {name: tensor.cpu().clone() for name, tensor in model.state_dict().items()}
                     patience_left = config.training.EARLY_STOP_PATIENCE
+                    plateau_strikes = 0
                 else:
                     patience_left -= 1
+                    plateau_strikes += 1
+
+            # ? AUTOMATED LR DECAY ON PLATEAU — IF VAL LOSS HASN'T IMPROVED FOR
+            # ? `plateau_threshold` EPOCHS, MANUALLY DAMPEN THE OPTIMIZER LR TO 0.5X.
+            # ? ONECYCLELR ALONE CAN'T REACT TO PLATEAUS; THIS GIVES IT A SECOND CHANCE.
+            if plateau_strikes >= plateau_threshold and val_tensors_device is not None:
+                for pg in optimizer.param_groups:
+                    pg["lr"] = max(pg["lr"] * 0.5, config.training.LEARNING_RATE * 0.01)
+                console.print(
+                    f"[warning]Plateau detected — LR dampened to "
+                    f"{optimizer.param_groups[0]['lr']:.2e}[/warning]"
+                )
+                plateau_strikes = 0
 
             status = "Phase 1"
-            if patience_left <= 0 and val_features is not None:
+            if patience_left <= 0 and val_tensors_device is not None:
                 status = "early-stop"
             training_history.append(
                 {
@@ -505,13 +678,13 @@ def train_model(
             metrics_table.add_row(
                 f"{epoch + 1}/{epochs}",
                 f"{average_train_loss:.5f}",
-                f"{val_loss_value:.5f}" if val_features is not None else "—",
-                f"{val_direction_accuracy:.1f}%" if val_features is not None else "—",
+                f"{val_loss_value:.5f}" if val_tensors_device is not None else "—",
+                f"{val_direction_accuracy:.1f}%" if val_tensors_device is not None else "—",
                 "—",  # PnL Effect is Phase 2 only
                 status,
             )
 
-            if val_features is not None and patience_left <= 0:
+            if val_tensors_device is not None and patience_left <= 0:
                 break
 
     if best_state is not None:
@@ -539,6 +712,7 @@ def train_model(
             class_weights=class_weight_tensor,
             focal_gamma=config.training.FOCAL_GAMMA,
             use_focal=config.training.USE_FOCAL_LOSS,
+            consistency_weight=config.training.LOSS_CONSISTENCY,
         ).to(device)
 
         rl_optimizer = torch.optim.AdamW(
@@ -558,12 +732,16 @@ def train_model(
                 running_loss_tensor = torch.tensor(0.0, device=device)
                 running_pnl_tensor = torch.tensor(0.0, device=device)
                 batch_count = 0
+                non_blocking = pin_memory
                 for batch_features, batch_targets in train_loader:
-                    batch_features = batch_features.to(device)
-                    batch_targets = {name: tensor.to(device) for name, tensor in batch_targets.items()}
+                    batch_features = batch_features.to(device, non_blocking=non_blocking)
+                    batch_targets = {
+                        name: tensor.to(device, non_blocking=non_blocking)
+                        for name, tensor in batch_targets.items()
+                    }
                     rl_optimizer.zero_grad(set_to_none=True)
 
-                    with torch.autocast(device_type="mps" if "mps" in str(device) else "cpu", enabled=True):
+                    with _training_autocast(device):
                         outputs = model(batch_features)
                         loss_dict = rl_loss_fn(outputs, batch_targets)
                         loss = loss_dict["total"]
@@ -580,30 +758,30 @@ def train_model(
 
                 val_loss_value = float("nan")
                 val_direction_accuracy = float("nan")
-                if val_features is not None and val_targets is not None:
+                if val_tensors_device is not None:
                     model.eval()
                     val_loss_sum = 0.0
                     val_batches = 0
                     correct_direction = 0
                     total_direction = 0
-                    with torch.no_grad():
-                        val_tensor = torch.FloatTensor(val_features).to(device)
-                        direction_actual = torch.LongTensor(val_targets["direction"]).to(device)
-                        chunk_size = 2048
-                        for start in range(0, val_tensor.size(0), chunk_size):
-                            end = min(start + chunk_size, val_tensor.size(0))
+                    val_tensor = val_tensors_device["X"]
+                    direction_actual = val_tensors_device["direction"]
+                    with torch.inference_mode():
+                        for start in range(0, val_tensor.size(0), eval_chunk):
+                            end = min(start + eval_chunk, val_tensor.size(0))
                             batch_X = val_tensor[start:end]
                             batch_y_dir = direction_actual[start:end]
-                            val_outputs = model(batch_X)
+                            with _training_autocast(device):
+                                val_outputs = model(batch_X)
                             val_chunk_targets = {
-                                "upside": torch.FloatTensor(val_targets["upside"][start:end]).to(device),
-                                "downside": torch.FloatTensor(val_targets["downside"][start:end]).to(device),
-                                "future_drawdown": torch.FloatTensor(val_targets["drawdown"][start:end]).to(device),
-                                "take_profit_pct": torch.FloatTensor(val_targets["take_profit_pct"][start:end]).to(device),
-                                "stop_loss_pct": torch.FloatTensor(val_targets["stop_loss_pct"][start:end]).to(device),
+                                "upside": val_tensors_device["upside"][start:end],
+                                "downside": val_tensors_device["downside"][start:end],
+                                "future_drawdown": val_tensors_device["drawdown"][start:end],
+                                "take_profit_pct": val_tensors_device["take_profit_pct"][start:end],
+                                "stop_loss_pct": val_tensors_device["stop_loss_pct"][start:end],
                                 "direction": batch_y_dir,
-                                "actual_pnl_pct": torch.FloatTensor(val_targets["actual_pnl_pct"][start:end]).to(device),
-                                "qty_ratio": torch.FloatTensor(val_targets["qty_ratio"][start:end]).to(device),
+                                "actual_pnl_pct": val_tensors_device["actual_pnl_pct"][start:end],
+                                "qty_ratio": val_tensors_device["qty_ratio"][start:end],
                             }
                             batch_loss = rl_loss_fn(val_outputs, val_chunk_targets)["total"]
                             val_loss_sum += batch_loss.item()
@@ -622,18 +800,18 @@ def train_model(
                         patience_left -= 1
 
                 status = "Phase 2 (RL)"
-                if patience_left <= 0 and val_features is not None:
+                if patience_left <= 0 and val_tensors_device is not None:
                     status = "early-stop ✓"
                 metrics_table.add_row(
                     f"RL {epoch + 1}/{rl_epochs}",
                     f"{average_train_loss:.5f}",
-                    f"{val_loss_value:.5f}" if val_features is not None else "—",
-                    f"{val_direction_accuracy:.1f}%" if val_features is not None else "—",
+                    f"{val_loss_value:.5f}" if val_tensors_device is not None else "—",
+                    f"{val_direction_accuracy:.1f}%" if val_tensors_device is not None else "—",
                     f"{average_pnl_effect:.4f}",
                     status,
                 )
 
-                if val_features is not None and patience_left <= 0:
+                if val_tensors_device is not None and patience_left <= 0:
                     break
 
         if rl_best_state is not None:
@@ -652,18 +830,28 @@ def train_model(
 
     # ---- Per-class confidence calibration on val set ----
     calibrated_thresholds = {0: 1.01, 2: 1.01}
-    if val_features is not None and val_targets is not None:
+    if val_tensors_device is not None and val_targets is not None:
         model.eval()
-        with torch.no_grad():
-            val_tensor_cal = torch.FloatTensor(val_features).to(device)
-            val_out = model(val_tensor_cal)
-            val_probs = torch.softmax(val_out["direction"], dim=1).cpu().numpy()
-            val_sizing = val_out["sizing"].cpu().numpy()
+        prob_parts: List[torch.Tensor] = []
+        sizing_parts: List[torch.Tensor] = []
+        with torch.inference_mode():
+            val_cal_x = val_tensors_device["X"]
+            for start in range(0, val_cal_x.size(0), eval_chunk):
+                end = min(start + eval_chunk, val_cal_x.size(0))
+                with _training_autocast(device):
+                    chunk_out = model(val_cal_x[start:end])
+                prob_parts.append(direction_logits_to_probabilities(chunk_out["direction"]).float().cpu())
+                sizing_parts.append(chunk_out["sizing"].float().cpu())
+        val_probs = torch.cat(prob_parts, dim=0).numpy()
+        val_sizing = torch.cat(sizing_parts, dim=0).numpy()
         val_true = val_targets["direction"].astype(int)
         minimum_support = max(20, int(len(val_true) * 0.01))
         predicted_tp = val_sizing[:, 1] * config.strategy.LABEL_TP_PCT_MAX
         predicted_sl = val_sizing[:, 2] * config.strategy.LABEL_SL_PCT_MAX
         directional_edge = np.maximum(val_probs[:, 0], val_probs[:, 2]) - val_probs[:, 1]
+        sorted_val_probs = np.sort(val_probs, axis=1)
+        softmax_margin = sorted_val_probs[:, -1] - sorted_val_probs[:, -2]
+        margin_floor = float(config.strategy.MIN_SOFTMAX_MARGIN)
         estimated_round_trip_cost_pct = (
             config.strategy.ROUND_TRIP_FEE_PCT
             + (2.0 * config.strategy.SLIPPAGE_PCT)
@@ -680,6 +868,7 @@ def train_model(
                     (np.argmax(val_probs, axis=1) == cls)
                     & (val_probs[:, cls] >= thresh)
                     & (directional_edge >= edge_floor)
+                    & (softmax_margin >= margin_floor)
                 )
                 total_pred = pred_mask.sum()
                 if total_pred < minimum_support:
@@ -700,14 +889,20 @@ def train_model(
                     best_prec = precision
                     best_thresh = float(thresh)
                     best_support = int(total_pred)
-            calibrated_thresholds[cls] = best_thresh
             if best_support == 0:
                 best_expectancy = 0.0
+                # ? NEVER LEAVE best_thresh AT 1.01 — SOFTMAX CONFIDENCE IS ALWAYS ≤ 1.0,
+                # ? SO ai_confidence < 1.01 FOR EVERY ROW AND ALL BUY/SELL SIGNALS BECOME NEUTRAL.
+                # ? FALL BACK TO BASE CONFIG THRESHOLD SO BACKTESTS STILL RUN (WITH CLEAR WARNING).
+                calibrated_thresholds[cls] = float(config.strategy.AI_CONFIDENCE_THRESHOLD)
                 console.print(
                     f"[warning]Calibrated {cls_name} threshold: BLOCKED "
-                    f"(no validation slice met precision/expectancy gates)[/warning]"
+                    f"(no validation slice met precision/expectancy gates). "
+                    f"Falling back to AI_CONFIDENCE_THRESHOLD={calibrated_thresholds[cls]:.2f} "
+                    f"for inference — review gates or model quality.[/warning]"
                 )
                 continue
+            calibrated_thresholds[cls] = best_thresh
             console.print(
                 f"[info]Calibrated {cls_name} threshold: {best_thresh:.2f} "
                 f"(precision={best_prec:.1%}, support={best_support}, net_expectancy={best_expectancy:.3f}%)[/info]"
@@ -726,6 +921,8 @@ def run_inference_with_confidence_filter(
     calibrated_thresholds: Dict[int, float] | None = None,
     min_directional_edge: float | None = None,
     min_reward_risk_ratio: float | None = None,
+    min_softmax_margin: float | None = None,
+    use_breakeven_confidence_gate: bool | None = None,
 ) -> pd.DataFrame:
     """Direction softmax, directional-edge gate, and volatility-aware TP/SL percentage heads."""
     model.eval()
@@ -733,7 +930,7 @@ def run_inference_with_confidence_filter(
     with torch.no_grad():
         raw_outputs = model(input_tensor)
     
-    direction_probabilities = torch.softmax(raw_outputs["direction"], dim=1)
+    direction_probabilities = direction_logits_to_probabilities(raw_outputs["direction"])
     verdict_indices = torch.argmax(direction_probabilities, dim=1).cpu().numpy()
     
     # Sigmoid sizing output decoding
@@ -781,7 +978,11 @@ def run_inference_with_confidence_filter(
         suppressed_count += int(cls_mask.sum())
         result_frame.loc[cls_mask, "ai_verdict"] = 1
     if suppressed_count > 0:
-        console.print(f"[warning]Risk Rule 1: forced neutral on {suppressed_count} low-confidence rows (per-class calibrated)[/warning]")
+        console.print(
+            f"[warning]Risk Rule 1: forced neutral on {suppressed_count} rows "
+            f"(predicted-class prob < threshold Buy={calibrated_thresholds[0]:.2f}, "
+            f"Sell={calibrated_thresholds[2]:.2f}; softmax uses inference temperature)[/warning]"
+        )
 
     directional_edge_floor = (
         config.strategy.MIN_DIRECTIONAL_EDGE
@@ -805,6 +1006,59 @@ def run_inference_with_confidence_filter(
         console.print(f"[warning]Risk Rule 2: forced neutral on {suppressed_rr} poor R:R rows (< {min_rr})[/warning]")
     result_frame.loc[poor_rr_mask, "ai_verdict"] = 1
 
+    # ? SOFTMAX MARGIN — TOP CLASS MUST CLEARLY BEAT RUNNER-UP (NOT A TIE-BREAK COIN FLIP).
+    margin_floor = (
+        config.strategy.MIN_SOFTMAX_MARGIN
+        if min_softmax_margin is None
+        else float(min_softmax_margin)
+    )
+    stacked_probs = np.stack(
+        [
+            result_frame["ai_prob_buy"].values,
+            result_frame["ai_prob_neutral"].values,
+            result_frame["ai_prob_sell"].values,
+        ],
+        axis=1,
+    )
+    sorted_row_probs = np.sort(stacked_probs, axis=1)
+    softmax_margin_arr = sorted_row_probs[:, -1] - sorted_row_probs[:, -2]
+    result_frame["ai_softmax_margin"] = softmax_margin_arr
+    margin_mask = softmax_margin_arr < margin_floor
+    suppressed_margin = int((margin_mask & (result_frame["ai_verdict"] != 1)).sum())
+    if suppressed_margin > 0:
+        console.print(
+            f"[warning]Risk Rule 3: forced neutral on {suppressed_margin} rows "
+            f"(softmax margin < {margin_floor:.2f})[/warning]"
+        )
+    result_frame.loc[margin_mask, "ai_verdict"] = 1
+
+    # ? PER-ROW BREAKEVEN WIN RATE VS ROUND-TRIP COST (FEES + SLIPPAGE ONLY FOR ENTRY GATE).
+    gate_on = (
+        config.strategy.BREAKEVEN_CONFIDENCE_GATE
+        if use_breakeven_confidence_gate is None
+        else bool(use_breakeven_confidence_gate)
+    )
+    if gate_on:
+        tp_arr = result_frame["ai_take_profit_pct"].values.astype(np.float64)
+        sl_arr = result_frame["ai_stop_loss_pct"].values.astype(np.float64)
+        leg_cost_pct = (
+            config.strategy.ROUND_TRIP_FEE_PCT + 2.0 * config.strategy.SLIPPAGE_PCT
+        )
+        denom = tp_arr + sl_arr + 1e-8
+        breakeven_p = (sl_arr + leg_cost_pct) / denom
+        buffer = float(config.strategy.BREAKEVEN_CONFIDENCE_BUFFER)
+        conf_arr = result_frame["ai_confidence"].values
+        below_be = conf_arr < (breakeven_p + buffer)
+        active_side = result_frame["ai_verdict"].values != 1
+        breakeven_mask = active_side & below_be
+        suppressed_be = int(breakeven_mask.sum())
+        if suppressed_be > 0:
+            console.print(
+                f"[warning]Risk Rule 4: forced neutral on {suppressed_be} rows "
+                f"(confidence below TP/SL implied breakeven + {buffer:.2f})[/warning]"
+            )
+        result_frame.loc[breakeven_mask, "ai_verdict"] = 1
+
     return result_frame
 
 
@@ -821,7 +1075,7 @@ def predict_model_outputs_for_single_window(
     verdict_names = ("BUY", "NEUTRAL", "SELL")
     with torch.no_grad():
         outputs = model(batch)
-    direction_probabilities = torch.softmax(outputs["direction"], dim=1)[0]
+    direction_probabilities = direction_logits_to_probabilities(outputs["direction"])[0]
     verdict_index = int(torch.argmax(direction_probabilities).item())
     
     sizing = outputs["sizing"][0]
@@ -831,12 +1085,21 @@ def predict_model_outputs_for_single_window(
     
     confidence = float(torch.max(direction_probabilities).item())
     directional_edge = float(max(direction_probabilities[0].item(), direction_probabilities[2].item()) - direction_probabilities[1].item())
-    
-    # Apply rules
+    probs_np = direction_probabilities.detach().float().cpu().numpy()
+    sorted_p = np.sort(probs_np)
+    softmax_margin = float(sorted_p[-1] - sorted_p[-2])
+
+    leg_cost_pct = config.strategy.ROUND_TRIP_FEE_PCT + 2.0 * config.strategy.SLIPPAGE_PCT
+    breakeven_p = (sl_pct + leg_cost_pct) / (tp_pct + sl_pct + 1e-8)
+    below_breakeven = confidence < (breakeven_p + config.strategy.BREAKEVEN_CONFIDENCE_BUFFER)
+
+    # Apply rules (match run_inference_with_confidence_filter; per-class calibrator not available here)
     if (
         confidence < config.strategy.AI_CONFIDENCE_THRESHOLD
         or directional_edge < config.strategy.MIN_DIRECTIONAL_EDGE
         or (tp_pct / (sl_pct + 1e-6)) < config.strategy.MIN_REWARD_RISK_RATIO
+        or softmax_margin < config.strategy.MIN_SOFTMAX_MARGIN
+        or (config.strategy.BREAKEVEN_CONFIDENCE_GATE and below_breakeven)
     ):
         verdict_index = 1
     

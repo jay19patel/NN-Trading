@@ -31,9 +31,11 @@ from diagnostics import (
     save_confusion_matrix_chart,
     save_diagnostic_summary,
     save_equity_curve_chart,
+    save_feature_group_importance_chart,
     save_feature_relevance_chart,
     save_metrics_bar_chart,
     save_signal_distribution_chart,
+    save_trade_length_vs_pnl_chart,
     save_trade_pnl_chart,
     save_training_history_chart,
 )
@@ -312,6 +314,21 @@ def main() -> None:
             symbol_predictions["ai_stop_loss_pct"].values * config.strategy.EXECUTION_SL_SCALE
         )
 
+        # ? PER-BAR SYMBOL SENTIMENT — INSIGHT ENGINE
+        # ? RANGE [-1, +1]: NEGATIVE = BEARISH, NEAR ZERO = NEUTRAL, POSITIVE = BULLISH.
+        # ? STORED ON THE PANEL FOR DOWNSTREAM CHARTS / OPTIONAL LIVE LOGGING.
+        symbol_panel["ai_sentiment"] = (
+            symbol_predictions["ai_prob_buy"].values
+            - symbol_predictions["ai_prob_sell"].values
+        )
+        sentiment_mean = float(symbol_panel["ai_sentiment"].mean())
+        sentiment_std = float(symbol_panel["ai_sentiment"].std())
+        sentiment_pos = float((symbol_panel["ai_sentiment"] > 0).mean() * 100.0)
+        console.print(
+            f"[info]{symbol} sentiment: mean={sentiment_mean:+.3f}  std={sentiment_std:.3f}  "
+            f"bullish bars={sentiment_pos:.1f}%[/info]"
+        )
+
         # Skip evaluate_ai_verdicts as run_paper_portfolio_on_signals now handles path simulation sequentially
         # symbol_panel = evaluate_ai_verdicts(symbol_panel, lookahead_bars=config.features.LOOKAHEAD_BARS)
 
@@ -448,6 +465,8 @@ def main() -> None:
             calibrated_thresholds={0: 0.40, 2: 0.40},
             min_directional_edge=0.03,
             min_reward_risk_ratio=1.20,
+            min_softmax_margin=0.04,
+            use_breakeven_confidence_gate=False,
         )
 
         diagnostic_table = Table(
@@ -587,6 +606,16 @@ def main() -> None:
         diagnostics_dir,
     )
     chart_paths.append(feature_relevance_png)
+    # ? NEW DIAGNOSTICS — TRADE LENGTH vs PNL AND FEATURE GROUP IMPORTANCE
+    chart_paths.append(
+        save_trade_length_vs_pnl_chart(
+            all_trade_records, diagnostics_dir, "strict_trade_length_vs_pnl.png"
+        )
+    )
+    if feature_relevance_csv:
+        chart_paths.append(
+            save_feature_group_importance_chart(feature_relevance_csv, diagnostics_dir)
+        )
     if diagnostic_equity_curves:
         chart_paths.append(
             save_equity_curve_chart(
@@ -600,6 +629,13 @@ def main() -> None:
                 diagnostic_trade_records,
                 diagnostics_dir,
                 "relaxed_diagnostic_trade_pnl.png",
+            )
+        )
+        chart_paths.append(
+            save_trade_length_vs_pnl_chart(
+                diagnostic_trade_records,
+                diagnostics_dir,
+                "relaxed_diagnostic_trade_length_vs_pnl.png",
             )
         )
 
