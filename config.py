@@ -66,6 +66,7 @@ class TrainingConfig:
     EPOCHS: int = 50
     LR: float = 0.0005
     FOCAL_NEUTRAL_VIOLATION_SCALE: float = 2.0
+    TRAINING_DATA_DAYS: int = 365
     
 @dataclass
 class TradingConfig:

@@ -44,7 +44,7 @@ def run_strategy_backtest(strategy, all_candles):
 
 def ensure_model_trained():
     """Checks if the Short NN model exists, if not, runs training."""
-    model_path = "results/models/short_model_eth.pth"
+    model_path = "models/short_model_eth.pth"
     if not os.path.exists(model_path):
         console.rule("[bold yellow]TRAINING SHORT-ONLY MODEL")
         console.print("[info]Model not found. Initializing auto-training sequence...[/info]")
@@ -68,9 +68,9 @@ def main():
     
     # 2. Run different strategies
     # Load model-based strategies here so they can find the files we just trained
-    model_path = "results/models/short_model_eth.pth"
-    mean_path = "results/models/scaler_mean.npy"
-    scale_path = "results/models/scaler_scale.npy"
+    model_path = "models/short_model_eth.pth"
+    mean_path = "models/scaler_mean.npy"
+    scale_path = "models/scaler_scale.npy"
     
     strategies_to_run = [
         OracleStrategy(),

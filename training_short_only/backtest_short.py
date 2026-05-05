@@ -13,19 +13,20 @@ from ui_utils import console
 
 def run_short_backtest():
     symbol = config.data.SYMBOLS[0]
-    days = 30  # Backtest on the last 30 days of the year
+    days = config.data.TOTAL_DAYS
     interval = config.data.INTERVAL
     
     # 1. Fetch Data
+    console.print(f"[info]Fetching last {days} days for testing (unseen data)...[/info]")
     df = fetch_data(symbol, days, interval)
     if df.empty:
         console.print("[error]No data for backtest.[/error]")
         return
         
     # 2. Initialize Strategy
-    model_path = "results/models/short_model_eth.pth"
-    mean_path = "results/models/scaler_mean.npy"
-    scale_path = "results/models/scaler_scale.npy"
+    model_path = "models/short_model_eth.pth"
+    mean_path = "models/scaler_mean.npy"
+    scale_path = "models/scaler_scale.npy"
     
     if not os.path.exists(model_path):
         console.print("[error]Model not found. Run training first.[/error]")

@@ -12,6 +12,26 @@ def fetch_data(symbol: str = "ADAUSD", total_days: int = 100, interval: str = "1
     os.makedirs(data_dir, exist_ok=True)
     filename = os.path.join(data_dir, f"data_{symbol}_{interval}.csv")
 
+    # Caching Logic
+    if os.path.exists(filename):
+        try:
+            df_cached = pd.read_csv(filename, index_col=0, parse_dates=True)
+            if not df_cached.empty:
+                last_ts = df_cached.index[-1]
+                first_ts = df_cached.index[0]
+                now = datetime.now(last_ts.tzinfo)
+                
+                # If we have enough data (start_date is within our cache)
+                start_date_needed = now - timedelta(days=total_days)
+                if first_ts <= start_date_needed and (now - last_ts).total_seconds() < 3600:
+                    console.print(f"[success]✅ Using cached data for {symbol} ({len(df_cached)} bars)[/success]")
+                    return df_cached.sort_index()
+                
+                # Otherwise, we might just need to update it
+                console.print(f"[info]Cache for {symbol} is stale or insufficient. Updating...[/info]")
+        except Exception as e:
+            console.print(f"[warning]Failed to load cache: {e}. Fetching fresh...[/warning]")
+
     console.print(f"[info]Fetching fresh data from API for [bold]{symbol}[/bold]...[/info]")
 
     api_url = "https://api.india.delta.exchange/v2/history/candles"
