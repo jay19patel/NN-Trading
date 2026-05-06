@@ -3,21 +3,32 @@ import pandas as pd
 import numpy as np
 import torch
 import os
+import json
 from config import config
 from strategies.base import BaseStrategy
 from training_short_only.model import MultiHeadTradingModel
 from training_short_only.feature_utils import add_technical_indicators, get_feature_columns
 
 class ShortNNStrategy(BaseStrategy):
-    def __init__(self, model_path: str, scaler_mean_path: str, scaler_scale_path: str):
+    def __init__(self, model_path: str, scaler_mean_path: str, scaler_scale_path: str, threshold_path: str | None = None):
         self.feature_cols = get_feature_columns()
         self.input_dim = len(self.feature_cols)
         self.window_size = config.model.WINDOW_SIZE
+        self.short_threshold = config.strategy.AI_CONFIDENCE_THRESHOLD
+        if threshold_path and os.path.exists(threshold_path):
+            with open(threshold_path, "r", encoding="utf-8") as f:
+                self.short_threshold = float(json.load(f).get("short_probability_threshold", self.short_threshold))
         
         # Load model
         self.model = MultiHeadTradingModel(input_dim=self.input_dim)
         if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
+            try:
+                self.model.load_state_dict(torch.load(model_path, map_location="cpu", weights_only=True))
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Saved model is incompatible with the current feature/model schema. "
+                    "Retrain with training_short_only/train.py to regenerate the checkpoint and scaler."
+                ) from exc
         self.model.eval()
         
         # Load scaler params
@@ -48,6 +59,7 @@ class ShortNNStrategy(BaseStrategy):
         df['ai_stop_loss_pct'] = 0.5
         df['ai_qty_ratio'] = 0.0
         df['ai_directional_edge'] = 0.0
+        df['ai_expected_return_pct'] = 0.0
 
         # We need at least window_size bars to make a prediction
         if n < self.window_size:
@@ -77,17 +89,33 @@ class ShortNNStrategy(BaseStrategy):
                         # Short probability is at index 2
                         p_short = probs[j, 2]
                         p_neutral = probs[j, 1]
+                        directional_edge = p_short - p_neutral
+
+                        raw_qty = float(sizing[j, 0].item())
+                        raw_tp_pct = float(sizing[j, 1].item()) * config.strategy.ORACLE_MAX_TP_PCT
+                        raw_sl_pct = float(sizing[j, 2].item()) * config.strategy.ORACLE_MAX_SL_PCT
+                        tp_pct = float(np.clip(raw_tp_pct, config.strategy.ORACLE_MIN_TP_PCT, config.strategy.ORACLE_MAX_TP_PCT))
+                        sl_pct = float(np.clip(raw_sl_pct, config.strategy.ORACLE_MIN_SL_PCT, config.strategy.ORACLE_MAX_SL_PCT))
+                        if tp_pct / max(sl_pct, 1e-9) < config.strategy.MIN_REWARD_RISK_RATIO:
+                            tp_pct = min(config.strategy.ORACLE_MAX_TP_PCT, sl_pct * config.strategy.MIN_REWARD_RISK_RATIO)
+                        expected_return_pct = (p_short * tp_pct) - ((1.0 - p_short) * sl_pct) - (
+                            config.strategy.ROUND_TRIP_FEE_PCT + 2.0 * config.strategy.SLIPPAGE_PCT
+                        )
                         
-                        # Set verdict based on Short probability threshold (e.g. 0.5)
-                        if p_short > 0.5:
+                        if (
+                            p_short >= self.short_threshold
+                            and directional_edge >= config.strategy.MIN_DIRECTIONAL_EDGE
+                            and expected_return_pct >= config.strategy.MIN_EXPECTED_RETURN_PCT
+                            and tp_pct / max(sl_pct, 1e-9) >= config.strategy.MIN_REWARD_RISK_RATIO
+                        ):
                             df.at[df.index[idx], 'ai_verdict'] = 2 # Short
                         
                         df.at[df.index[idx], 'ai_confidence'] = p_short
-                        df.at[df.index[idx], 'ai_directional_edge'] = p_short - p_neutral
-                        df.at[df.index[idx], 'ai_qty_ratio'] = sizing[j, 0].item()
-                        
-                        # Optional: Use predicted TP/SL if available
-                        # df.at[df.index[idx], 'ai_take_profit_pct'] = sizing[j, 1].item() * config.strategy.ORACLE_MAX_TP_PCT
+                        df.at[df.index[idx], 'ai_directional_edge'] = directional_edge
+                        df.at[df.index[idx], 'ai_qty_ratio'] = float(np.clip(raw_qty, 0.0, 1.0))
+                        df.at[df.index[idx], 'ai_take_profit_pct'] = tp_pct
+                        df.at[df.index[idx], 'ai_stop_loss_pct'] = sl_pct
+                        df.at[df.index[idx], 'ai_expected_return_pct'] = expected_return_pct
                 
                 X_windows = []
                 indices = []

@@ -32,7 +32,7 @@ def run_short_backtest():
         console.print("[error]Model not found. Run training first.[/error]")
         return
         
-    strategy = ShortNNStrategy(model_path, mean_path, scale_path)
+    strategy = ShortNNStrategy(model_path, mean_path, scale_path, threshold_path="models/short_thresholds.json")
     
     # 3. Generate Signals
     console.print(f"[info]Generating signals using {strategy.name}...[/info]")

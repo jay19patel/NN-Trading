@@ -41,6 +41,8 @@ class PaperTradeRecord:
     equity_after_usd: float
     holding_bars: int = 0
     holding_duration_mins: float = 0.0
+    mae_pct: float = 0.0
+    mfe_pct: float = 0.0
 
 def compute_position_size_for_risk_budget(
     equity_usd: float,
@@ -157,6 +159,8 @@ def run_paper_portfolio_on_signals(
 
             if t["side"] == "LONG":
                 risk_per_unit = max(t["entry_price"] - t["sl_price_initial"], 1e-8)
+                t["mfe_pct"] = max(t["mfe_pct"], ((curr_high - t["entry_price"]) / t["entry_price"]) * 100.0)
+                t["mae_pct"] = min(t["mae_pct"], ((curr_low - t["entry_price"]) / t["entry_price"]) * 100.0)
                 best_r_multiple = (curr_high - t["entry_price"]) / risk_per_unit
                 if best_r_multiple >= break_even_after_r:
                     t["sl_price"] = max(t["sl_price"], t["entry_price"])
@@ -171,6 +175,8 @@ def run_paper_portfolio_on_signals(
                     exit_price = t["sl_price"]
             else: # SHORT
                 risk_per_unit = max(t["sl_price_initial"] - t["entry_price"], 1e-8)
+                t["mfe_pct"] = max(t["mfe_pct"], ((t["entry_price"] - curr_low) / t["entry_price"]) * 100.0)
+                t["mae_pct"] = min(t["mae_pct"], ((t["entry_price"] - curr_high) / t["entry_price"]) * 100.0)
                 best_r_multiple = (t["entry_price"] - curr_low) / risk_per_unit
                 if best_r_multiple >= break_even_after_r:
                     t["sl_price"] = min(t["sl_price"], t["entry_price"])
@@ -251,7 +257,9 @@ def run_paper_portfolio_on_signals(
                         capital_before_usd=t["capital_before"],
                         equity_after_usd=equity_usd,
                         holding_bars=t["bars_held"],
-                        holding_duration_mins=t["bars_held"] * interval_mins
+                        holding_duration_mins=t["bars_held"] * interval_mins,
+                        mae_pct=float(t["mae_pct"]),
+                        mfe_pct=float(t["mfe_pct"]),
                     )
                 )
                 finished_trades_indices.append(idx)
@@ -295,6 +303,11 @@ def run_paper_portfolio_on_signals(
                 
                 confidence = float(row.get("ai_confidence", 0.0))
                 qty_ratio = float(row.get("ai_qty_ratio", 1.0))
+                expected_return_pct = float(row.get("ai_expected_return_pct", 0.0))
+                if confidence < config.strategy.AI_CONFIDENCE_THRESHOLD:
+                    continue
+                if expected_return_pct < config.strategy.MIN_EXPECTED_RETURN_PCT:
+                    continue
                 
                 if side == "LONG":
                     tp_price = entry_price * (1 + tp_pct / 100.0)
@@ -335,9 +348,63 @@ def run_paper_portfolio_on_signals(
                         "confidence": confidence,
                         "qty_ratio": adjusted_qty_ratio,
                         "capital_before": equity_usd,
-                        "bars_held": 0
+                        "bars_held": 0,
+                        "mae_pct": 0.0,
+                        "mfe_pct": 0.0,
                     })
                     daily_trade_count += 1
+
+    if active_trades and len(working_frame) > 0:
+        final_row = working_frame.iloc[-1]
+        final_price = float(final_row["Close"])
+        final_time = str(final_row.name)
+        if "Date" in final_row:
+            final_time = str(final_row["Date"])
+        for t in active_trades:
+            if t["side"] == "LONG":
+                real_exit_price = final_price * (1 - slippage_fraction)
+                return_fraction = (real_exit_price - t["entry_price"]) / t["entry_price"]
+                pnl_gross = t["quantity"] * (final_price - t["raw_entry_price"])
+            else:
+                real_exit_price = final_price * (1 + slippage_fraction)
+                return_fraction = (t["entry_price"] - real_exit_price) / t["entry_price"]
+                pnl_gross = t["quantity"] * (t["raw_entry_price"] - final_price)
+            fees_usd = t["notional_usd"] * fee_fraction_per_leg * 2.0
+            pnl_net = t["notional_usd"] * return_fraction - fees_usd
+            equity_usd = max(equity_usd + pnl_net, 0.0)
+            trade_records.append(
+                PaperTradeRecord(
+                    symbol=symbol,
+                    entry_datetime=t["entry_time"],
+                    entry_index=t["entry_index"],
+                    exit_datetime=final_time,
+                    exit_price=real_exit_price,
+                    side=t["side"],
+                    entry_price=t["entry_price"],
+                    quantity=t["quantity"],
+                    notional_usd=t["notional_usd"],
+                    take_profit_pct=t["tp_pct"],
+                    stop_loss_pct=t["sl_pct"],
+                    tp_price=t["tp_price"],
+                    sl_price=t["sl_price_initial"],
+                    ai_confidence=t["confidence"],
+                    ai_qty_ratio=t["qty_ratio"],
+                    outcome="EOD_CLOSE",
+                    return_fraction=return_fraction,
+                    pnl_gross_usd=pnl_gross,
+                    slippage_usd=abs(t["entry_price"] - t["raw_entry_price"]) * t["quantity"],
+                    fees_usd=fees_usd,
+                    pnl_net_usd=pnl_net,
+                    capital_before_usd=t["capital_before"],
+                    equity_after_usd=equity_usd,
+                    holding_bars=t["bars_held"],
+                    holding_duration_mins=t["bars_held"] * interval_mins,
+                    mae_pct=float(t["mae_pct"]),
+                    mfe_pct=float(t["mfe_pct"]),
+                )
+            )
+        if equity_by_bar:
+            equity_by_bar[-1] = equity_usd
 
     working_frame["paper_equity_curve"] = equity_by_bar
     summary = summarize_trade_feedback(trade_records)
@@ -350,7 +417,8 @@ def summarize_trade_feedback(trade_records: List[PaperTradeRecord]) -> dict:
             "trade_count": 0, "win_rate_pct": 0.0, "wins": 0, "losses": 0, "timeouts": 0,
             "final_equity_usd": float(config.strategy.INITIAL_CAPITAL_USD),
             "total_fees_usd": 0.0, "total_pnl_net_usd": 0.0,
-            "avg_holding_mins": 0.0, "max_drawdown_usd": 0.0
+            "avg_holding_mins": 0.0, "max_drawdown_usd": 0.0, "max_drawdown_pct": 0.0,
+            "profit_factor": 0.0, "avg_win_usd": 0.0, "avg_loss_usd": 0.0
         }
 
     wins = sum(1 for t in trade_records if t.pnl_net_usd > 0)
@@ -361,15 +429,23 @@ def summarize_trade_feedback(trade_records: List[PaperTradeRecord]) -> dict:
     total_fees = sum(t.fees_usd for t in trade_records)
     total_pnl = sum(t.pnl_net_usd for t in trade_records)
     avg_holding = sum(t.holding_duration_mins for t in trade_records) / len(trade_records)
+    gross_profit = sum(t.pnl_net_usd for t in trade_records if t.pnl_net_usd > 0)
+    gross_loss = abs(sum(t.pnl_net_usd for t in trade_records if t.pnl_net_usd < 0))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    avg_win = gross_profit / wins if wins else 0.0
+    avg_loss = gross_loss / losses if losses else 0.0
 
     # Simple MDD calculation from trade sequence
     equities = [t.equity_after_usd for t in trade_records]
     peak = equities[0]
     mdd = 0.0
+    mdd_pct = 0.0
     for e in equities:
         if e > peak: peak = e
         dd = peak - e
         if dd > mdd: mdd = dd
+        if peak > 0:
+            mdd_pct = max(mdd_pct, dd / peak * 100.0)
 
     return {
         "trade_count": len(trade_records),
@@ -381,7 +457,13 @@ def summarize_trade_feedback(trade_records: List[PaperTradeRecord]) -> dict:
         "total_fees_usd": float(total_fees),
         "total_pnl_net_usd": float(total_pnl),
         "avg_holding_mins": float(avg_holding),
-        "max_drawdown_usd": float(mdd)
+        "max_drawdown_usd": float(mdd),
+        "max_drawdown_pct": float(mdd_pct),
+        "profit_factor": float(profit_factor),
+        "avg_win_usd": float(avg_win),
+        "avg_loss_usd": float(avg_loss),
+        "avg_mae_pct": float(sum(t.mae_pct for t in trade_records) / len(trade_records)),
+        "avg_mfe_pct": float(sum(t.mfe_pct for t in trade_records) / len(trade_records)),
     }
 
 def print_rich_summary(strategy_name: str, symbol: str, summary: dict):
@@ -400,8 +482,10 @@ def print_rich_summary(strategy_name: str, symbol: str, summary: dict):
     table.add_row("Win Rate", f"{summary['win_rate_pct']:.2f}%")
     table.add_row("Wins / Losses", f"[green]{summary['wins']}[/green] / [red]{summary['losses']}[/red]")
     table.add_row("Net PnL", f"[{pnl_color}]${summary['total_pnl_net_usd']:,.2f}[/{pnl_color}]")
+    table.add_row("Profit Factor", f"{summary.get('profit_factor', 0.0):.2f}")
+    table.add_row("Avg Win / Loss", f"${summary.get('avg_win_usd', 0.0):,.2f} / ${summary.get('avg_loss_usd', 0.0):,.2f}")
     table.add_row("Total Fees", f"${summary['total_fees_usd']:,.2f}")
-    table.add_row("Max Drawdown", f"${summary['max_drawdown_usd']:,.2f}")
+    table.add_row("Max Drawdown", f"${summary['max_drawdown_usd']:,.2f} ({summary.get('max_drawdown_pct', 0.0):.2f}%)")
     table.add_row("Avg Holding", f"{summary['avg_holding_mins']:.1f} mins")
     table.add_row("Final Equity", f"[bold]${summary['final_equity_usd']:,.2f}[/bold]")
 

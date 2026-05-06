@@ -34,11 +34,11 @@ class StrategyConfig:
     ORACLE_MIN_DOWNSIDE_PCT: float = 1.0  # Strict downside
     
     # Execution Logic
-    PARALLEL_SLOTS: int = 100
-    MAX_DAILY_TRADES: int = 1000
-    COOLDOWN_BARS: int = 0
-    MAX_CONSECUTIVE_LOSSES: int = 10
-    DAILY_STOP_LOSS_PCT: float = 10.0
+    PARALLEL_SLOTS: int = 3
+    MAX_DAILY_TRADES: int = 25
+    COOLDOWN_BARS: int = 4
+    MAX_CONSECUTIVE_LOSSES: int = 3
+    DAILY_STOP_LOSS_PCT: float = 4.0
     BREAK_EVEN_AFTER_R: float = 1000.0   # Set very high to disable
     TRAIL_STOP_AFTER_R: float = 1000.0   # Set very high to disable
     TRAIL_STOP_R_MULTIPLE: float = 2.0
@@ -48,8 +48,11 @@ class StrategyConfig:
     TARGET_PROFIT_PCT: float = 1.0
     STOP_LOSS_PCT: float = 0.5
     MIN_REWARD_RISK_RATIO: float = 2.0
-    MIN_DIRECTIONAL_EDGE: float = 0.0
-    AI_CONFIDENCE_THRESHOLD: float = 0.0
+    MIN_DIRECTIONAL_EDGE: float = 0.05
+    AI_CONFIDENCE_THRESHOLD: float = 0.55
+    MIN_EXPECTED_RETURN_PCT: float = 0.03
+    TP_GRID_PCT: tuple[float, ...] = (0.6, 0.8, 1.0, 1.2, 1.5, 2.0)
+    SL_GRID_PCT: tuple[float, ...] = (0.3, 0.4, 0.5, 0.6, 0.8, 1.0)
 
 @dataclass
 class ModelConfig:
@@ -67,6 +70,10 @@ class TrainingConfig:
     LR: float = 0.0005
     FOCAL_NEUTRAL_VIOLATION_SCALE: float = 2.0
     TRAINING_DATA_DAYS: int = 365
+    VALIDATION_DATA_DAYS: int = 45
+    TEST_DATA_DAYS: int = 30
+    EARLY_STOP_PATIENCE: int = 7
+    SHORT_OBJECTIVE: str = "binary_short_vs_rest"
     
 @dataclass
 class TradingConfig:

@@ -71,9 +71,7 @@ def _calculate_future_excursions_jit(highs, lows, lookahead):
 @numba.njit
 def _compute_oracle_labels_jit(
     row_count, lookahead, close_prices, high_prices, low_prices,
-    upside_adj, downside_adj,
-    oracle_tp_long, oracle_sl_long, oracle_rr_long,
-    oracle_tp_short, oracle_sl_short, oracle_rr_short,
+    tp_grid, sl_grid,
     estimated_trade_cost_pct_frac,
     slippage_fraction,
     min_rr
@@ -81,6 +79,8 @@ def _compute_oracle_labels_jit(
     labels = np.ones(row_count)
     label_tp_pct = np.full(row_count, 1.0)
     label_sl_pct = np.full(row_count, 0.5)
+    label_expected_return_pct = np.zeros(row_count)
+    label_r_multiple = np.zeros(row_count)
     
     cost_pct = estimated_trade_cost_pct_frac * 100.0
     
@@ -88,22 +88,54 @@ def _compute_oracle_labels_jit(
         entry_long = close_prices[row_index] * (1 + slippage_fraction)
         entry_short = close_prices[row_index] * (1 - slippage_fraction)
         
-        long_code, long_pnl = _simulate_trade_path_with_entry(close_prices, high_prices, low_prices, row_index, lookahead, oracle_tp_long[row_index], oracle_sl_long[row_index], True, entry_long)
-        short_code, short_pnl = _simulate_trade_path_with_entry(close_prices, high_prices, low_prices, row_index, lookahead, oracle_tp_short[row_index], oracle_sl_short[row_index], False, entry_short)
+        best_label = 1
+        best_tp = 1.0
+        best_sl = 0.5
+        best_net_return = 0.0
+        best_r_multiple = 0.0
 
-        long_valid = (long_code == 0 and (oracle_tp_long[row_index] - cost_pct) > 0.01 and oracle_rr_long[row_index] >= min_rr)
-        short_valid = (short_code == 0 and (oracle_tp_short[row_index] - cost_pct) > 0.01 and oracle_rr_short[row_index] >= min_rr)
+        for tp_i in range(len(tp_grid)):
+            tp_pct = tp_grid[tp_i]
+            for sl_i in range(len(sl_grid)):
+                sl_pct = sl_grid[sl_i]
+                rr = tp_pct / max(sl_pct, 1e-9)
+                if rr < min_rr:
+                    continue
 
-        if long_valid and (not short_valid or long_pnl >= short_pnl):
-            labels[row_index] = 0
-            label_tp_pct[row_index] = oracle_tp_long[row_index]
-            label_sl_pct[row_index] = oracle_sl_long[row_index]
-        elif short_valid:
-            labels[row_index] = 2
-            label_tp_pct[row_index] = oracle_tp_short[row_index]
-            label_sl_pct[row_index] = oracle_sl_short[row_index]
-            
-    return labels, label_tp_pct, label_sl_pct
+                long_code, long_pnl = _simulate_trade_path_with_entry(
+                    close_prices, high_prices, low_prices, row_index, lookahead,
+                    tp_pct, sl_pct, True, entry_long
+                )
+                short_code, short_pnl = _simulate_trade_path_with_entry(
+                    close_prices, high_prices, low_prices, row_index, lookahead,
+                    tp_pct, sl_pct, False, entry_short
+                )
+
+                long_net = long_pnl - cost_pct
+                short_net = short_pnl - cost_pct
+
+                if long_code == 0 and long_net > best_net_return:
+                    best_label = 0
+                    best_tp = tp_pct
+                    best_sl = sl_pct
+                    best_net_return = long_net
+                    best_r_multiple = long_net / max(sl_pct, 1e-9)
+
+                if short_code == 0 and short_net > best_net_return:
+                    best_label = 2
+                    best_tp = tp_pct
+                    best_sl = sl_pct
+                    best_net_return = short_net
+                    best_r_multiple = short_net / max(sl_pct, 1e-9)
+
+        if best_net_return > 0.0:
+            labels[row_index] = best_label
+            label_tp_pct[row_index] = best_tp
+            label_sl_pct[row_index] = best_sl
+            label_expected_return_pct[row_index] = best_net_return
+            label_r_multiple[row_index] = best_r_multiple
+
+    return labels, label_tp_pct, label_sl_pct, label_expected_return_pct, label_r_multiple
 
 class OracleStrategy(BaseStrategy):
     @property
@@ -119,31 +151,13 @@ class OracleStrategy(BaseStrategy):
         closes = df['Close'].values
         row_count = len(df)
         
-        future_max_high, future_min_low = _calculate_future_excursions_jit(highs, lows, lookahead)
-        
         slippage_fraction = strategy.SLIPPAGE_PCT / 100.0
-        entry_price_long = closes * (1 + slippage_fraction)
-        entry_price_short = closes * (1 - slippage_fraction)
+        tp_grid = np.array(strategy.TP_GRID_PCT, dtype=np.float64)
+        sl_grid = np.array(strategy.SL_GRID_PCT, dtype=np.float64)
         
-        upside_adj = ((future_max_high - entry_price_long) / entry_price_long) * 100.0
-        downside_adj = ((entry_price_short - future_min_low) / entry_price_short) * 100.0
-        
-        oracle_tp_long = np.maximum(upside_adj * strategy.ORACLE_TP_CAPTURE_RATIO, strategy.ORACLE_MIN_TP_PCT)
-        oracle_sl_long = oracle_tp_long / 2.0
-        
-        oracle_tp_short = np.maximum(downside_adj * strategy.ORACLE_TP_CAPTURE_RATIO, strategy.ORACLE_MIN_TP_PCT)
-        oracle_sl_short = oracle_tp_short / 2.0
-
-        oracle_rr_long = oracle_tp_long / oracle_sl_long
-        oracle_rr_short = oracle_tp_short / oracle_sl_short
-
-        oracle_lookahead = lookahead // 2 
-        
-        labels, label_tp_pct, label_sl_pct = _compute_oracle_labels_jit(
-            row_count, oracle_lookahead, closes, highs, lows,
-            upside_adj, downside_adj,
-            oracle_tp_long, oracle_sl_long, oracle_rr_long,
-            oracle_tp_short, oracle_sl_short, oracle_rr_short,
+        labels, label_tp_pct, label_sl_pct, label_expected_return_pct, label_r_multiple = _compute_oracle_labels_jit(
+            row_count, lookahead, closes, highs, lows,
+            tp_grid, sl_grid,
             strategy.ROUND_TRIP_FEE_PCT / 100.0 + (2.0 * strategy.SLIPPAGE_PCT / 100.0),
             slippage_fraction,
             strategy.ORACLE_MIN_RR
@@ -155,5 +169,7 @@ class OracleStrategy(BaseStrategy):
         df['ai_qty_ratio'] = 1.0
         df['ai_confidence'] = 1.0
         df['ai_directional_edge'] = 1.0
+        df['ai_expected_return_pct'] = label_expected_return_pct
+        df['ai_r_multiple'] = label_r_multiple
         
         return df
