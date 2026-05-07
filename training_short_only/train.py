@@ -82,16 +82,51 @@ def _ordered_split(df: pd.DataFrame, interval: str) -> tuple[pd.DataFrame, pd.Da
     bars_day = bars_per_day(interval)
     val_bars = int(config.training.VALIDATION_DATA_DAYS * bars_day)
     test_bars = int(config.training.TEST_DATA_DAYS * bars_day)
+    purge_bars = int(config.features.PURGE_BARS)
     min_train_bars = config.model.WINDOW_SIZE + 10
 
     if len(df) <= min_train_bars + val_bars + test_bars:
         train_end = max(int(len(df) * 0.70), min_train_bars)
         val_end = max(train_end + 1, int(len(df) * 0.85))
-        return df.iloc[:train_end].copy(), df.iloc[train_end:val_end].copy(), df.iloc[val_end:].copy()
+        return (
+            df.iloc[:max(train_end - purge_bars, min_train_bars)].copy(),
+            df.iloc[min(train_end + purge_bars, val_end):val_end].copy(),
+            df.iloc[min(val_end + purge_bars, len(df)):].copy(),
+        )
 
     test_start = len(df) - test_bars
     val_start = test_start - val_bars
-    return df.iloc[:val_start].copy(), df.iloc[val_start:test_start].copy(), df.iloc[test_start:].copy()
+    train_end = max(val_start - purge_bars, min_train_bars)
+    val_begin = min(val_start + purge_bars, test_start)
+    val_end = max(test_start - purge_bars, val_begin)
+    test_begin = min(test_start + purge_bars, len(df))
+    return df.iloc[:train_end].copy(), df.iloc[val_begin:val_end].copy(), df.iloc[test_begin:].copy()
+
+
+def _walk_forward_splits(df: pd.DataFrame, interval: str) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+    bars_day = bars_per_day(interval)
+    val_bars = int(config.training.WALK_FORWARD_VAL_DAYS * bars_day)
+    purge_bars = int(config.features.PURGE_BARS)
+    folds = max(int(config.training.WALK_FORWARD_FOLDS), 1)
+    min_train_bars = config.model.WINDOW_SIZE + 10
+    test_bars = int(config.training.TEST_DATA_DAYS * bars_day)
+    usable_end = max(len(df) - test_bars, min_train_bars)
+    if usable_end <= min_train_bars + purge_bars + val_bars:
+        train_df, val_df, _ = _ordered_split(df, interval)
+        return [(train_df, val_df)]
+
+    fold_ends = np.linspace(min_train_bars + purge_bars + val_bars, usable_end, folds, dtype=int)
+    out = []
+    for fold_end in fold_ends:
+        val_end = int(fold_end)
+        val_start = max(val_end - val_bars, min_train_bars + purge_bars)
+        train_end = max(val_start - purge_bars, min_train_bars)
+        val_begin = min(val_start + purge_bars, val_end)
+        train_df = df.iloc[:train_end].copy()
+        val_df = df.iloc[val_begin:val_end].copy()
+        if len(train_df) > config.model.WINDOW_SIZE and len(val_df) > config.model.WINDOW_SIZE:
+            out.append((train_df, val_df))
+    return out
 
 
 def _make_sequences(df: pd.DataFrame, feature_cols: list[str], scaler: StandardScaler) -> tuple[np.ndarray, ...]:
@@ -105,11 +140,11 @@ def _make_sequences(df: pd.DataFrame, feature_cols: list[str], scaler: StandardS
 
     X_seq = sliding_window_view(X_scaled[:-1], (config.model.WINDOW_SIZE, X_scaled.shape[1])).squeeze(1)
     raw_dir = df["direction_label"].values[config.model.WINDOW_SIZE:]
-    y_dir = np.where(raw_dir == 2, 2, 1).astype(np.int64)
+    y_dir = raw_dir.astype(np.int64)
 
     y_tp = df["take_profit_pct"].values[config.model.WINDOW_SIZE:].astype(np.float32)
     y_sl = df["stop_loss_pct"].values[config.model.WINDOW_SIZE:].astype(np.float32)
-    y_qty = (y_dir == 2).astype(np.float32)
+    y_qty = (y_dir != 1).astype(np.float32)
     y_pnl = df.get("expected_return_pct", pd.Series(0.0, index=df.index)).values[config.model.WINDOW_SIZE:].astype(np.float32)
     return X_seq.astype(np.float32), y_dir, y_qty, y_tp, y_sl, y_pnl
 
@@ -167,32 +202,40 @@ def _predict(model: torch.nn.Module, X: np.ndarray, device: str, batch_size: int
 
 
 def _classification_metrics(y_true: np.ndarray, probs: np.ndarray) -> dict:
-    pred = np.where(probs[:, 2] >= np.maximum(probs[:, 1], probs[:, 0]), 2, 1)
-    precision, recall, f1, _ = precision_recall_fscore_support(
+    pred = np.argmax(probs, axis=1)
+    long_precision, long_recall, long_f1, _ = precision_recall_fscore_support(
+        y_true == 0, pred == 0, average="binary", zero_division=0
+    )
+    short_precision, short_recall, short_f1, _ = precision_recall_fscore_support(
         y_true == 2, pred == 2, average="binary", zero_division=0
     )
     return {
         "accuracy": float((pred == y_true).mean()) if len(y_true) else 0.0,
-        "short_precision": float(precision),
-        "short_recall": float(recall),
-        "short_f1": float(f1),
-        "confusion_matrix_labels_1_neutral_2_short": confusion_matrix(y_true, pred, labels=[1, 2]).tolist(),
+        "long_precision": float(long_precision),
+        "long_recall": float(long_recall),
+        "long_f1": float(long_f1),
+        "short_precision": float(short_precision),
+        "short_recall": float(short_recall),
+        "short_f1": float(short_f1),
+        "macro_f1_trading_sides": float((long_f1 + short_f1) / 2.0),
+        "confusion_matrix_labels_0_long_1_neutral_2_short": confusion_matrix(y_true, pred, labels=[0, 1, 2]).tolist(),
     }
 
 
-def _threshold_search(y_true: np.ndarray, y_tp: np.ndarray, y_sl: np.ndarray, probs: np.ndarray) -> dict:
+def _threshold_search_for_side(y_true: np.ndarray, y_tp: np.ndarray, y_sl: np.ndarray, probs: np.ndarray, side_label: int) -> dict:
     best = {"score": -1e9, "threshold": config.strategy.AI_CONFIDENCE_THRESHOLD}
     rows = []
-    for threshold in np.arange(0.50, 0.91, 0.05):
-        p_short = probs[:, 2]
-        edge = p_short - probs[:, 1]
-        selected = (p_short >= threshold) & (edge >= config.strategy.MIN_DIRECTIONAL_EDGE)
+    min_trades = int(config.training.THRESHOLD_MIN_TRADES)
+    for threshold in np.arange(0.35, 0.56, 0.025):
+        p_side = probs[:, side_label]
+        edge = p_side - probs[:, 1]
+        selected = (p_side >= threshold) & (edge >= config.strategy.MIN_DIRECTIONAL_EDGE)
         if not selected.any():
             rows.append({"threshold": float(threshold), "trade_count": 0})
             continue
 
-        wins = selected & (y_true == 2)
-        losses = selected & (y_true != 2)
+        wins = selected & (y_true == side_label)
+        losses = selected & (y_true != side_label)
         gross_win = float(np.sum(y_tp[wins]))
         gross_loss = float(np.sum(y_sl[losses]))
         fee_drag = float(selected.sum() * (config.strategy.ROUND_TRIP_FEE_PCT + 2.0 * config.strategy.SLIPPAGE_PCT))
@@ -207,10 +250,42 @@ def _threshold_search(y_true: np.ndarray, y_tp: np.ndarray, y_sl: np.ndarray, pr
             "net_expectancy_pct_proxy": float(net_expectancy_pct),
         }
         rows.append(row)
-        score = net_expectancy_pct * min(selected.sum(), 200) / 200.0
+        trade_count = int(selected.sum())
+        sample_penalty = min(trade_count / max(min_trades, 1), 1.0)
+        score = net_expectancy_pct * sample_penalty
+        if trade_count < min_trades:
+            score -= 1.0
         if score > best["score"]:
             best = {**row, "score": float(score)}
     return {"best": best, "grid": rows}
+
+
+def _threshold_search(y_true: np.ndarray, y_tp: np.ndarray, y_sl: np.ndarray, probs: np.ndarray) -> dict:
+    long_search = _threshold_search_for_side(y_true, y_tp, y_sl, probs, side_label=0)
+    short_search = _threshold_search_for_side(y_true, y_tp, y_sl, probs, side_label=2)
+    combined_score = (
+        long_search["best"].get("score", -1e9)
+        + short_search["best"].get("score", -1e9)
+    ) / 2.0
+    return {
+        "long": long_search,
+        "short": short_search,
+        "best": {
+            "long_threshold": long_search["best"].get("threshold", config.strategy.LONG_CONFIDENCE_THRESHOLD),
+            "short_threshold": short_search["best"].get("threshold", config.strategy.SHORT_CONFIDENCE_THRESHOLD),
+            "score": float(combined_score),
+        },
+    }
+
+
+def _model_selection_score(val_thresholds: dict, val_metrics: dict, avg_val_loss: float) -> float:
+    threshold_score = float(val_thresholds["best"].get("score", -1e9))
+    if threshold_score > -1e8:
+        return threshold_score
+
+    # Early epochs can be too uncertain to pass the production threshold grid.
+    # Keep checkpointing those epochs by falling back to classification quality.
+    return float(val_metrics["macro_f1_trading_sides"] - avg_val_loss)
 
 
 def train_short_model():
@@ -266,10 +341,9 @@ def train_short_model():
 
     class_counts = np.bincount(y_train.astype(np.int64), minlength=3)
     class_weights = len(y_train) / (len(class_counts) * (class_counts + 1e-6))
-    class_weights[0] = 0.25
     class_weights = torch.FloatTensor(class_weights).to(device)
     console.print(
-        f"[info]Short-vs-rest objective. Class counts: neutral/rest={class_counts[1]}, short={class_counts[2]}[/info]"
+        f"[info]3-class objective. Class counts: long={class_counts[0]}, neutral={class_counts[1]}, short={class_counts[2]}[/info]"
     )
 
     model = MultiHeadTradingModel(input_dim=len(feature_cols)).to(device)
@@ -277,15 +351,16 @@ def train_short_model():
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.LR, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
 
-    best_val_score = -1e9
+    best_val_score = -float("inf")
     no_improve_epochs = 0
     os.makedirs("models", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
+    best_model_path = os.path.join("models", "short_model_eth_best.pth")
 
     from ui_utils import get_progress
 
     with get_progress() as progress:
-        task = progress.add_task("[cyan]Training short-vs-rest Transformer...", total=config.training.EPOCHS * len(train_loader))
+        task = progress.add_task("[cyan]Training long/neutral/short Transformer...", total=config.training.EPOCHS * len(train_loader))
         for epoch in range(config.training.EPOCHS):
             model.train()
             train_loss = 0.0
@@ -309,26 +384,32 @@ def train_short_model():
             val_pred = _predict(model, X_val, device)
             val_metrics = _classification_metrics(y_val, val_pred["probs"])
             val_thresholds = _threshold_search(y_val, y_tp_val, y_sl_val, val_pred["probs"])
-            val_score = val_thresholds["best"].get("net_expectancy_pct_proxy", -1.0)
+            threshold_score = float(val_thresholds["best"].get("score", -1e9))
+            val_score = _model_selection_score(val_thresholds, val_metrics, avg_val_loss)
 
             if (epoch + 1) % 5 == 0:
                 console.print(
                     f"[dim]Epoch {epoch + 1:02d}: train_loss={avg_train_loss:.5f}, "
-                    f"val_loss={avg_val_loss:.5f}, val_short_f1={val_metrics['short_f1']:.3f}, "
-                    f"val_proxy_ev={val_score:.4f}[/dim]"
+                    f"val_loss={avg_val_loss:.5f}, val_long_f1={val_metrics['long_f1']:.3f}, "
+                    f"val_short_f1={val_metrics['short_f1']:.3f}, threshold_score={threshold_score:.4f}, "
+                    f"selection_score={val_score:.4f}[/dim]"
                 )
 
             if val_score > best_val_score:
                 best_val_score = val_score
                 no_improve_epochs = 0
-                torch.save(model.state_dict(), os.path.join("models", "short_model_eth_best.pth"))
+                torch.save(model.state_dict(), best_model_path)
             else:
                 no_improve_epochs += 1
                 if no_improve_epochs >= config.training.EARLY_STOP_PATIENCE:
                     console.print(f"[warning]Early stopping at epoch {epoch + 1}[/warning]")
                     break
 
-    model.load_state_dict(torch.load(os.path.join("models", "short_model_eth_best.pth"), map_location=device, weights_only=True))
+    if not os.path.exists(best_model_path):
+        console.print("[warning]No best checkpoint was produced; saving final epoch weights instead.[/warning]")
+        torch.save(model.state_dict(), best_model_path)
+
+    model.load_state_dict(torch.load(best_model_path, map_location=device, weights_only=True))
     torch.save(model.state_dict(), os.path.join("models", "short_model_eth.pth"))
     np.save(os.path.join("models", "scaler_mean.npy"), scaler.mean_)
     np.save(os.path.join("models", "scaler_scale.npy"), scaler.scale_)
@@ -338,6 +419,13 @@ def train_short_model():
     diagnostics = {
         "objective": config.training.SHORT_OBJECTIVE,
         "split_samples": {"train": int(len(X_train)), "validation": int(len(X_val)), "test": int(len(X_test))},
+        "validation_scheme": {
+            "type": "purged_time_ordered_holdout",
+            "purge_bars": int(config.features.PURGE_BARS),
+            "walk_forward_folds_available": {
+                symbol: len(_walk_forward_splits(frame, interval)) for symbol, frame in frames.items()
+            },
+        },
         "label_diagnostics": _label_diagnostics(frames),
         "validation_metrics": _classification_metrics(y_val, val_pred["probs"]),
         "validation_threshold_search": _threshold_search(y_val, y_tp_val, y_sl_val, val_pred["probs"]),
@@ -347,9 +435,16 @@ def train_short_model():
     with open(os.path.join("reports", "model_diagnostics.json"), "w", encoding="utf-8") as f:
         json.dump(diagnostics, f, indent=2)
 
-    threshold = diagnostics["validation_threshold_search"]["best"].get("threshold", config.strategy.AI_CONFIDENCE_THRESHOLD)
+    threshold_info = diagnostics["validation_threshold_search"]["best"]
     with open(os.path.join("models", "short_thresholds.json"), "w", encoding="utf-8") as f:
-        json.dump({"short_probability_threshold": threshold}, f, indent=2)
+        json.dump(
+            {
+                "long_probability_threshold": threshold_info.get("long_threshold", config.strategy.LONG_CONFIDENCE_THRESHOLD),
+                "short_probability_threshold": threshold_info.get("short_threshold", config.strategy.SHORT_CONFIDENCE_THRESHOLD),
+            },
+            f,
+            indent=2,
+        )
 
     console.print("[success]Model, train-only scaler, thresholds, and reports/model_diagnostics.json saved.[/success]")
     run_short_backtest()

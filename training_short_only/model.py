@@ -196,8 +196,8 @@ class TradingLoss(nn.Module):
 
         # Simplified sizing loss for now (just qty_ratio if others missing)
         true_qty = targets.get("qty_ratio", torch.zeros_like(sizing_out[:, 0]))
-        true_tp = targets.get("take_profit_pct", torch.zeros_like(sizing_out[:, 1])) / config.strategy.ORACLE_MAX_TP_PCT
-        true_sl = targets.get("stop_loss_pct", torch.zeros_like(sizing_out[:, 2])) / config.strategy.ORACLE_MAX_SL_PCT
+        true_tp = targets.get("take_profit_pct", torch.zeros_like(sizing_out[:, 1])) / config.strategy.MAX_ATR_TARGET_PCT
+        true_sl = targets.get("stop_loss_pct", torch.zeros_like(sizing_out[:, 2])) / config.strategy.MAX_ATR_STOP_PCT
         true_sizing = torch.stack([true_qty, true_tp, true_sl], dim=1)
 
         signal_loss = self.direction_loss(signal_logits, true_signal)

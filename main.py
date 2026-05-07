@@ -74,7 +74,7 @@ def main():
     
     strategies_to_run = [
         OracleStrategy(),
-        ShortNNStrategy(model_path, mean_path, scale_path),
+        ShortNNStrategy(model_path, mean_path, scale_path, threshold_path="models/short_thresholds.json"),
         RandomStrategy()
     ]
     

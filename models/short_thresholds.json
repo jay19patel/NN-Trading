@@ -1,3 +1,4 @@
 {
-  "short_probability_threshold": 0.6500000000000001
+  "long_probability_threshold": 0.4,
+  "short_probability_threshold": 0.4
 }

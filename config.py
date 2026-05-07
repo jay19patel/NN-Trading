@@ -12,6 +12,7 @@ class DataConfig:
 @dataclass
 class FeatureConfig:
     LOOKAHEAD_BARS: int = 60
+    PURGE_BARS: int = 60
     FEATURE_CACHE_VERSION: int = 100
 
 @dataclass
@@ -34,10 +35,10 @@ class StrategyConfig:
     ORACLE_MIN_DOWNSIDE_PCT: float = 1.0  # Strict downside
     
     # Execution Logic
-    PARALLEL_SLOTS: int = 3
+    PARALLEL_SLOTS: int = 1
     MAX_DAILY_TRADES: int = 25
-    COOLDOWN_BARS: int = 4
-    MAX_CONSECUTIVE_LOSSES: int = 3
+    COOLDOWN_BARS: int = 12
+    MAX_CONSECUTIVE_LOSSES: int = 2
     DAILY_STOP_LOSS_PCT: float = 4.0
     BREAK_EVEN_AFTER_R: float = 1000.0   # Set very high to disable
     TRAIL_STOP_AFTER_R: float = 1000.0   # Set very high to disable
@@ -49,10 +50,27 @@ class StrategyConfig:
     STOP_LOSS_PCT: float = 0.5
     MIN_REWARD_RISK_RATIO: float = 2.0
     MIN_DIRECTIONAL_EDGE: float = 0.05
-    AI_CONFIDENCE_THRESHOLD: float = 0.55
+    AI_CONFIDENCE_THRESHOLD: float = 0.40
+    LONG_CONFIDENCE_THRESHOLD: float = 0.40
+    SHORT_CONFIDENCE_THRESHOLD: float = 0.40
     MIN_EXPECTED_RETURN_PCT: float = 0.03
+    USE_REGIME_FILTER: bool = True
+    REGIME_MIN_ADX: float = 20.0
+    LONG_RSI_MIN: float = 55.0
+    LONG_RSI_MAX: float = 65.0
+    SHORT_RSI_MIN: float = 35.0
+    SHORT_RSI_MAX: float = 45.0
+    LONG_MIN_TREND_SMA_20_50: float = 0.0
+    SHORT_MAX_TREND_SMA_20_50: float = 0.0
     TP_GRID_PCT: tuple[float, ...] = (0.6, 0.8, 1.0, 1.2, 1.5, 2.0)
     SL_GRID_PCT: tuple[float, ...] = (0.3, 0.4, 0.5, 0.6, 0.8, 1.0)
+    ATR_LENGTH: int = 14
+    TP_ATR_MULTIPLIERS: tuple[float, ...] = (1.5, 2.0, 2.5, 3.0)
+    SL_ATR_MULTIPLIERS: tuple[float, ...] = (0.75, 1.0, 1.25, 1.5)
+    MIN_ATR_STOP_PCT: float = 0.25
+    MAX_ATR_STOP_PCT: float = 1.50
+    MIN_ATR_TARGET_PCT: float = 0.50
+    MAX_ATR_TARGET_PCT: float = 4.00
 
 @dataclass
 class ModelConfig:
@@ -73,7 +91,10 @@ class TrainingConfig:
     VALIDATION_DATA_DAYS: int = 45
     TEST_DATA_DAYS: int = 30
     EARLY_STOP_PATIENCE: int = 7
-    SHORT_OBJECTIVE: str = "binary_short_vs_rest"
+    SHORT_OBJECTIVE: str = "three_class_long_neutral_short"
+    WALK_FORWARD_FOLDS: int = 4
+    WALK_FORWARD_VAL_DAYS: int = 30
+    THRESHOLD_MIN_TRADES: int = 50
     
 @dataclass
 class TradingConfig:

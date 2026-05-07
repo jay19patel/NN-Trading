@@ -61,5 +61,5 @@ def test_oracle_outputs_grid_bounded_labels():
     df = _sample_frame()
     labeled = OracleStrategy().generate_signals(df)
     assert {"ai_verdict", "ai_take_profit_pct", "ai_stop_loss_pct", "ai_expected_return_pct"}.issubset(labeled.columns)
-    assert labeled["ai_take_profit_pct"].between(min(config.strategy.TP_GRID_PCT), max(config.strategy.TP_GRID_PCT)).all()
-    assert labeled["ai_stop_loss_pct"].between(min(config.strategy.SL_GRID_PCT), max(config.strategy.SL_GRID_PCT)).all()
+    assert labeled["ai_take_profit_pct"].between(config.strategy.MIN_ATR_TARGET_PCT, config.strategy.MAX_ATR_TARGET_PCT).all()
+    assert labeled["ai_stop_loss_pct"].between(config.strategy.MIN_ATR_STOP_PCT, config.strategy.MAX_ATR_STOP_PCT).all()

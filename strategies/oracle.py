@@ -1,9 +1,35 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
-import numba
+try:
+    import numba
+except ModuleNotFoundError:
+    class _NumbaFallback:
+        @staticmethod
+        def njit(func=None, **_kwargs):
+            if func is None:
+                return lambda wrapped: wrapped
+            return func
+
+    numba = _NumbaFallback()
 from config import config
 from strategies.base import BaseStrategy
+
+
+def _causal_atr_pct(df: pd.DataFrame, length: int) -> np.ndarray:
+    """ATR percentage using only current and historical bars."""
+    prev_close = df["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+    atr_pct = (atr / df["Close"]) * 100.0
+    return atr_pct.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).to_numpy(dtype=np.float64)
 
 @numba.njit
 def _simulate_trade_path_with_entry(
@@ -71,10 +97,14 @@ def _calculate_future_excursions_jit(highs, lows, lookahead):
 @numba.njit
 def _compute_oracle_labels_jit(
     row_count, lookahead, close_prices, high_prices, low_prices,
-    tp_grid, sl_grid,
+    atr_pct, tp_multipliers, sl_multipliers,
     estimated_trade_cost_pct_frac,
     slippage_fraction,
-    min_rr
+    min_rr,
+    min_target_pct,
+    max_target_pct,
+    min_stop_pct,
+    max_stop_pct
 ):
     labels = np.ones(row_count)
     label_tp_pct = np.full(row_count, 1.0)
@@ -94,10 +124,22 @@ def _compute_oracle_labels_jit(
         best_net_return = 0.0
         best_r_multiple = 0.0
 
-        for tp_i in range(len(tp_grid)):
-            tp_pct = tp_grid[tp_i]
-            for sl_i in range(len(sl_grid)):
-                sl_pct = sl_grid[sl_i]
+        current_atr_pct = atr_pct[row_index]
+        if current_atr_pct <= 0.0:
+            continue
+
+        for tp_i in range(len(tp_multipliers)):
+            tp_pct = current_atr_pct * tp_multipliers[tp_i]
+            if tp_pct < min_target_pct:
+                tp_pct = min_target_pct
+            if tp_pct > max_target_pct:
+                tp_pct = max_target_pct
+            for sl_i in range(len(sl_multipliers)):
+                sl_pct = current_atr_pct * sl_multipliers[sl_i]
+                if sl_pct < min_stop_pct:
+                    sl_pct = min_stop_pct
+                if sl_pct > max_stop_pct:
+                    sl_pct = max_stop_pct
                 rr = tp_pct / max(sl_pct, 1e-9)
                 if rr < min_rr:
                     continue
@@ -152,15 +194,20 @@ class OracleStrategy(BaseStrategy):
         row_count = len(df)
         
         slippage_fraction = strategy.SLIPPAGE_PCT / 100.0
-        tp_grid = np.array(strategy.TP_GRID_PCT, dtype=np.float64)
-        sl_grid = np.array(strategy.SL_GRID_PCT, dtype=np.float64)
+        atr_pct = _causal_atr_pct(df, strategy.ATR_LENGTH)
+        tp_multipliers = np.array(strategy.TP_ATR_MULTIPLIERS, dtype=np.float64)
+        sl_multipliers = np.array(strategy.SL_ATR_MULTIPLIERS, dtype=np.float64)
         
         labels, label_tp_pct, label_sl_pct, label_expected_return_pct, label_r_multiple = _compute_oracle_labels_jit(
             row_count, lookahead, closes, highs, lows,
-            tp_grid, sl_grid,
+            atr_pct, tp_multipliers, sl_multipliers,
             strategy.ROUND_TRIP_FEE_PCT / 100.0 + (2.0 * strategy.SLIPPAGE_PCT / 100.0),
             slippage_fraction,
-            strategy.ORACLE_MIN_RR
+            strategy.ORACLE_MIN_RR,
+            strategy.MIN_ATR_TARGET_PCT,
+            strategy.MAX_ATR_TARGET_PCT,
+            strategy.MIN_ATR_STOP_PCT,
+            strategy.MAX_ATR_STOP_PCT
         )
         
         df['ai_verdict'] = labels

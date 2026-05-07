@@ -14,10 +14,13 @@ class ShortNNStrategy(BaseStrategy):
         self.feature_cols = get_feature_columns()
         self.input_dim = len(self.feature_cols)
         self.window_size = config.model.WINDOW_SIZE
-        self.short_threshold = config.strategy.AI_CONFIDENCE_THRESHOLD
+        self.long_threshold = config.strategy.LONG_CONFIDENCE_THRESHOLD
+        self.short_threshold = config.strategy.SHORT_CONFIDENCE_THRESHOLD
         if threshold_path and os.path.exists(threshold_path):
             with open(threshold_path, "r", encoding="utf-8") as f:
-                self.short_threshold = float(json.load(f).get("short_probability_threshold", self.short_threshold))
+                thresholds = json.load(f)
+                self.long_threshold = float(thresholds.get("long_probability_threshold", self.long_threshold))
+                self.short_threshold = float(thresholds.get("short_probability_threshold", self.short_threshold))
         
         # Load model
         self.model = MultiHeadTradingModel(input_dim=self.input_dim)
@@ -37,7 +40,7 @@ class ShortNNStrategy(BaseStrategy):
 
     @property
     def name(self) -> str:
-        return "Short_Transformer"
+        return "LongShort_Transformer"
 
     def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
         # 1. Add technical indicators
@@ -86,31 +89,80 @@ class ShortNNStrategy(BaseStrategy):
                     probs = torch.softmax(logits, dim=1).numpy()
                     
                     for j, idx in enumerate(indices):
-                        # Short probability is at index 2
+                        # Model classes: 0=long, 1=neutral, 2=short.
+                        p_long = probs[j, 0]
                         p_short = probs[j, 2]
                         p_neutral = probs[j, 1]
-                        directional_edge = p_short - p_neutral
+                        long_edge = p_long - p_neutral
+                        short_edge = p_short - p_neutral
 
                         raw_qty = float(sizing[j, 0].item())
-                        raw_tp_pct = float(sizing[j, 1].item()) * config.strategy.ORACLE_MAX_TP_PCT
-                        raw_sl_pct = float(sizing[j, 2].item()) * config.strategy.ORACLE_MAX_SL_PCT
-                        tp_pct = float(np.clip(raw_tp_pct, config.strategy.ORACLE_MIN_TP_PCT, config.strategy.ORACLE_MAX_TP_PCT))
-                        sl_pct = float(np.clip(raw_sl_pct, config.strategy.ORACLE_MIN_SL_PCT, config.strategy.ORACLE_MAX_SL_PCT))
+                        atr_source_idx = max(idx - 1, 0)
+                        atr_pct = float(df_feats["natr"].iloc[atr_source_idx]) if "natr" in df_feats else 0.0
+                        raw_tp_pct = float(sizing[j, 1].item()) * config.strategy.MAX_ATR_TARGET_PCT
+                        raw_sl_pct = float(sizing[j, 2].item()) * config.strategy.MAX_ATR_STOP_PCT
+                        atr_tp_pct = atr_pct * config.strategy.TP_ATR_MULTIPLIERS[1]
+                        atr_sl_pct = atr_pct * config.strategy.SL_ATR_MULTIPLIERS[1]
+                        tp_pct = float(np.clip(max(raw_tp_pct, atr_tp_pct), config.strategy.MIN_ATR_TARGET_PCT, config.strategy.MAX_ATR_TARGET_PCT))
+                        sl_pct = float(np.clip(max(raw_sl_pct, atr_sl_pct), config.strategy.MIN_ATR_STOP_PCT, config.strategy.MAX_ATR_STOP_PCT))
                         if tp_pct / max(sl_pct, 1e-9) < config.strategy.MIN_REWARD_RISK_RATIO:
-                            tp_pct = min(config.strategy.ORACLE_MAX_TP_PCT, sl_pct * config.strategy.MIN_REWARD_RISK_RATIO)
-                        expected_return_pct = (p_short * tp_pct) - ((1.0 - p_short) * sl_pct) - (
-                            config.strategy.ROUND_TRIP_FEE_PCT + 2.0 * config.strategy.SLIPPAGE_PCT
+                            tp_pct = min(config.strategy.MAX_ATR_TARGET_PCT, sl_pct * config.strategy.MIN_REWARD_RISK_RATIO)
+                        trade_cost_pct = config.strategy.ROUND_TRIP_FEE_PCT + 2.0 * config.strategy.SLIPPAGE_PCT
+                        long_expected_return_pct = (p_long * tp_pct) - ((1.0 - p_long) * sl_pct) - trade_cost_pct
+                        short_expected_return_pct = (p_short * tp_pct) - ((1.0 - p_short) * sl_pct) - trade_cost_pct
+                        verdict = 1
+                        confidence = max(p_long, p_short)
+                        directional_edge = max(long_edge, short_edge)
+                        expected_return_pct = max(long_expected_return_pct, short_expected_return_pct)
+                        rsi = float(df_feats["rsi"].iloc[idx]) if "rsi" in df_feats else 50.0
+                        adx = float(df_feats["adx"].iloc[idx]) if "adx" in df_feats else 0.0
+                        trend_sma = float(df_feats["trend_sma_20_50"].iloc[idx]) if "trend_sma_20_50" in df_feats else 0.0
+                        regime_enabled = bool(config.strategy.USE_REGIME_FILTER)
+                        long_regime_ok = (
+                            not regime_enabled
+                            or (
+                                adx >= config.strategy.REGIME_MIN_ADX
+                                and config.strategy.LONG_RSI_MIN <= rsi <= config.strategy.LONG_RSI_MAX
+                                and trend_sma >= config.strategy.LONG_MIN_TREND_SMA_20_50
+                            )
+                        )
+                        short_regime_ok = (
+                            not regime_enabled
+                            or (
+                                adx >= config.strategy.REGIME_MIN_ADX
+                                and config.strategy.SHORT_RSI_MIN <= rsi <= config.strategy.SHORT_RSI_MAX
+                                and trend_sma <= config.strategy.SHORT_MAX_TREND_SMA_20_50
+                            )
                         )
                         
                         if (
-                            p_short >= self.short_threshold
-                            and directional_edge >= config.strategy.MIN_DIRECTIONAL_EDGE
-                            and expected_return_pct >= config.strategy.MIN_EXPECTED_RETURN_PCT
+                            p_long >= self.long_threshold
+                            and p_long >= p_short
+                            and long_edge >= config.strategy.MIN_DIRECTIONAL_EDGE
+                            and long_expected_return_pct >= config.strategy.MIN_EXPECTED_RETURN_PCT
                             and tp_pct / max(sl_pct, 1e-9) >= config.strategy.MIN_REWARD_RISK_RATIO
+                            and long_regime_ok
                         ):
-                            df.at[df.index[idx], 'ai_verdict'] = 2 # Short
+                            verdict = 0
+                            confidence = p_long
+                            directional_edge = long_edge
+                            expected_return_pct = long_expected_return_pct
+                        elif (
+                            p_short >= self.short_threshold
+                            and p_short > p_long
+                            and short_edge >= config.strategy.MIN_DIRECTIONAL_EDGE
+                            and short_expected_return_pct >= config.strategy.MIN_EXPECTED_RETURN_PCT
+                            and tp_pct / max(sl_pct, 1e-9) >= config.strategy.MIN_REWARD_RISK_RATIO
+                            and short_regime_ok
+                        ):
+                            verdict = 2
+                            confidence = p_short
+                            directional_edge = short_edge
+                            expected_return_pct = short_expected_return_pct
+
+                        df.at[df.index[idx], 'ai_verdict'] = verdict
                         
-                        df.at[df.index[idx], 'ai_confidence'] = p_short
+                        df.at[df.index[idx], 'ai_confidence'] = confidence
                         df.at[df.index[idx], 'ai_directional_edge'] = directional_edge
                         df.at[df.index[idx], 'ai_qty_ratio'] = float(np.clip(raw_qty, 0.0, 1.0))
                         df.at[df.index[idx], 'ai_take_profit_pct'] = tp_pct
