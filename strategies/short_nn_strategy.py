@@ -6,8 +6,8 @@ import os
 import json
 from config import config
 from strategies.base import BaseStrategy
-from training_short_only.model import MultiHeadTradingModel
-from training_short_only.feature_utils import add_technical_indicators, get_feature_columns
+from neural_engine.model import MultiHeadTradingModel
+from neural_engine.feature_utils import add_technical_indicators, get_feature_columns
 
 class ShortNNStrategy(BaseStrategy):
     def __init__(self, model_path: str, scaler_mean_path: str, scaler_scale_path: str, threshold_path: str | None = None):
@@ -30,7 +30,7 @@ class ShortNNStrategy(BaseStrategy):
             except RuntimeError as exc:
                 raise RuntimeError(
                     "Saved model is incompatible with the current feature/model schema. "
-                    "Retrain with training_short_only/train.py to regenerate the checkpoint and scaler."
+                    "Retrain with neural_engine/train.py to regenerate the checkpoint and scaler."
                 ) from exc
         self.model.eval()
         
@@ -99,14 +99,24 @@ class ShortNNStrategy(BaseStrategy):
                         raw_qty = float(sizing[j, 0].item())
                         atr_source_idx = max(idx - 1, 0)
                         atr_pct = float(df_feats["natr"].iloc[atr_source_idx]) if "natr" in df_feats else 0.0
+                        
+                        # Model predicts a multiplier of MAX_ATR_TARGET_PCT. 
+                        # We want to balance this with a volatility-based floor.
                         raw_tp_pct = float(sizing[j, 1].item()) * config.strategy.MAX_ATR_TARGET_PCT
                         raw_sl_pct = float(sizing[j, 2].item()) * config.strategy.MAX_ATR_STOP_PCT
-                        atr_tp_pct = atr_pct * config.strategy.TP_ATR_MULTIPLIERS[1]
-                        atr_sl_pct = atr_pct * config.strategy.SL_ATR_MULTIPLIERS[1]
-                        tp_pct = float(np.clip(max(raw_tp_pct, atr_tp_pct), config.strategy.MIN_ATR_TARGET_PCT, config.strategy.MAX_ATR_TARGET_PCT))
-                        sl_pct = float(np.clip(max(raw_sl_pct, atr_sl_pct), config.strategy.MIN_ATR_STOP_PCT, config.strategy.MAX_ATR_STOP_PCT))
-                        if tp_pct / max(sl_pct, 1e-9) < config.strategy.MIN_REWARD_RISK_RATIO:
-                            tp_pct = min(config.strategy.MAX_ATR_TARGET_PCT, sl_pct * config.strategy.MIN_REWARD_RISK_RATIO)
+                        
+                        # Use a mix of model prediction and ATR logic
+                        tp_pct = float(np.clip(raw_tp_pct, config.strategy.MIN_ATR_TARGET_PCT, config.strategy.MAX_ATR_TARGET_PCT))
+                        sl_pct = float(np.clip(raw_sl_pct, config.strategy.MIN_ATR_STOP_PCT, config.strategy.MAX_ATR_STOP_PCT))
+                        
+                        # Safety: Ensure minimum RR ratio
+                        min_rr = config.strategy.MIN_REWARD_RISK_RATIO
+                        if tp_pct / max(sl_pct, 1e-9) < min_rr:
+                            # If RR is too low, try to increase TP or decrease SL
+                            if tp_pct < config.strategy.MIN_ATR_TARGET_PCT:
+                                tp_pct = config.strategy.MIN_ATR_TARGET_PCT
+                            sl_pct = tp_pct / min_rr
+
                         trade_cost_pct = config.strategy.ROUND_TRIP_FEE_PCT + 2.0 * config.strategy.SLIPPAGE_PCT
                         long_expected_return_pct = (p_long * tp_pct) - ((1.0 - p_long) * sl_pct) - trade_cost_pct
                         short_expected_return_pct = (p_short * tp_pct) - ((1.0 - p_short) * sl_pct) - trade_cost_pct
@@ -135,26 +145,33 @@ class ShortNNStrategy(BaseStrategy):
                             )
                         )
                         
-                        if (
+                        # Choose the side with higher probability/edge if both qualify
+                        is_long_valid = (
                             p_long >= self.long_threshold
-                            and p_long >= p_short
                             and long_edge >= config.strategy.MIN_DIRECTIONAL_EDGE
                             and long_expected_return_pct >= config.strategy.MIN_EXPECTED_RETURN_PCT
-                            and tp_pct / max(sl_pct, 1e-9) >= config.strategy.MIN_REWARD_RISK_RATIO
                             and long_regime_ok
-                        ):
+                        )
+                        is_short_valid = (
+                            p_short >= self.short_threshold
+                            and short_edge >= config.strategy.MIN_DIRECTIONAL_EDGE
+                            and short_expected_return_pct >= config.strategy.MIN_EXPECTED_RETURN_PCT
+                            and short_regime_ok
+                        )
+
+                        if is_long_valid and is_short_valid:
+                            # If both valid, pick the stronger one
+                            if p_long >= p_short:
+                                is_short_valid = False
+                            else:
+                                is_long_valid = False
+
+                        if is_long_valid:
                             verdict = 0
                             confidence = p_long
                             directional_edge = long_edge
                             expected_return_pct = long_expected_return_pct
-                        elif (
-                            p_short >= self.short_threshold
-                            and p_short > p_long
-                            and short_edge >= config.strategy.MIN_DIRECTIONAL_EDGE
-                            and short_expected_return_pct >= config.strategy.MIN_EXPECTED_RETURN_PCT
-                            and tp_pct / max(sl_pct, 1e-9) >= config.strategy.MIN_REWARD_RISK_RATIO
-                            and short_regime_ok
-                        ):
+                        elif is_short_valid:
                             verdict = 2
                             confidence = p_short
                             directional_edge = short_edge

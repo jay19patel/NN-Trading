@@ -48,7 +48,7 @@ def ensure_model_trained():
     if not os.path.exists(model_path):
         console.rule("[bold yellow]TRAINING SHORT-ONLY MODEL")
         console.print("[info]Model not found. Initializing auto-training sequence...[/info]")
-        from training_short_only.train import train_short_model
+        from neural_engine.train import train_short_model
         train_short_model()
         console.print("[success]✅ Training Complete![/success]\n")
 

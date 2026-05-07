@@ -5,14 +5,14 @@ import os
 @dataclass
 class DataConfig:
     SYMBOLS: list[str] = ("ETHUSD",)
-    INTERVAL: str = "15m"
+    INTERVAL: str = "1h"
     TOTAL_DAYS: int = 30
     CACHE_VALID_MINS: int = 0  # Rebuild every time for 100% accuracy
 
 @dataclass
 class FeatureConfig:
-    LOOKAHEAD_BARS: int = 60
-    PURGE_BARS: int = 60
+    LOOKAHEAD_BARS: int = 24 # 1 full day for 1h
+    PURGE_BARS: int = 24
     FEATURE_CACHE_VERSION: int = 100
 
 @dataclass
@@ -30,8 +30,8 @@ class StrategyConfig:
     ORACLE_MAX_SL_PCT: float = 2.0
     ORACLE_TP_CAPTURE_RATIO: float = 0.80 # Buffer for slippage
     ORACLE_SL_CAPTURE_RATIO: float = 0.01 
-    ORACLE_MIN_RR: float = 2.0
-    ORACLE_MIN_UPSIDE_PCT: float = 1.0    # Strict upside
+    ORACLE_MIN_RR: float = 2.5 # Higher quality signals
+    ORACLE_MIN_UPSIDE_PCT: float = 1.2    # Strict upside
     ORACLE_MIN_DOWNSIDE_PCT: float = 1.0  # Strict downside
     
     # Execution Logic
@@ -48,20 +48,20 @@ class StrategyConfig:
     USE_ORACLE_LABELS: bool = True
     TARGET_PROFIT_PCT: float = 1.0
     STOP_LOSS_PCT: float = 0.5
-    MIN_REWARD_RISK_RATIO: float = 2.0
-    MIN_DIRECTIONAL_EDGE: float = 0.05
-    AI_CONFIDENCE_THRESHOLD: float = 0.40
-    LONG_CONFIDENCE_THRESHOLD: float = 0.40
-    SHORT_CONFIDENCE_THRESHOLD: float = 0.40
-    MIN_EXPECTED_RETURN_PCT: float = 0.03
-    USE_REGIME_FILTER: bool = True
-    REGIME_MIN_ADX: float = 20.0
-    LONG_RSI_MIN: float = 55.0
-    LONG_RSI_MAX: float = 65.0
-    SHORT_RSI_MIN: float = 35.0
-    SHORT_RSI_MAX: float = 45.0
-    LONG_MIN_TREND_SMA_20_50: float = 0.0
-    SHORT_MAX_TREND_SMA_20_50: float = 0.0
+    MIN_REWARD_RISK_RATIO: float = 1.5   # Loosened from 2.0
+    MIN_DIRECTIONAL_EDGE: float = 0.02   # Loosened from 0.05
+    AI_CONFIDENCE_THRESHOLD: float = 0.35 # Loosened from 0.40
+    LONG_CONFIDENCE_THRESHOLD: float = 0.35
+    SHORT_CONFIDENCE_THRESHOLD: float = 0.35
+    MIN_EXPECTED_RETURN_PCT: float = 0.01 # Loosened from 0.03
+    USE_REGIME_FILTER: bool = False      # Disabled to let NN learn
+    REGIME_MIN_ADX: float = 15.0
+    LONG_RSI_MIN: float = 40.0           # Loosened
+    LONG_RSI_MAX: float = 80.0           # Loosened
+    SHORT_RSI_MIN: float = 20.0          # Loosened
+    SHORT_RSI_MAX: float = 60.0          # Loosened
+    LONG_MIN_TREND_SMA_20_50: float = -0.01
+    SHORT_MAX_TREND_SMA_20_50: float = 0.01
     TP_GRID_PCT: tuple[float, ...] = (0.6, 0.8, 1.0, 1.2, 1.5, 2.0)
     SL_GRID_PCT: tuple[float, ...] = (0.3, 0.4, 0.5, 0.6, 0.8, 1.0)
     ATR_LENGTH: int = 14
@@ -69,8 +69,8 @@ class StrategyConfig:
     SL_ATR_MULTIPLIERS: tuple[float, ...] = (0.75, 1.0, 1.25, 1.5)
     MIN_ATR_STOP_PCT: float = 0.25
     MAX_ATR_STOP_PCT: float = 1.50
-    MIN_ATR_TARGET_PCT: float = 0.50
-    MAX_ATR_TARGET_PCT: float = 4.00
+    MIN_ATR_TARGET_PCT: float = 0.80 # Increased from 0.50 to cover fees better
+    MAX_ATR_TARGET_PCT: float = 5.00
 
 @dataclass
 class ModelConfig:
@@ -87,8 +87,8 @@ class TrainingConfig:
     EPOCHS: int = 50
     LR: float = 0.0005
     FOCAL_NEUTRAL_VIOLATION_SCALE: float = 2.0
-    TRAINING_DATA_DAYS: int = 365
-    VALIDATION_DATA_DAYS: int = 45
+    TRAINING_DATA_DAYS: int = 300
+    VALIDATION_DATA_DAYS: int = 60
     TEST_DATA_DAYS: int = 30
     EARLY_STOP_PATIENCE: int = 7
     SHORT_OBJECTIVE: str = "three_class_long_neutral_short"
