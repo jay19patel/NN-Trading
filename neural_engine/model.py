@@ -85,7 +85,7 @@ class MultiHeadTradingModel(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self._sequence_max_len = max_sequence_len
@@ -114,6 +114,19 @@ class MultiHeadTradingModel(nn.Module):
             nn.Sigmoid(),
         )
 
+        self.magnitude_head = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+
+        self.time_head = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid(), # Time is relative 0-1 (normalized by lookahead)
+        )
+
     def forward(self, window_features: torch.Tensor) -> Dict[str, torch.Tensor]:
         if window_features.size(1) > self._sequence_max_len:
             raise ValueError(f"Sequence length {window_features.size(1)} exceeds positional encoding max")
@@ -140,6 +153,8 @@ class MultiHeadTradingModel(nn.Module):
         return {
             "direction": self.signal_head(shared),
             "sizing": self.sizing_head(shared),
+            "magnitude": self.magnitude_head(shared),
+            "time": self.time_head(shared),
         }
 
 class FocalLoss(nn.Module):
@@ -216,6 +231,13 @@ class TradingLoss(nn.Module):
         signal_loss = self.direction_loss(signal_logits, true_signal)
         sizing_loss = self.mse(sizing_out, true_sizing)
 
+        # New Magnitude and Time losses
+        true_magnitude = targets.get("magnitude", torch.zeros_like(sizing_out[:, 0])).unsqueeze(1)
+        true_time = targets.get("time", torch.zeros_like(sizing_out[:, 0])).unsqueeze(1)
+        
+        magnitude_loss = self.mse(predictions["magnitude"], true_magnitude)
+        time_loss = self.mse(predictions["time"], true_time)
+
         # actual_pnl_pct is the expected return from oracle.
         # We want to weight the signal loss by the magnitude of the potential gain/loss.
         actual_pnl = targets.get("actual_pnl_pct", torch.zeros_like(true_qty))
@@ -228,5 +250,18 @@ class TradingLoss(nn.Module):
         target_qty_from_signal = directional_edge.clamp(0.0, 1.0)
         consistency_loss = self.mse(sizing_out[:, 0], target_qty_from_signal.detach())
 
-        total = (self.alpha * weighted_signal_loss + self.beta * sizing_loss + self.consistency_weight * consistency_loss)
-        return {"total": total, "signal_loss": signal_loss, "sizing_loss": sizing_loss, "consistency_loss": consistency_loss}
+        total = (
+            self.alpha * weighted_signal_loss + 
+            self.beta * sizing_loss + 
+            self.consistency_weight * consistency_loss +
+            0.5 * magnitude_loss + 
+            0.2 * time_loss
+        )
+        return {
+            "total": total, 
+            "signal_loss": signal_loss, 
+            "sizing_loss": sizing_loss, 
+            "consistency_loss": consistency_loss,
+            "magnitude_loss": magnitude_loss,
+            "time_loss": time_loss
+        }

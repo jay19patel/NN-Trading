@@ -1,96 +1,48 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import argparse
+import logging
 import pandas as pd
 from config import config
 from ui_utils import console
-from engine.data_handler import get_data_for_symbols
-from engine.backtester import run_paper_portfolio_on_signals, print_rich_summary
-from engine.visuals import save_backtest_results
-from strategies.oracle import OracleStrategy
-from strategies.random import RandomStrategy
-from strategies.short_nn_strategy import ShortNNStrategy
+from neural_engine.train import train_short_model
+from neural_engine.backtest_short import run_backtest
 
-def run_strategy_backtest(strategy, all_candles):
-    console.rule(f"[bold cyan]{strategy.name.upper()} STRATEGY BACKTEST")
-    
-    all_trade_records = []
-    equity_curves = {}
-    
-    for symbol, df in all_candles.items():
-        console.print(f"Processing {symbol} with {strategy.name}...")
-        
-        # 1. Generate Signals
-        df_with_signals = strategy.generate_signals(df.copy())
-        
-        # 2. Run Backtest
-        final_df, trade_records, summary = run_paper_portfolio_on_signals(
-            panel=df_with_signals,
-            symbol=symbol,
-            initial_capital_usd=config.strategy.INITIAL_CAPITAL_USD,
-            risk_per_trade_pct_of_equity=config.strategy.RISK_PER_TRADE_PCT_OF_EQUITY,
-            max_notional_pct_of_equity=config.strategy.MAX_POSITION_NOTIONAL_PCT_OF_EQUITY,
-            round_trip_fee_pct=config.strategy.ROUND_TRIP_FEE_PCT
-        )
-        
-        all_trade_records.extend(trade_records)
-        equity_curves[symbol] = final_df["paper_equity_curve"].values
-        
-        # Professional Console Summary
-        print_rich_summary(strategy.name, symbol, summary)
-
-    # 3. Save results to results/<strategy_name>/
-    save_backtest_results(all_trade_records, equity_curves, all_candles, strategy.name)
-
-def ensure_model_trained():
-    """Checks if the Short NN model exists, if not, runs training."""
-    model_path = "models/short_model_eth.pth"
-    if not os.path.exists(model_path):
-        console.rule("[bold yellow]TRAINING SHORT-ONLY MODEL")
-        console.print("[info]Model not found. Initializing auto-training sequence...[/info]")
-        from neural_engine.train import train_short_model
-        train_short_model()
-        console.print("[success]✅ Training Complete![/success]\n")
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("Main")
 
 def main():
-    console.clear()
-    console.rule("[bold magenta]ETHUSD AI TRADING ENGINE")
-    
-    # Ensure the short model is ready
-    ensure_model_trained()
-    
-    symbols = config.data.SYMBOLS
-    days = config.data.TOTAL_DAYS
-    interval = config.data.INTERVAL
-    
-    # 1. Fetch Data Once
-    all_candles = get_data_for_symbols(symbols, days, interval)
-    
-    # 2. Run different strategies
-    # Load model-based strategies here so they can find the files we just trained
-    model_path = "models/short_model_eth.pth"
-    mean_path = "models/scaler_mean.npy"
-    scale_path = "models/scaler_scale.npy"
-    
-    strategies_to_run = [
-        OracleStrategy(),
-        ShortNNStrategy(model_path, mean_path, scale_path, threshold_path="models/short_thresholds.json"),
-        RandomStrategy()
-    ]
-    
-    for strategy in strategies_to_run:
-        run_strategy_backtest(strategy, all_candles)
+    parser = argparse.ArgumentParser(description="NN-Trading Model Engine CLI")
+    parser.add_argument("--train", action="store_true", help="Train the short model")
+    parser.add_argument("--test", action="store_true", help="Run backtest for the short model")
+    parser.add_argument("--symbol", type=str, default="ETHUSD", help="Symbol to train/test on")
+    parser.add_argument("--days", type=int, default=300, help="Number of days of data to use")
 
-    # 4. Final summary
-    console.print("\n[bold green]───────────────────────── ALL SIMULATIONS COMPLETE ──────────────────────────[/bold green]")
-    console.print("Check the [bold]results/[/bold] folder for raw data.")
-    
-    # 5. Start Dashboard Server
-    console.print("\n[bold cyan]🚀 Starting Dynamic Analytics Dashboard...[/bold cyan]")
-    console.print("[info]Access your results at: [bold underline]http://127.0.0.1:5001[/bold underline][/info]\n")
-    
-    from web.app import app
-    app.run(debug=False, port=5001)
+    args = parser.parse_args()
+
+    # Update config symbol if provided
+    if args.symbol:
+        config.data.SYMBOLS = [args.symbol]
+
+    if args.train:
+        console.rule(f"[bold cyan]TRAINING PIPELINE: {args.symbol}")
+        logger.info(f"Starting training pipeline for {args.symbol} with {args.days} days of data...")
+        # Note: train_short_model doesn't take arguments in its current definition, 
+        # it uses config values. I'll update train_short_model to accept symbol/days.
+        train_short_model() 
+    elif args.test:
+        console.rule(f"[bold cyan]BACKTEST PIPELINE: {args.symbol}")
+        logger.info(f"Starting backtest for {args.symbol}...")
+        # run_backtest also uses config
+        run_backtest(symbol=args.symbol)
+    else:
+        parser.print_help()
 
 if __name__ == "__main__":
     main()

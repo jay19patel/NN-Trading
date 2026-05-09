@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import numba
 from config import config
-from ui_utils import console, get_progress
 
 FEATURE_CACHE_VERSION = config.features.FEATURE_CACHE_VERSION
 
