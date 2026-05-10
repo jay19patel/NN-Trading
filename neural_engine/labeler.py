@@ -138,6 +138,8 @@ def _compute_oracle_labels_jit(
     max_target_pct: float,
     min_stop_pct: float,
     max_stop_pct: float,
+    sma50: np.ndarray,
+    atr_ratio: np.ndarray,
 ):
     """
     Core Oracle labeling loop — fully JIT-compiled for speed.
@@ -188,25 +190,31 @@ def _compute_oracle_labels_jit(
                 if rr < min_rr:
                     continue
 
-                # Test LONG
-                l_code, l_pnl, l_time = _simulate_trade_path(
-                    close_prices, high_prices, low_prices,
-                    row_index, lookahead, tp_pct, sl_pct, True, entry_long,
-                )
-                l_net = l_pnl - cost_pct
-                if l_code == 0 and l_net > best_net_return:
-                    best_label, best_tp, best_sl = 0, tp_pct, sl_pct
-                    best_net_return, best_time, best_magnitude = l_net, float(l_time), tp_pct
+                # Volatility Filter: Skip if current ATR is much higher than average (noisy regime)
+                if atr_ratio[row_index] > 1.5:
+                    continue
 
-                # Test SHORT
-                s_code, s_pnl, s_time = _simulate_trade_path(
-                    close_prices, high_prices, low_prices,
-                    row_index, lookahead, tp_pct, sl_pct, False, entry_short,
-                )
-                s_net = s_pnl - cost_pct
-                if s_code == 0 and s_net > best_net_return:
-                    best_label, best_tp, best_sl = 2, tp_pct, sl_pct
-                    best_net_return, best_time, best_magnitude = s_net, float(s_time), -tp_pct
+                # Test LONG (Only if Price > SMA50)
+                if close_prices[row_index] > sma50[row_index]:
+                    l_code, l_pnl, l_time = _simulate_trade_path(
+                        close_prices, high_prices, low_prices,
+                        row_index, lookahead, tp_pct, sl_pct, True, entry_long,
+                    )
+                    l_net = l_pnl - cost_pct
+                    if l_code == 0 and l_net > best_net_return:
+                        best_label, best_tp, best_sl = 0, tp_pct, sl_pct
+                        best_net_return, best_time, best_magnitude = l_net, float(l_time), tp_pct
+
+                # Test SHORT (Only if Price < SMA50)
+                if close_prices[row_index] < sma50[row_index]:
+                    s_code, s_pnl, s_time = _simulate_trade_path(
+                        close_prices, high_prices, low_prices,
+                        row_index, lookahead, tp_pct, sl_pct, False, entry_short,
+                    )
+                    s_net = s_pnl - cost_pct
+                    if s_code == 0 and s_net > best_net_return:
+                        best_label, best_tp, best_sl = 2, tp_pct, sl_pct
+                        best_net_return, best_time, best_magnitude = s_net, float(s_time), -tp_pct
 
         if best_net_return > 0.0:
             labels[row_index] = best_label
@@ -275,6 +283,8 @@ class OracleLabeler:
             training.MAX_ATR_TARGET_PCT,
             training.MIN_ATR_STOP_PCT,
             training.MAX_ATR_STOP_PCT,
+            df["sma_50"].values if "sma_50" in df.columns else df["Close"].rolling(50).mean().fillna(df["Close"]).values,
+            (df["atr"] / df["atr"].rolling(100).mean()).fillna(1.0).values,
         )
 
         df["direction_label"] = labels

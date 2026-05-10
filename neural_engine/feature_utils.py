@@ -117,7 +117,9 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['buy_pressure'] = (close - low) / (candle_range + 1e-9)
     df['wick_imbalance'] = df['upper_wick_pct_range'] - df['lower_wick_pct_range']
     
-    # Advanced Volatility
+    # Advanced Volatility & Efficiency
+    df['atr_ratio'] = df['atr'] / (df['atr'].rolling(100).mean() + 1e-9)  # High = Over-extended volatility
+    df['efficiency_ratio'] = (close - close.shift(10)).abs() / (candle_range.rolling(10).sum() + 1e-9) # Trending vs Choppy
     df['range_compression'] = candle_range.rolling(10).mean() / (candle_range.rolling(50).mean() + 1e-9)
     df['fractal_proxy'] = df['natr'] / (df['realized_vol_10'] + 1e-9)
     
@@ -151,7 +153,7 @@ def get_feature_columns():
         'vol_ratio', 'vol_zscore_20', 'vol_trend_5_20',
         'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
         'price_to_vwap', 'buy_pressure', 'wick_imbalance',
-        'range_compression', 'fractal_proxy',
+        'atr_ratio', 'efficiency_ratio', 'range_compression', 'fractal_proxy',
         'trend_strength', 'rsi_7',
         'surprise', 'shock_elasticity'
     ]

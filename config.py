@@ -30,7 +30,7 @@ class NNModelConfig:
 
     # --- Data Source ---
     SYMBOLS: list[str] = field(default_factory=lambda: ["ETHUSD"])
-    INTERVAL: str = "15m"           # Shifted to 1h to eliminate HFT noise and boost PnL
+    INTERVAL: str = "1h"           # Shifted to 1h to eliminate HFT noise and boost PnL
     CACHE_VALID_MINS: int = 0      # 0 = always fetch fresh data
 
     # --- Transformer Architecture ---
@@ -78,8 +78,8 @@ class TrainingConfig(TradeBoundsConfig):
     # --- Oracle Labeling (Balanced 1:1 Risk:Reward Strategy) ---
     # Equal targets and stops. Because we use a Macro Trend Filter, the win-rate
     # will stay above 50%, ensuring mathematically guaranteed long-term positive PnL.
-    TP_ATR_MULTIPLIERS: tuple[float, ...] = (0.8, 1.0, 1.2)
-    SL_ATR_MULTIPLIERS: tuple[float, ...] = (0.8, 1.0, 1.2)
+    TP_ATR_MULTIPLIERS: tuple[float, ...] = (1.2, 1.5, 2.0)
+    SL_ATR_MULTIPLIERS: tuple[float, ...] = (1.0, 1.2, 1.5)
     ATR_LENGTH: int = 14
     ORACLE_MIN_RR: float = 1   # STRICT 1:1 RR ratio
 
@@ -88,7 +88,7 @@ class TrainingConfig(TradeBoundsConfig):
     EPOCHS: int = 50               # High max; early stopping prevents overfit
     LR: float = 0.0001             # Lower LR to prevent model collapse
     EARLY_STOP_PATIENCE: int = 10   # Epochs without val improvement before stopping
-    FOCAL_GAMMA: float = 2.0       # Focal loss focusing parameter
+    FOCAL_GAMMA: float = 3.0       # Higher gamma focus on harder, clear patterns
     FOCAL_NEUTRAL_VIOLATION_SCALE: float = 2.0  # Penalty when model wrongly trades on NEUTRAL
 
     # --- Threshold Search ---
@@ -97,7 +97,7 @@ class TrainingConfig(TradeBoundsConfig):
     # --- Cache Versioning ---
     # Bump this number whenever any labeling/feature param above changes.
     # This forces train.py to rebuild the parquet cache instead of using stale data.
-    FEATURE_CACHE_VERSION: int = 110
+    FEATURE_CACHE_VERSION: int = 112
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +128,9 @@ class TestingConfig(TradeBoundsConfig):
     #
     # Example: prob_long=0.48, prob_neutral=0.33, prob_short=0.19
     #   margin = 0.48 - 0.33 = 0.15 → FIRES
-    SIGNAL_MARGIN_THRESHOLD: float = 0.10        # Lowered to 0.10 to allow more signals (including SHORTs)
-    AI_CONFIDENCE_THRESHOLD: float = 0.45        # Lowered to 0.45 to increase trade frequency
-    USE_TREND_FILTER: bool = True               # Disabled for now so we can see both LONG and SHORT trades
+    SIGNAL_MARGIN_THRESHOLD: float = 0.12        # Stricter margin for higher precision
+    AI_CONFIDENCE_THRESHOLD: float = 0.48        # Higher floor to filter noise
+    USE_TREND_FILTER: bool = True               # Strictly trade with macro trend
     AI_TARGET_DISCOUNT_FACTOR: float = 0.80     # Scale down AI targets for conservative exits (1.0 = No discount)
 
     # --- Execution Guards ---

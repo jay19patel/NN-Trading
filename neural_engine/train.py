@@ -135,9 +135,9 @@ def _prepare_symbol_frame(
         if missing:
             raise ValueError(f"{symbol}: missing OHLCV columns {missing}")
 
+        df = add_technical_indicators(df)
         labeler = OracleLabeler()
         df = labeler.generate_labels(df.copy())
-        df = add_technical_indicators(df)
 
         # Drop the warmup window to avoid NaN-polluted rows from slow indicators
         df = df.iloc[INDICATOR_WARMUP_BARS:]
