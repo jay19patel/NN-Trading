@@ -46,57 +46,104 @@ The configuration is divided into logical blocks:
 
 ---
 
-## 🧠 Model Architecture: Multi-Head Transformer
+## 🧠 AI Model: Input & Output Architecture
 
-Instead of a simple "Up/Down" prediction, this model uses a **Multi-Task Learning** approach:
+Hamara **Multi-Head Transformer Model** kaise data leta hai aur kya soch kar output nikalta hai, iski poori technical detail yaha di gayi hai.
 
-### How it works (Example):
-When the model sees a price action (e.g., a "Hammer" candle after a downtrend):
-1.  **Head 1 (Direction)**: Predicts `SHORT`, `LONG`, or `NEUTRAL`.
-2.  **Head 2 (Sizing)**: Predicts exactly where the **Take Profit** and **Stop Loss** should be based on current volatility.
-3.  **Head 3 (Magnitude)**: Predicts how big the move will be (e.g., +2.5%).
-4.  **Head 4 (Time)**: Predicts how many candles it will take to hit the target.
+### 1. Model Ko Kya Data Diya Jata Hai? (INPUTS)
+Model ek 3D tensor leta hai jiska shape hai: `(Batch Size, WINDOW_SIZE, Num Features)`
+* **WINDOW_SIZE:** `48` (Yani model ek baar me pichle 48 candles ek sath dekhta hai).
+* **Num Features:** `49` (Har candle ke baare me 49 alag-alag metrics).
 
-### Internal Structure:
-- **Input**: 40+ Features (RSI, MACD, Volume Z-Score, etc.)
-- **Processor**: Transformer Encoder with Multi-Head Attention.
-- **Output**: 4 Parallel Linear Heads.
+**49 Features me kya-kya hota hai?**
+1. **Price Data:** Returns (`return_1`, `return_5`, `log_return` etc.)
+2. **Microstructure & Scalping:** `price_to_vwap`, `buy_pressure`, `wick_imbalance`, `range_compression`, `fractal_proxy`
+3. **Trend & Momentum:** `supertrend`, `trend_strength`, `rsi_7`, `macd`
+4. **Volatility:** `natr`, `realized_vol_10`, `bb_width`
+5. **Information Theory:** `surprise`, `shock_elasticity`
+6. **Time Context:** `hour_sin`, `dow_sin`
 
----
-
-## 🔍 Deep Dive: Understanding AI Predictions
-
-When you run a prediction, the model doesn't just give a "Buy/Sell" signal. It outputs a complex data structure:
-
-### 1. Directional Verdict (Probability)
-The model outputs a probability distribution across 3 classes:
-- **Long**: Confidence that price will hit `ORACLE_MIN_RR` target before stop.
-- **Neutral**: High volatility but no clear direction, or sideways market.
-- **Short**: Confidence that price will drop to target.
-*The engine only takes a trade if the confidence exceeds the threshold (e.g., > 45%).*
-
-### 2. Intelligent Sizing (Dynamic TP/SL)
-Unlike traditional bots, our AI predicts the **Take Profit (TP)** and **Stop Loss (SL)** for *every* trade based on market volatility:
-- **tp_pct**: Calculated as `predicted_sizing * MAX_ATR_TARGET_PCT`.
-- **sl_pct**: Calculated as `predicted_sizing * MAX_ATR_STOP_PCT`.
-
-### 3. Price Magnitude & Horizon
-- **Predicted Magnitude**: How much % the price is expected to move in the predicted direction.
-- **Predicted Time**: How many bars (15m intervals) the model expects the trade to stay active.
+### 2. Model Kya Predict Karta Hai? (OUTPUTS)
+Model ek sath **3 alag-alag cheezein (Heads)** predict karta hai:
+1. **Signal Head (Direction):** Predicts probabilities for LONG, NEUTRAL, and SHORT.
+2. **Sizing Head (Target & Risk):** Predicts Quantity Ratio, Normalized Take Profit %, and Normalized Stop Loss %.
+3. **Magnitude Head:** Predicts the total expected move magnitude.
 
 ---
 
-## 💻 Example: Model Output Structure
-If you print the model's output during inference, it looks like this:
+## 🚀 EXACT REPLICA EXAMPLE (Python/JSON Format)
+
+Agar aap code ke through model ko use karenge (Inference phase), toh data kuch is tarah ka dikhega:
+
+### 📥 INPUT DATA (Jo hum model ko pass karte hai)
+```python
+import numpy as np
+import torch
+
+# 1 Sample (Batch), 48 Candles ka history, 49 Features har candle ke
+input_tensor = torch.tensor([
+    [
+        # Candle 1 (Sabse purani)
+        [0.0012, -0.05, 1.05, 0.45, ... 49th feature], 
+        # Candle 2
+        [0.0021, -0.02, 1.10, 0.47, ... 49th feature],
+        # ...
+        # Candle 48 (Abhi ki current candle)
+        [-0.0010, 0.01, 0.98, 0.35, ... 49th feature]
+    ]
+]) # Shape: (1, 48, 49)
+
+### 📤 RAW OUTPUT DATA (PyTorch Tensors)
+Jab model ka inference chalta hai, toh wo seedha dictionary nahi deta. Wo 3 PyTorch Tensors return karta hai (Kyuki 3 Heads hai):
 
 ```python
+# Model Returns 3 Tensors at once!
+signal_logits, sizing, magnitude = model(input_tensor)
+
+print(signal_logits) 
+# Output: tensor([[-1.245, 0.531, 2.103]], grad_fn=<AddmmBackward0>) 
+# (Yani: [LONG, NEUTRAL, SHORT] ke raw scores, jinhe hum Softmax karke % banate hai)
+
+print(sizing)
+# Output: tensor([[0.950, 0.055, 0.150]], grad_fn=<SigmoidBackward0>)
+# (Yani: [Qty_Ratio, Raw_TP, Raw_SL] 0-1 scale par)
+
+print(magnitude)
+# Output: tensor([[0.420]], grad_fn=<SigmoidBackward0>)
+# (Yani: Expected move size)
+```
+
+### ⚙️ PARSED OUTPUT (Dictionaries)
+Jab hum un raw tensors ko engine me clean kar lete hai, tab wo aise dikhte hai:
+
+```python
+# 1. Signal Head Output (Logits -> Probabilities me convert karne ke baad)
+ai_probabilities = {
+    "LONG": 0.526,    # 52.6% confidence market upar jayega
+    "NEUTRAL": 0.310, # 31.0% confidence flat rahega
+    "SHORT": 0.164    # 16.4% confidence niche jayega
+}
+
+# 2. Sizing Head Output (0-1 format me)
+sizing_output = {
+    "qty_ratio": 0.95,          # 95% quantity use karo
+    "raw_tp": 0.055,            # Raw value from sigmoid
+    "raw_sl": 0.150             # Raw value from sigmoid
+}
+
+# 3. Magnitude Head Output
+expected_volatility = 0.42      # Expected overall move strength
+```
+
+### Final Trading Signal (Jo engine ko samajh aayega)
+```json
 {
-    "verdict": "SHORT",          # Predicted Side
-    "confidence": 0.82,          # 82% sure about the move
-    "take_profit_pct": 1.45,     # AI suggested target (+1.45%)
-    "stop_loss_pct": 0.80,       # AI suggested risk (-0.80%)
-    "expected_magnitude": 2.10,  # Expected total drop
-    "expected_duration": 12      # Expected to hit target in 3 hours (12 bars)
+    "action": "LONG",
+    "confidence": 52.6,
+    "entry_price": 2345.00,
+    "take_profit_pct": 0.33,
+    "stop_loss_pct": 0.30,
+    "suggested_quantity_ratio": 0.95
 }
 ```
 

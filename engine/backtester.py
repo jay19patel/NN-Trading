@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 import pandas as pd
-from config import config
+from config import cfg
 
 @dataclass
 class PaperTradeRecord:
@@ -35,43 +35,35 @@ class PaperTradeRecord:
     holding_duration_mins: float = 0.0
     mae_pct: float = 0.0
     mfe_pct: float = 0.0
+    max_price_reached: float = 0.0
+    min_price_reached: float = 0.0
 
-def compute_position_size_for_risk_budget(
+def compute_position_size_for_margin_budget(
     equity_usd: float,
     entry_price: float,
-    stop_loss_pct: float,
-    risk_budget_fraction_of_equity: float,
-    max_notional_fraction_of_equity: float,
-    qty_ratio: float = 1.0,
+    margin_budget_fraction_of_equity: float,
+    leverage: float,
 ) -> tuple[float, float]:
     if entry_price <= 0 or equity_usd <= 0:
         return 0.0, 0.0
-    stop_distance_fraction = max(float(stop_loss_pct) / 100.0, 1e-5)
-    dollars_at_risk_per_unit = entry_price * stop_distance_fraction
-    risk_budget_usd = equity_usd * risk_budget_fraction_of_equity
-    quantity = (risk_budget_usd / dollars_at_risk_per_unit) * qty_ratio
-    notional_usd = quantity * entry_price
-    max_notional_usd = equity_usd * max_notional_fraction_of_equity
-    if notional_usd > max_notional_usd and max_notional_usd > 0:
-        scale = max_notional_usd / notional_usd
-        quantity *= scale
-        notional_usd = quantity * entry_price
+    margin_usd = equity_usd * margin_budget_fraction_of_equity
+    notional_usd = margin_usd * leverage
+    quantity = notional_usd / entry_price
     return float(quantity), float(notional_usd)
 
 def run_paper_portfolio_on_signals(
     panel: pd.DataFrame,
     symbol: str,
     initial_capital_usd: float,
-    risk_per_trade_pct_of_equity: float,
-    max_notional_pct_of_equity: float,
+    margin_per_trade_pct_of_equity: float,
+    leverage: float,
     round_trip_fee_pct: float,
 ) -> tuple[pd.DataFrame, List[PaperTradeRecord], dict]:
-    risk_fraction = risk_per_trade_pct_of_equity / 100.0
-    max_notional_fraction = max_notional_pct_of_equity
+    margin_fraction = margin_per_trade_pct_of_equity / 100.0
     fee_fraction_per_leg = (round_trip_fee_pct / 100.0) / 2.0
-    slippage_fraction = config.strategy.SLIPPAGE_PCT / 100.0
-    lookahead_limit = config.features.LOOKAHEAD_BARS
-    max_slots = config.strategy.PARALLEL_SLOTS
+    slippage_fraction = cfg.testing.SLIPPAGE_PCT / 100.0
+    lookahead_limit = cfg.testing.LOOKAHEAD_BARS
+    max_slots = cfg.testing.PARALLEL_SLOTS
 
     working_frame = panel.sort_index().copy()
     equity_usd = float(initial_capital_usd)
@@ -94,38 +86,88 @@ def run_paper_portfolio_on_signals(
         curr_low = float(row["Low"])
         curr_time = str(row.name)
 
+        curr_day = str(row.name)[:10]
+        if curr_day != last_day:
+            last_day = curr_day
+            daily_trade_count = 0
+            daily_start_equity = equity_usd
+            trading_locked_for_day = False
+
+        if equity_usd <= daily_start_equity * (1 - cfg.testing.DAILY_STOP_LOSS_PCT / 100.0):
+            trading_locked_for_day = True
+
+        if cooldown_bars_left > 0:
+            cooldown_bars_left -= 1
+
         # 1. Handle Active Trades
         finished_trades_indices = []
         for idx, t in enumerate(active_trades):
             t["bars_held"] += 1
             hit_tp = False
             hit_sl = False
+            hit_liq = False
             exit_price = curr_price
             outcome = "NONE"
 
             if t["side"] == "LONG":
-                if curr_high >= t["tp_price"]:
+                curr_mfe = ((curr_high - t["entry_price"]) / t["entry_price"]) * 100.0
+                curr_mae = ((curr_low - t["entry_price"]) / t["entry_price"]) * 100.0
+                t["mfe_pct"] = max(t["mfe_pct"], curr_mfe)
+                t["mae_pct"] = min(t["mae_pct"], curr_mae)
+
+                if curr_low <= t["liq_price"]:
+                    hit_liq, exit_price = True, t["liq_price"]
+                elif curr_high >= t["tp_price"]:
                     hit_tp, exit_price = True, t["tp_price"]
-                if curr_low <= t["sl_price"]:
+                elif curr_low <= t["sl_price"]:
                     hit_sl, exit_price = True, t["sl_price"]
             else: # SHORT
-                if curr_low <= t["tp_price"]:
+                curr_mfe = ((t["entry_price"] - curr_low) / t["entry_price"]) * 100.0
+                curr_mae = ((t["entry_price"] - curr_high) / t["entry_price"]) * 100.0
+                t["mfe_pct"] = max(t["mfe_pct"], curr_mfe)
+                t["mae_pct"] = min(t["mae_pct"], curr_mae)
+
+                if curr_high >= t["liq_price"]:
+                    hit_liq, exit_price = True, t["liq_price"]
+                elif curr_low <= t["tp_price"]:
                     hit_tp, exit_price = True, t["tp_price"]
-                if curr_high >= t["sl_price"]:
+                elif curr_high >= t["sl_price"]:
                     hit_sl, exit_price = True, t["sl_price"]
 
-            if hit_tp and hit_sl:
-                outcome, exit_reason, exit_price = "FAILED", "SL_HIT", t["sl_price"]
+            if hit_liq:
+                outcome, exit_reason = "FAILED", "💀 Liquidated"
+                t["mae_pct"] = min(t["mae_pct"], -100.0) # Full margin loss
+            elif hit_tp and hit_sl:
+                outcome, exit_reason, exit_price = "FAILED", "🛑 SL Hit", t["sl_price"]
+                t["mae_pct"] = min(t["mae_pct"], -t["sl_pct"])
             elif hit_tp:
-                outcome, exit_reason = "SUCCESS", "TP_HIT"
+                outcome, exit_reason = "SUCCESS", "🎯 TP Hit"
+                t["mfe_pct"] = max(t["mfe_pct"], t["tp_pct"])
             elif hit_sl:
-                outcome, exit_reason = "FAILED", "SL_HIT"
+                outcome, exit_reason = "FAILED", "🛑 SL Hit"
+                t["mae_pct"] = min(t["mae_pct"], -t["sl_pct"])
             elif t["bars_held"] >= lookahead_limit:
-                outcome, exit_reason, exit_price = "TIMEOUT", "TIME_OUT", curr_price
+                outcome, exit_reason, exit_price = "TIMEOUT", "⏳ Time Out", curr_price
             else:
                 exit_reason = "NONE"
 
             if outcome != "NONE":
+                # --- NEW LOGIC: Compute absolute potential max/min over the full lookahead window ---
+                start_idx = t["entry_index"]
+                end_idx = min(len(working_frame), start_idx + lookahead_limit + 1)
+                future_highs = working_frame['High'].iloc[start_idx:end_idx]
+                future_lows = working_frame['Low'].iloc[start_idx:end_idx]
+                
+                if not future_highs.empty:
+                    t["max_price"] = future_highs.max()
+                    t["min_price"] = future_lows.min()
+                    if t["side"] == "LONG":
+                        t["mfe_pct"] = ((t["max_price"] - t["entry_price"]) / t["entry_price"]) * 100.0
+                        t["mae_pct"] = ((t["min_price"] - t["entry_price"]) / t["entry_price"]) * 100.0
+                    else:
+                        t["mfe_pct"] = ((t["entry_price"] - t["min_price"]) / t["entry_price"]) * 100.0
+                        t["mae_pct"] = ((t["entry_price"] - t["max_price"]) / t["entry_price"]) * 100.0
+
                 if t["side"] == "LONG":
                     real_exit_price = exit_price * (1 - slippage_fraction)
                     return_fraction = (real_exit_price - t["entry_price"]) / t["entry_price"]
@@ -146,40 +188,60 @@ def run_paper_portfolio_on_signals(
                     outcome=outcome, return_fraction=return_fraction, pnl_gross_usd=pnl_net + fees_usd,
                     slippage_usd=0, fees_usd=fees_usd, pnl_net_usd=pnl_net,
                     capital_before_usd=t["capital_before"], equity_after_usd=equity_usd, 
-                    exit_reason=exit_reason, holding_bars=t["bars_held"]
+                    exit_reason=exit_reason, holding_bars=t["bars_held"],
+                    mae_pct=t["mae_pct"], mfe_pct=t["mfe_pct"],
+                    max_price_reached=t["max_price"], min_price_reached=t["min_price"]
                 ))
                 finished_trades_indices.append(idx)
+                
+                # Update execution guards based on exit
+                cooldown_bars_left = cfg.testing.COOLDOWN_BARS
+                if outcome == "FAILED":
+                    consecutive_losses += 1
+                elif outcome == "SUCCESS":
+                    consecutive_losses = 0
 
         for idx in sorted(finished_trades_indices, reverse=True):
             active_trades.pop(idx)
 
         # 2. Check for New Signal
-        if len(active_trades) < max_slots:
+        can_trade = (
+            not trading_locked_for_day and 
+            cooldown_bars_left == 0 and 
+            consecutive_losses < cfg.testing.MAX_CONSECUTIVE_LOSSES and 
+            daily_trade_count < cfg.testing.MAX_DAILY_TRADES
+        )
+
+        if len(active_trades) < max_slots and can_trade:
             verdict = int(row["ai_verdict"])
             if verdict != 1:
                 side = "LONG" if verdict == 0 else "SHORT"
                 confidence = float(row.get("ai_confidence", 0.0))
-                if confidence < config.strategy.AI_CONFIDENCE_THRESHOLD: continue
+                if confidence < cfg.testing.AI_CONFIDENCE_THRESHOLD: continue
 
-                tp_pct = float(row["ai_take_profit_pct"])
-                sl_pct = float(row["ai_stop_loss_pct"])
+                tp_pct = float(row["ai_take_profit_pct"]) * cfg.testing.AI_TARGET_DISCOUNT_FACTOR
+                sl_pct = float(row["ai_stop_loss_pct"]) * cfg.testing.AI_TARGET_DISCOUNT_FACTOR
                 
                 entry_price = curr_price * (1 + slippage_fraction if side == "LONG" else 1 - slippage_fraction)
                 tp_price = entry_price * (1 + tp_pct / 100.0) if side == "LONG" else entry_price * (1 - tp_pct / 100.0)
                 sl_price = entry_price * (1 - sl_pct / 100.0) if side == "LONG" else entry_price * (1 + sl_pct / 100.0)
+                
+                # Liquidation calculation based on leverage
+                liq_price = entry_price * (1 - (1.0 / leverage)) if side == "LONG" else entry_price * (1 + (1.0 / leverage))
 
-                quantity, notional_usd = compute_position_size_for_risk_budget(
-                    equity_usd, entry_price, sl_pct, risk_fraction, max_notional_fraction, float(row.get("ai_qty_ratio", 1.0))
+                quantity, notional_usd = compute_position_size_for_margin_budget(
+                    equity_usd, entry_price, margin_fraction, leverage
                 )
 
                 if quantity > 0:
                     active_trades.append({
                         "symbol": symbol, "side": side, "entry_price": entry_price, "tp_price": tp_price, "sl_price": sl_price,
-                        "sl_price_initial": sl_price, "tp_pct": tp_pct, "sl_pct": sl_pct, "quantity": quantity,
+                        "liq_price": liq_price, "sl_price_initial": sl_price, "tp_pct": tp_pct, "sl_pct": sl_pct, "quantity": quantity,
                         "notional_usd": notional_usd, "entry_time": curr_time, "entry_index": i,
                         "confidence": confidence, "qty_ratio": 1.0, "capital_before": equity_usd, "bars_held": 0,
-                        "mae_pct": 0.0, "mfe_pct": 0.0
+                        "mae_pct": 0.0, "mfe_pct": 0.0, "max_price": curr_high, "min_price": curr_low
                     })
+                    daily_trade_count += 1
 
     working_frame["paper_equity_curve"] = equity_by_bar
     summary = summarize_trade_feedback(trade_records)

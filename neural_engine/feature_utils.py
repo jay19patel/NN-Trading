@@ -107,6 +107,32 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df['hour_cos'] = 0.0
         df['dow_sin'] = 0.0
         df['dow_cos'] = 0.0
+        
+    # === ADVANCED SCALPING FEATURES ===
+    
+    # VWAP & Microstructure
+    vwap = ta.vwap(high, low, close, volume)
+    df['vwap'] = vwap if vwap is not None else close.rolling(20).mean()
+    df['price_to_vwap'] = (close - df['vwap']) / (df['vwap'] + 1e-9)
+    df['buy_pressure'] = (close - low) / (candle_range + 1e-9)
+    df['wick_imbalance'] = df['upper_wick_pct_range'] - df['lower_wick_pct_range']
+    
+    # Advanced Volatility
+    df['range_compression'] = candle_range.rolling(10).mean() / (candle_range.rolling(50).mean() + 1e-9)
+    df['fractal_proxy'] = df['natr'] / (df['realized_vol_10'] + 1e-9)
+    
+    # Advanced Trend & Momentum
+    supertrend = ta.supertrend(high, low, close, length=10, multiplier=3)
+    if supertrend is not None and "SUPERT_10_3" in supertrend.columns:
+        df['supertrend'] = supertrend["SUPERT_10_3"]
+    else:
+        df['supertrend'] = close.rolling(10).mean()
+    df['trend_strength'] = (close - df['supertrend']).abs() / (close + 1e-9)
+    df['rsi_7'] = ta.rsi(close, length=7)
+    
+    # Information Theory
+    df['surprise'] = (df['return_1'] - df['return_1'].rolling(20).mean()) / (df['return_1'].rolling(20).std() + 1e-9)
+    df['shock_elasticity'] = df['return_1'].abs() / (df['realized_vol_10'] + 1e-9)
     
     # Cleanup
     df = df.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -124,4 +150,8 @@ def get_feature_columns():
         'dist_high_20', 'dist_low_20', 'dist_high_50', 'dist_low_50',
         'vol_ratio', 'vol_zscore_20', 'vol_trend_5_20',
         'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
+        'price_to_vwap', 'buy_pressure', 'wick_imbalance',
+        'range_compression', 'fractal_proxy',
+        'trend_strength', 'rsi_7',
+        'surprise', 'shock_elasticity'
     ]
