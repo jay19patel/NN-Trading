@@ -19,7 +19,7 @@ from engine.data_handler import fetch_data
 from neural_engine.feature_utils import add_technical_indicators
 from neural_engine.labeler import OracleLabeler
 from engine.backtester import run_paper_portfolio_on_signals
-from neural_engine.backtest_short import _print_professional_backtest_summary
+from neural_engine.backtest_engine import _print_professional_backtest_summary
 
 logger = logging.getLogger("OracleBacktest")
 

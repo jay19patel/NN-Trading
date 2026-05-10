@@ -14,8 +14,8 @@ import sys
 
 from config import cfg
 from ui_utils import console
-from neural_engine.train import train_short_model
-from neural_engine.backtest_short import run_backtest
+from neural_engine.train import train_trading_model
+from neural_engine.backtest_engine import run_backtest
 from neural_engine.backtest_oracle import run_oracle_backtest
 
 logging.basicConfig(
@@ -45,7 +45,7 @@ def main() -> None:
     if args.train:
         console.rule(f"[bold cyan]TRAINING PIPELINE: {args.symbol}")
         logger.info(f"Starting training pipeline for {args.symbol}...")
-        train_short_model()
+        train_trading_model()
     elif args.test:
         console.rule(f"[bold cyan]BACKTEST PIPELINE: {args.symbol}")
         logger.info(f"Starting backtest for {args.symbol}...")

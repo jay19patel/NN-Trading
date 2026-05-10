@@ -365,12 +365,12 @@ def _threshold_search(
 # Main training entry point
 # ---------------------------------------------------------------------------
 
-def train_short_model() -> None:
+def train_trading_model() -> None:
     """
     Full training pipeline.  Reads from `cfg`, saves artifacts to models/.
     After training automatically runs the backtest.
     """
-    from neural_engine.backtest_short import run_backtest
+    from neural_engine.backtest_engine import run_backtest
 
     symbols = cfg.model.SYMBOLS
     interval = cfg.model.INTERVAL
@@ -450,7 +450,7 @@ def train_short_model() -> None:
 
     # ── Step 7: Training loop ─────────────────────────────────────────────
     os.makedirs("models", exist_ok=True)
-    best_model_path = os.path.join("models", "short_model_eth.pth")
+    best_model_path = os.path.join("models", "trading_model.pth")
     best_val_loss = float("inf")
     patience_counter = 0
 
@@ -544,5 +544,6 @@ def train_short_model() -> None:
     run_backtest(symbol=cfg.model.SYMBOLS[0])
 
 
+
 if __name__ == "__main__":
-    train_short_model()
+    train_trading_model()

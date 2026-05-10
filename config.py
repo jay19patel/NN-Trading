@@ -41,7 +41,7 @@ class NNModelConfig:
     MAX_SEQ_LEN: int = 256         # Positional encoding max length
 
     # --- Sequence Window ---
-    WINDOW_SIZE: int = 48          # Past candles fed to model (48 × 1h = 2 days of context)
+    WINDOW_SIZE: int = 96          # Past candles fed to model (48 × 1h = 2 days of context)
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +68,9 @@ class TrainingConfig(TradeBoundsConfig):
     """
 
     # --- Data Volume (Days) ---
-    TRAINING_DATA_DAYS: int = 500
-    VALIDATION_DATA_DAYS: int = 30
-    TEST_DATA_DAYS: int = 50
+    TRAINING_DATA_DAYS: int = 1000
+    VALIDATION_DATA_DAYS: int = 100
+    TEST_DATA_DAYS: int = 100
 
     # --- Leakage Prevention ---
     PURGE_BARS: int = 24           # Gap between train/val/test splits
@@ -84,10 +84,10 @@ class TrainingConfig(TradeBoundsConfig):
     ORACLE_MIN_RR: float = 1   # STRICT 1:1 RR ratio
 
     # --- Training Hyperparams ---
-    BATCH_SIZE: int = 64
+    BATCH_SIZE: int = 128
     EPOCHS: int = 50               # High max; early stopping prevents overfit
-    LR: float = 0.0003             # Lower LR to prevent model collapse
-    EARLY_STOP_PATIENCE: int = 8   # Epochs without val improvement before stopping
+    LR: float = 0.0001             # Lower LR to prevent model collapse
+    EARLY_STOP_PATIENCE: int = 10   # Epochs without val improvement before stopping
     FOCAL_GAMMA: float = 2.0       # Focal loss focusing parameter
     FOCAL_NEUTRAL_VIOLATION_SCALE: float = 2.0  # Penalty when model wrongly trades on NEUTRAL
 
@@ -116,7 +116,7 @@ class TestingConfig(TradeBoundsConfig):
 
     # --- Capital, Margin & Leverage ---
     INITIAL_CAPITAL_USD: float = 100.0
-    MARGIN_PER_TRADE_PCT_OF_EQUITY: float = 50.0  # Increased to 50% for high-impact 20x leverage results
+    MARGIN_PER_TRADE_PCT_OF_EQUITY: float = 30.0  # Increased to 50% for high-impact 20x leverage results
     LEVERAGE: float = 20.0                       # Default 20x realistic leverage
     ROUND_TRIP_FEE_PCT: float = 0.00             # Total fee for entry + exit
     SLIPPAGE_PCT: float = 0.00                   # Per-leg slippage estimate
@@ -135,7 +135,7 @@ class TestingConfig(TradeBoundsConfig):
 
     # --- Execution Guards ---
     PARALLEL_SLOTS: int = 1        # Allow up to 2 concurrent open positions (was 1)
-    MAX_DAILY_TRADES: int = 2    # Relaxed to replicate previous state
+    MAX_DAILY_TRADES: int = 3    # Relaxed to replicate previous state
     COOLDOWN_BARS: int = 0         # Disabled to replicate previous state
     MAX_CONSECUTIVE_LOSSES: int = 10
     DAILY_STOP_LOSS_PCT: float = 10.0
