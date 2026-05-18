@@ -36,13 +36,13 @@ The configuration is divided into logical blocks:
 
 | Category | Key Variables | Use Case |
 | :--- | :--- | :--- |
-| **Data** | `TRAINING_DATA_DAYS (500)` | Kitne din ka data seekhne ke liye use hoga. |
-| | `TEST_DATA_DAYS (30)` | Recent 1 month par model ka test hota hai. |
-| **Strategy** | `ORACLE_MIN_RR (1.5)` | Trade lene ke liye minimum Profit vs Risk ratio. |
-| | `MIN_ATR_STOP_PCT (0.8%)` | Market noise se bachne ke liye minimum Stop Loss. |
-| **Model** | `WINDOW_SIZE (30)` | Pichli 30 candles (7.5 hours) dekh kar pattern pehchanna. |
-| | `DROPOUT (0.40)` | Overfitting rokne ke liye neurons ko randomly ignore karna. |
-| **Training** | `LR (0.0003)` | Seekhne ki raftaar. Slow = Better Pattern recognition. |
+| **Data** | `TRAINING_DATA_DAYS (1000)` | Kitne din ka data seekhne ke liye use hoga. |
+| | `TEST_DATA_DAYS (100)` | Recent test window par model ka test hota hai. |
+| **Strategy** | `ORACLE_MIN_RR (1.0)` | Trade lene ke liye minimum Profit vs Risk ratio. |
+| | `MIN_ATR_STOP_PCT (0.30%)` | Market noise se bachne ke liye minimum Stop Loss. |
+| **Model** | `WINDOW_SIZE (96)` | Pichli 96 hourly candles (4 days) dekh kar pattern pehchanna. |
+| | `DROPOUT (0.30)` | Overfitting rokne ke liye neurons ko randomly ignore karna. |
+| **Training** | `LR (0.0001)` | Seekhne ki raftaar. Slow = Better Pattern recognition. |
 
 ---
 
@@ -52,16 +52,17 @@ Hamara **Multi-Head Transformer Model** kaise data leta hai aur kya soch kar out
 
 ### 1. Model Ko Kya Data Diya Jata Hai? (INPUTS)
 Model ek 3D tensor leta hai jiska shape hai: `(Batch Size, WINDOW_SIZE, Num Features)`
-* **WINDOW_SIZE:** `48` (Yani model ek baar me pichle 48 candles ek sath dekhta hai).
-* **Num Features:** `49` (Har candle ke baare me 49 alag-alag metrics).
+* **WINDOW_SIZE:** `96` (Yani model ek baar me pichle 96 hourly candles ek sath dekhta hai).
+* **Num Features:** `73` (1h execution features + completed 4h/1d regime context).
 
-**49 Features me kya-kya hota hai?**
-1. **Price Data:** Returns (`return_1`, `return_5`, `log_return` etc.)
-2. **Microstructure & Scalping:** `price_to_vwap`, `buy_pressure`, `wick_imbalance`, `range_compression`, `fractal_proxy`
-3. **Trend & Momentum:** `supertrend`, `trend_strength`, `rsi_7`, `macd`
-4. **Volatility:** `natr`, `realized_vol_10`, `bb_width`
-5. **Information Theory:** `surprise`, `shock_elasticity`
-6. **Time Context:** `hour_sin`, `dow_sin`
+**73 Features me kya-kya hota hai?**
+1. **Price Data:** Log returns (`log_return_1`, `log_return_6`, `log_return_24` etc.)
+2. **EMA/RSI Trend Stack:** `dist_ema_21`, `ema_21_50_spread`, `rsi_14`, `stochrsi_k`
+3. **Volatility & Structure:** `natr`, `realized_vol_24`, `bb_width`, `candle_vs_atr`
+4. **Volume & Participation:** `price_to_vwap`, `volume_surprise_50`, `obv_slope_20`
+5. **Regime Quality:** `efficiency_ratio_10`, `range_compression_10_50`, `trend_regime`
+6. **Multi-Timeframe Context:** previous completed `4h` and `1d` EMA/RSI/volatility features
+7. **Time Context:** `hour_sin`, `dow_sin`
 
 ### 2. Model Kya Predict Karta Hai? (OUTPUTS)
 Model ek sath **3 alag-alag cheezein (Heads)** predict karta hai:
@@ -80,18 +81,18 @@ Agar aap code ke through model ko use karenge (Inference phase), toh data kuch i
 import numpy as np
 import torch
 
-# 1 Sample (Batch), 48 Candles ka history, 49 Features har candle ke
+# 1 Sample (Batch), 96 Candles ka history, 73 Features har candle ke
 input_tensor = torch.tensor([
     [
         # Candle 1 (Sabse purani)
-        [0.0012, -0.05, 1.05, 0.45, ... 49th feature], 
+        [0.0012, -0.05, 1.05, 0.45, ... 73rd feature],
         # Candle 2
-        [0.0021, -0.02, 1.10, 0.47, ... 49th feature],
+        [0.0021, -0.02, 1.10, 0.47, ... 73rd feature],
         # ...
-        # Candle 48 (Abhi ki current candle)
-        [-0.0010, 0.01, 0.98, 0.35, ... 49th feature]
+        # Candle 96 (Abhi ki current candle)
+        [-0.0010, 0.01, 0.98, 0.35, ... 73rd feature]
     ]
-]) # Shape: (1, 48, 49)
+]) # Shape: (1, 96, 73)
 
 ### 📤 RAW OUTPUT DATA (PyTorch Tensors)
 Jab model ka inference chalta hai, toh wo seedha dictionary nahi deta. Wo 3 PyTorch Tensors return karta hai (Kyuki 3 Heads hai):

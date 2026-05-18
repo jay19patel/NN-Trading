@@ -50,7 +50,7 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
     ))
 
     # ── 1. Fetch data ─────────────────────────────────────────────────────
-    total_days = cfg.training.TEST_DATA_DAYS + 10
+    total_days = cfg.training.TEST_DATA_DAYS + 45
     df = fetch_data(symbol=symbol, total_days=total_days, interval=cfg.model.INTERVAL)
     if df.empty:
         console.print("[red]No data found.[/red]")
@@ -68,8 +68,9 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
 
     device = cfg.DEVICE
     model = MultiHeadTradingModel(input_dim=len(feature_cols)).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
+    param_count = sum(param.numel() for param in model.parameters())
 
     # ── 4. Load scaler ────────────────────────────────────────────────────
     try:
@@ -153,9 +154,9 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
 
     # Apply macro trend filter to prevent fighting the market
     if getattr(cfg.testing, "USE_TREND_FILTER", True):
-        # dist_sma_50 > 0 means Close > SMA50
-        trend_long = df_features["dist_sma_50"].values > 0
-        trend_short = df_features["dist_sma_50"].values < 0
+        # Use the same EMA-regime feature family that the model sees.
+        trend_long = df_features["dist_ema_50"].values > 0
+        trend_short = df_features["dist_ema_50"].values < 0
         long_signal = long_signal & trend_long
         short_signal = short_signal & trend_short
 
@@ -170,6 +171,7 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
     bars_per_interval = 24 if cfg.model.INTERVAL == "1h" else 96
     test_bars = int(cfg.training.TEST_DATA_DAYS * bars_per_interval)
     df_test = df_features.iloc[-test_bars:].copy()
+    eligible_rows = max(len(df_features) - window_size + 1, 0)
 
     final_df, trades, summary = run_paper_portfolio_on_signals(
         panel=df_test,
@@ -179,6 +181,21 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
         leverage=cfg.testing.LEVERAGE,
         round_trip_fee_pct=cfg.testing.ROUND_TRIP_FEE_PCT,
     )
+    summary.update({
+        "raw_rows": len(df),
+        "feature_rows": len(df_features),
+        "eligible_prediction_rows": eligible_rows,
+        "test_rows": len(df_test),
+        "feature_count": len(feature_cols),
+        "window_size": window_size,
+        "model_parameters": param_count,
+        "interval": cfg.model.INTERVAL,
+        "signal_long_count": int(long_count),
+        "signal_short_count": int(short_count),
+        "signal_neutral_count": int((~long_signal & ~short_signal).sum()),
+        "signal_margin_threshold": cfg.testing.SIGNAL_MARGIN_THRESHOLD,
+        "confidence_threshold": cfg.testing.AI_CONFIDENCE_THRESHOLD,
+    })
 
     # ── 9. Print results ──────────────────────────────────────────────────
     _print_professional_backtest_summary(symbol, summary, trades)
@@ -192,6 +209,20 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
 # ---------------------------------------------------------------------------
 # Rich output formatting
 # ---------------------------------------------------------------------------
+
+def _money(value: float) -> str:
+    """Format signed dollar values with color for Rich tables."""
+    if value >= 0:
+        return f"[green]+${value:,.2f}[/]"
+    return f"[red]-${abs(value):,.2f}[/]"
+
+
+def _format_pf(value: float) -> str:
+    """Format profit factor, including infinite values."""
+    if np.isinf(value):
+        return "∞"
+    return f"{value:.2f}"
+
 
 def _print_professional_backtest_summary(symbol: str, summary: dict, trades: list) -> None:
     """Render a rich console summary of backtest results."""
@@ -211,6 +242,8 @@ def _print_professional_backtest_summary(symbol: str, summary: dict, trades: lis
 
     long_trades = sum(1 for t in trades if getattr(t, "side", "").upper() == "LONG")
     short_trades = sum(1 for t in trades if getattr(t, "side", "").upper() == "SHORT")
+    long_stats = summary.get("long", {})
+    short_stats = summary.get("short", {})
 
     # ── Performance table ─────────────────────────────────────────────────
     perf_table = Table(
@@ -246,10 +279,71 @@ def _print_professional_backtest_summary(symbol: str, summary: dict, trades: lis
     analytics_table.add_column("Parameter", style="dim")
     analytics_table.add_column("Value", justify="right", style="bold")
     analytics_table.add_row("Profit Factor", f"{summary.get('profit_factor', 0):.2f}")
+    analytics_table.add_row("Gross PnL", f"{_money(summary.get('total_pnl_gross_usd', 0))}")
+    analytics_table.add_row("Fees Paid", f"[red]-${summary.get('total_fees_usd', 0):,.2f}[/]")
+    analytics_table.add_row("Winners Total", f"[green]+${summary.get('positive_pnl_usd', 0):,.2f}[/]")
+    analytics_table.add_row("Losers Total", f"[red]${summary.get('negative_pnl_usd', 0):,.2f}[/]")
     analytics_table.add_row("Avg Win", f"[green]${summary.get('avg_win_usd', 0):,.2f}[/]")
     analytics_table.add_row("Avg Loss", f"[red]-${abs(summary.get('avg_loss_usd', 0)):,.2f}[/]")
+    analytics_table.add_row("Expectancy/Trade", f"{_money(summary.get('expectancy_usd', 0))}")
     analytics_table.add_row("Avg Holding", f"{summary.get('avg_holding_bars', 0):.1f} Bars")
+    analytics_table.add_row("Trades / Day", f"{summary.get('trades_per_day', 0):.2f}")
     analytics_table.add_row("Max Drawdown", f"[red]{summary.get('max_drawdown_pct', 0):.2f}%[/]")
+    analytics_table.add_row("Sharpe", f"{summary.get('sharpe_ratio', 0):.2f}")
+
+    # ── Direction breakdown table ────────────────────────────────────────
+    direction_table = Table(
+        title="[bold magenta]Long vs Short",
+        show_header=True,
+        header_style="bold magenta",
+        box=box.MINIMAL,
+    )
+    direction_table.add_column("Side", style="dim")
+    direction_table.add_column("Trades", justify="right", style="bold")
+    direction_table.add_column("Win Rate", justify="right", style="bold")
+    direction_table.add_column("Net PnL", justify="right", style="bold")
+    direction_table.add_column("PF", justify="right", style="bold")
+    direction_table.add_row(
+        "LONG",
+        str(long_stats.get("trades", 0)),
+        f"{long_stats.get('win_rate_pct', 0):.2f}%",
+        _money(long_stats.get("net_pnl_usd", 0)),
+        _format_pf(long_stats.get("profit_factor", 0)),
+    )
+    direction_table.add_row(
+        "SHORT",
+        str(short_stats.get("trades", 0)),
+        f"{short_stats.get('win_rate_pct', 0):.2f}%",
+        _money(short_stats.get("net_pnl_usd", 0)),
+        _format_pf(short_stats.get("profit_factor", 0)),
+    )
+
+    # ── Model/data context table ─────────────────────────────────────────
+    context_table = Table(
+        title="[bold green]Model & Data",
+        show_header=True,
+        header_style="bold green",
+        box=box.MINIMAL,
+    )
+    context_table.add_column("Metric", style="dim")
+    context_table.add_column("Value", justify="right", style="bold")
+    context_table.add_row("Interval", str(summary.get("interval", cfg.model.INTERVAL)))
+    context_table.add_row("Features", str(summary.get("feature_count", 0)))
+    context_table.add_row("Window", f"{summary.get('window_size', 0)} bars")
+    context_table.add_row("Model Params", f"{summary.get('model_parameters', 0):,}")
+    context_table.add_row("Raw Rows", f"{summary.get('raw_rows', 0):,}")
+    context_table.add_row("Feature Rows", f"{summary.get('feature_rows', 0):,}")
+    context_table.add_row("Predictable Rows", f"{summary.get('eligible_prediction_rows', 0):,}")
+    context_table.add_row("Test Rows", f"{summary.get('test_rows', 0):,}")
+    context_table.add_row("Signals L/S/N", (
+        f"{summary.get('signal_long_count', 0):,} / "
+        f"{summary.get('signal_short_count', 0):,} / "
+        f"{summary.get('signal_neutral_count', 0):,}"
+    ))
+    context_table.add_row("Conf / Margin", (
+        f"{summary.get('confidence_threshold', 0):.2f} / "
+        f"{summary.get('signal_margin_threshold', 0):.2f}"
+    ))
 
     # ── Signal quality table ──────────────────────────────────────────────
     rel_table = Table(
@@ -273,8 +367,10 @@ def _print_professional_backtest_summary(symbol: str, summary: dict, trades: lis
         "Reliability Gap",
         f"[green]{gap:+.1f}%[/]" if gap > 0 else f"[red]{gap:+.1f}%[/]",
     )
+    rel_table.add_row("Max Win Streak", str(summary.get("max_win_streak", 0)))
+    rel_table.add_row("Max Loss Streak", str(summary.get("max_loss_streak", 0)))
 
-    console.print(Columns([perf_table, analytics_table, rel_table]))
+    console.print(Columns([perf_table, analytics_table, direction_table, rel_table, context_table]))
     console.print("")
 
     if not trades:

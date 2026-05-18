@@ -21,6 +21,9 @@ from neural_engine.feature_utils import add_technical_indicators, get_feature_co
 from neural_engine.model import MultiHeadTradingModel
 
 console = Console()
+MAX_RETRIES = 3
+RETRY_SLEEP = 300
+PREDICTION_SLEEP = 3600
 
 def load_model_and_scaler():
     """Load model weights and normalization parameters."""
@@ -36,7 +39,7 @@ def load_model_and_scaler():
     
     # Load Model
     model = MultiHeadTradingModel(input_dim=len(feature_cols)).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
 
     # Load Scaler
@@ -51,8 +54,8 @@ def get_latest_prediction(model, mean, scale, feature_cols, device):
     interval = cfg.model.INTERVAL
     window_size = cfg.model.WINDOW_SIZE
     
-    # Fetch enough data for indicators + window (approx 200 bars)
-    total_days = (window_size + 150) // (24 if interval == "1h" else 96) + 2
+    # Fetch enough history for 1h indicators plus completed 4h/1d regime features.
+    total_days = max(60, (window_size + 220) // (24 if interval == "1h" else 96) + 2)
     df = fetch_data(symbol=symbol, total_days=total_days, interval=interval)
     
     if df.empty or len(df) < window_size + 100:
@@ -128,22 +131,30 @@ def main():
 
     with Live(table, refresh_per_second=1):
         while True:
-            res, err = get_latest_prediction(model, mean, scale, feature_cols, device)
-            
-            if err:
-                console.print(f"[yellow]Prediction Warning: {err}[/yellow]")
-            elif res:
-                table.add_row(
-                    res["time"],
-                    res["symbol"],
-                    f"${res['price']:,.2f}",
-                    f"[{res['color']}]{res['verdict']}[/{res['color']}]",
-                    res["confidence"],
-                    f"{res['tp_atr']} / {res['sl_atr']}"
-                )
-            
-            # Sleep for 1 hour
-            time.sleep(3600)
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    res, err = get_latest_prediction(model, mean, scale, feature_cols, device)
+                    if err:
+                        console.print(f"[yellow]Prediction Warning (attempt {attempt}/{MAX_RETRIES}): {err}[/yellow]")
+                        if attempt < MAX_RETRIES:
+                            time.sleep(RETRY_SLEEP)
+                            continue
+                    elif res:
+                        table.add_row(
+                            res["time"],
+                            res["symbol"],
+                            f"${res['price']:,.2f}",
+                            f"[{res['color']}]{res['verdict']}[/{res['color']}]",
+                            res["confidence"],
+                            f"{res['tp_atr']} / {res['sl_atr']}"
+                        )
+                    break
+                except Exception as exc:
+                    console.print(f"[red]Prediction Error (attempt {attempt}/{MAX_RETRIES}): {exc}[/red]")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_SLEEP)
+
+            time.sleep(PREDICTION_SLEEP)
 
 if __name__ == "__main__":
     main()

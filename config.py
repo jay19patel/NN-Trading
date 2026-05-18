@@ -41,7 +41,7 @@ class NNModelConfig:
     MAX_SEQ_LEN: int = 256         # Positional encoding max length
 
     # --- Sequence Window ---
-    WINDOW_SIZE: int = 96          # Past candles fed to model (48 × 1h = 2 days of context)
+    WINDOW_SIZE: int = 96          # Past candles fed to model (96 × 1h = 4 days of context)
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ class TrainingConfig(TradeBoundsConfig):
     """
 
     # --- Data Volume (Days) ---
-    TRAINING_DATA_DAYS: int = 1000
+    TRAINING_DATA_DAYS: int = 500
     VALIDATION_DATA_DAYS: int = 100
     TEST_DATA_DAYS: int = 100
 
@@ -97,7 +97,7 @@ class TrainingConfig(TradeBoundsConfig):
     # --- Cache Versioning ---
     # Bump this number whenever any labeling/feature param above changes.
     # This forces train.py to rebuild the parquet cache instead of using stale data.
-    FEATURE_CACHE_VERSION: int = 112
+    FEATURE_CACHE_VERSION: int = 114
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +116,10 @@ class TestingConfig(TradeBoundsConfig):
 
     # --- Capital, Margin & Leverage ---
     INITIAL_CAPITAL_USD: float = 100.0
-    MARGIN_PER_TRADE_PCT_OF_EQUITY: float = 30.0  # Increased to 50% for high-impact 20x leverage results
-    LEVERAGE: float = 20.0                       # Default 20x realistic leverage
-    ROUND_TRIP_FEE_PCT: float = 0.00             # Total fee for entry + exit
-    SLIPPAGE_PCT: float = 0.00                   # Per-leg slippage estimate
+    MARGIN_PER_TRADE_PCT_OF_EQUITY: float = 5.0
+    LEVERAGE: float = 20
+    ROUND_TRIP_FEE_PCT: float = 0.10             # Total fee for entry + exit
+    SLIPPAGE_PCT: float = 0.03                   # Per-leg slippage estimate
 
     # --- Signal Filtering (NEW APPROACH: margin-based, not absolute threshold) ---
     # A trade signal fires when the model's leading class probability beats neutral
@@ -128,15 +128,15 @@ class TestingConfig(TradeBoundsConfig):
     #
     # Example: prob_long=0.48, prob_neutral=0.33, prob_short=0.19
     #   margin = 0.48 - 0.33 = 0.15 → FIRES
-    SIGNAL_MARGIN_THRESHOLD: float = 0.12        # Stricter margin for higher precision
-    AI_CONFIDENCE_THRESHOLD: float = 0.48        # Higher floor to filter noise
+    SIGNAL_MARGIN_THRESHOLD: float = 0.20        # Require a clear edge over NEUTRAL
+    AI_CONFIDENCE_THRESHOLD: float = 0.75        # Trade only high-confidence signals
     USE_TREND_FILTER: bool = True               # Strictly trade with macro trend
     AI_TARGET_DISCOUNT_FACTOR: float = 0.80     # Scale down AI targets for conservative exits (1.0 = No discount)
 
     # --- Execution Guards ---
-    PARALLEL_SLOTS: int = 1        # Allow up to 2 concurrent open positions (was 1)
-    MAX_DAILY_TRADES: int = 3    # Relaxed to replicate previous state
-    COOLDOWN_BARS: int = 0         # Disabled to replicate previous state
+    PARALLEL_SLOTS: int = 1
+    MAX_DAILY_TRADES: int = 2
+    COOLDOWN_BARS: int = 6
     MAX_CONSECUTIVE_LOSSES: int = 10
     DAILY_STOP_LOSS_PCT: float = 10.0
 
@@ -166,6 +166,25 @@ class TradingConfig:
 
 # Singleton — import `cfg` everywhere instead of `config`
 cfg = TradingConfig()
+
+
+def _validate_config(c: TradingConfig) -> None:
+    """Fail fast on configuration values that would break training or testing."""
+    assert c.model.HIDDEN_DIM % c.model.NUM_HEADS == 0, (
+        f"HIDDEN_DIM {c.model.HIDDEN_DIM} must be divisible by NUM_HEADS {c.model.NUM_HEADS}"
+    )
+    assert c.model.WINDOW_SIZE <= c.model.MAX_SEQ_LEN, (
+        f"WINDOW_SIZE {c.model.WINDOW_SIZE} > MAX_SEQ_LEN {c.model.MAX_SEQ_LEN}"
+    )
+    assert c.training.PURGE_BARS >= c.training.LOOKAHEAD_BARS, (
+        "PURGE_BARS should be >= LOOKAHEAD_BARS to prevent label-to-feature leakage"
+    )
+    assert 0.0 <= c.testing.ROUND_TRIP_FEE_PCT <= 1.0, "Fee must be 0-1%"
+    assert c.testing.LEVERAGE >= 1.0, "Leverage must be >= 1"
+    assert c.model.HIDDEN_DIM > 0 and c.model.NUM_LAYERS > 0
+
+
+_validate_config(cfg)
 
 
 # ---------------------------------------------------------------------------

@@ -116,7 +116,7 @@ class MultiHeadTradingModel(nn.Module):
         # Direction head: 3-class classifier (LONG / NEUTRAL / SHORT)
         self.signal_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 3),
@@ -125,7 +125,7 @@ class MultiHeadTradingModel(nn.Module):
         # Sizing head: qty_ratio, normalized TP%, normalized SL%  (all 0-1)
         self.sizing_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 3),

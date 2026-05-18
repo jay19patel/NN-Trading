@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
+import numpy as np
 import pandas as pd
 from config import cfg
 
@@ -220,7 +221,7 @@ def run_paper_portfolio_on_signals(
                 if confidence < cfg.testing.AI_CONFIDENCE_THRESHOLD: continue
 
                 tp_pct = float(row["ai_take_profit_pct"]) * cfg.testing.AI_TARGET_DISCOUNT_FACTOR
-                sl_pct = float(row["ai_stop_loss_pct"]) * cfg.testing.AI_TARGET_DISCOUNT_FACTOR
+                sl_pct = float(row["ai_stop_loss_pct"])
                 
                 entry_price = curr_price * (1 + slippage_fraction if side == "LONG" else 1 - slippage_fraction)
                 tp_price = entry_price * (1 + tp_pct / 100.0) if side == "LONG" else entry_price * (1 - tp_pct / 100.0)
@@ -252,6 +253,13 @@ def run_paper_portfolio_on_signals(
         summary["end_time"] = str(working_frame.index[-1])
         summary["duration_days"] = (working_frame.index[-1] - working_frame.index[0]).total_seconds() / 86400.0
         summary["trades_per_day"] = len(trade_records) / max(summary["duration_days"], 0.001)
+        if len(trade_records) > 1:
+            returns = np.array([t.return_fraction for t in trade_records], dtype=np.float64)
+            if returns.std() > 0:
+                trades_per_year = len(trade_records) / max(summary["duration_days"] / 365.0, 1e-9)
+                summary["sharpe_ratio"] = round(float((returns.mean() / returns.std()) * np.sqrt(trades_per_year)), 3)
+            else:
+                summary["sharpe_ratio"] = 0.0
 
     # Max Drawdown
     equity_series = pd.Series(equity_by_bar)
@@ -266,13 +274,43 @@ def summarize_trade_feedback(trade_records: List[PaperTradeRecord]) -> dict:
     
     wins = [t for t in trade_records if t.pnl_net_usd > 0]
     losses = [t for t in trade_records if t.pnl_net_usd <= 0]
+    long_trades = [t for t in trade_records if t.side.upper() == "LONG"]
+    short_trades = [t for t in trade_records if t.side.upper() == "SHORT"]
     
     total_profit = sum(t.pnl_net_usd for t in wins)
     total_loss = abs(sum(t.pnl_net_usd for t in losses))
+    gross_pnl = sum(t.pnl_gross_usd for t in trade_records)
+    total_fees = sum(t.fees_usd for t in trade_records)
     profit_factor = total_profit / total_loss if total_loss > 0 else float('inf')
     
     avg_win = total_profit / len(wins) if wins else 0
     avg_loss = total_loss / len(losses) if losses else 0
+    expectancy = sum(t.pnl_net_usd for t in trade_records) / len(trade_records)
+
+    def side_stats(side_records: list[PaperTradeRecord]) -> dict:
+        side_wins = [t for t in side_records if t.pnl_net_usd > 0]
+        side_losses = [t for t in side_records if t.pnl_net_usd <= 0]
+        side_profit = sum(t.pnl_net_usd for t in side_wins)
+        side_loss = abs(sum(t.pnl_net_usd for t in side_losses))
+        return {
+            "trades": len(side_records),
+            "wins": len(side_wins),
+            "losses": len(side_losses),
+            "win_rate_pct": (len(side_wins) / len(side_records) * 100.0) if side_records else 0.0,
+            "net_pnl_usd": sum(t.pnl_net_usd for t in side_records),
+            "profit_factor": side_profit / side_loss if side_loss > 0 else (float("inf") if side_profit > 0 else 0.0),
+        }
+
+    max_win_streak = max_loss_streak = current_win_streak = current_loss_streak = 0
+    for trade in trade_records:
+        if trade.pnl_net_usd > 0:
+            current_win_streak += 1
+            current_loss_streak = 0
+        else:
+            current_loss_streak += 1
+            current_win_streak = 0
+        max_win_streak = max(max_win_streak, current_win_streak)
+        max_loss_streak = max(max_loss_streak, current_loss_streak)
     
     return {
         "trade_count": len(trade_records),
@@ -280,11 +318,20 @@ def summarize_trade_feedback(trade_records: List[PaperTradeRecord]) -> dict:
         "loss_count": len(losses),
         "win_rate_pct": (len(wins) / len(trade_records)) * 100.0,
         "total_pnl_net_usd": sum(t.pnl_net_usd for t in trade_records),
+        "total_pnl_gross_usd": gross_pnl,
+        "total_fees_usd": total_fees,
+        "positive_pnl_usd": total_profit,
+        "negative_pnl_usd": -total_loss,
         "profit_factor": profit_factor,
         "avg_win_usd": avg_win,
         "avg_loss_usd": avg_loss,
+        "expectancy_usd": expectancy,
         "avg_holding_bars": sum(t.holding_bars for t in trade_records) / len(trade_records),
-        "final_equity_usd": trade_records[-1].equity_after_usd
+        "final_equity_usd": trade_records[-1].equity_after_usd,
+        "long": side_stats(long_trades),
+        "short": side_stats(short_trades),
+        "max_win_streak": max_win_streak,
+        "max_loss_streak": max_loss_streak,
     }
 
 def print_rich_summary(strategy_name: str, symbol: str, summary: dict):
@@ -293,4 +340,5 @@ def print_rich_summary(strategy_name: str, symbol: str, summary: dict):
     print(f"Win Rate: {summary.get('win_rate_pct', 0):.2f}%")
     print(f"Net PnL: ${summary.get('total_pnl_net_usd', 0):,.2f}")
     print(f"Final Equity: ${summary.get('final_equity_usd', 0):,.2f}")
+    print(f"Sharpe: {summary.get('sharpe_ratio', 0):.3f}")
     print("-" * 30)

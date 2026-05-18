@@ -31,6 +31,10 @@ env/
 # Data & CSVs
 data_*.csv
 *.csv
+data/*.parquet
+data/data_*.csv
+models/*.pth
+models/*.npy
 
 # IDEs
 .vscode/

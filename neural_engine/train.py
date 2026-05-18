@@ -24,12 +24,13 @@ Pipeline order:
 import json
 import logging
 import os
+import random
 import sys
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+from sklearn.metrics import confusion_matrix, precision_recall_fscore_support, roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
@@ -45,8 +46,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 logger = logging.getLogger(__name__)
 
 # Bars to drop at the start of each dataframe before training.
-# Covers the longest indicator lookback (SMA50=50 bars) plus the new WINDOW_SIZE=48 buffer.
-INDICATOR_WARMUP_BARS = 75
+# Covers daily multi-timeframe indicator warmup before training rows are used.
+INDICATOR_WARMUP_BARS = 35 * 24
 
 
 # ---------------------------------------------------------------------------
@@ -68,14 +69,14 @@ class TradingDataset(Dataset):
         y_time: np.ndarray,
         device: str = "cpu",
     ):
-        self.X = torch.from_numpy(X_seq).float().to(device)
-        self.y_dir = torch.from_numpy(y_dir).long().to(device)
-        self.y_qty = torch.from_numpy(y_qty).float().to(device)
-        self.y_tp = torch.from_numpy(y_tp).float().to(device)
-        self.y_sl = torch.from_numpy(y_sl).float().to(device)
-        self.y_pnl = torch.from_numpy(y_pnl).float().to(device)
-        self.y_mag = torch.from_numpy(y_mag).float().to(device)
-        self.y_time = torch.from_numpy(y_time).float().to(device)
+        self.X = torch.from_numpy(X_seq).float()
+        self.y_dir = torch.from_numpy(y_dir).long()
+        self.y_qty = torch.from_numpy(y_qty).float()
+        self.y_tp = torch.from_numpy(y_tp).float()
+        self.y_sl = torch.from_numpy(y_sl).float()
+        self.y_pnl = torch.from_numpy(y_pnl).float()
+        self.y_mag = torch.from_numpy(y_mag).float()
+        self.y_time = torch.from_numpy(y_time).float()
 
     def __len__(self) -> int:
         return len(self.X)
@@ -150,6 +151,20 @@ def _prepare_symbol_frame(
         df.to_parquet(cache)
 
     return df.sort_index()
+
+
+def _detect_and_log_gaps(df: pd.DataFrame, interval: str, symbol: str) -> None:
+    """Log large time gaps that can contaminate rolling windows."""
+    if len(df) < 2:
+        return
+    expected_delta = pd.Timedelta(interval)
+    time_diffs = df.index.to_series().diff().dropna()
+    large_gaps = time_diffs[time_diffs > expected_delta * 5]
+    if len(large_gaps) > 0:
+        logger.warning(
+            f"{symbol}: found {len(large_gaps)} data gap(s). "
+            f"First gaps: {large_gaps.head(5).to_dict()}"
+        )
 
 
 def _ordered_split(
@@ -284,12 +299,17 @@ def _classification_metrics(y_true: np.ndarray, probs: np.ndarray) -> dict:
     pred = np.argmax(probs, axis=1)
     _, _, long_f1, _ = precision_recall_fscore_support(y_true == 0, pred == 0, average="binary", zero_division=0)
     _, _, short_f1, _ = precision_recall_fscore_support(y_true == 2, pred == 2, average="binary", zero_division=0)
-    return {
+    metrics = {
         "accuracy": float((pred == y_true).mean()) if len(y_true) else 0.0,
         "long_f1": float(long_f1),
         "short_f1": float(short_f1),
         "macro_f1": float((long_f1 + short_f1) / 2.0),
     }
+    try:
+        metrics["roc_auc_ovr"] = float(roc_auc_score(y_true, probs, multi_class="ovr", labels=[0, 1, 2]))
+    except ValueError:
+        metrics["roc_auc_ovr"] = 0.0
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +392,14 @@ def train_trading_model() -> None:
     """
     from neural_engine.backtest_engine import run_backtest
 
+    seed = 42
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     symbols = cfg.model.SYMBOLS
     interval = cfg.model.INTERVAL
     total_days = (
@@ -389,6 +417,7 @@ def train_trading_model() -> None:
         if df_full.empty:
             logger.warning(f"No data for {symbol}, skipping.")
             continue
+        _detect_and_log_gaps(df_full, interval, symbol)
         train_df, val_df, test_df = _ordered_split(df_full, interval)
         raw_splits["train"].append(train_df)
         raw_splits["val"].append(val_df)
@@ -433,8 +462,21 @@ def train_trading_model() -> None:
         num_samples=len(y_train),
         replacement=True,
     )
-    train_loader = DataLoader(train_dataset, batch_size=cfg.training.BATCH_SIZE, sampler=sampler)
-    val_loader = DataLoader(val_dataset, batch_size=cfg.training.BATCH_SIZE, shuffle=False)
+    pin_memory = device == "cuda"
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.training.BATCH_SIZE,
+        sampler=sampler,
+        pin_memory=pin_memory,
+        num_workers=2,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.training.BATCH_SIZE,
+        shuffle=False,
+        pin_memory=pin_memory,
+        num_workers=2,
+    )
 
     # ── Step 6: Model, loss, optimizer, scheduler ─────────────────────────
     model = MultiHeadTradingModel(input_dim=len(feature_cols)).to(device)
@@ -453,6 +495,12 @@ def train_trading_model() -> None:
     best_model_path = os.path.join("models", "trading_model.pth")
     best_val_loss = float("inf")
     patience_counter = 0
+    val_pred = None
+
+    def move_batch(batch_X: torch.Tensor, batch_targets: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        batch_X = batch_X.to(device, non_blocking=pin_memory)
+        batch_targets = {key: value.to(device, non_blocking=pin_memory) for key, value in batch_targets.items()}
+        return batch_X, batch_targets
 
     logger.info(f"Starting training on {device}...")
     logger.info(
@@ -465,6 +513,7 @@ def train_trading_model() -> None:
         model.train()
         total_loss = total_sig = total_mag = total_time = 0.0
         for batch_X, batch_targets in train_loader:
+            batch_X, batch_targets = move_batch(batch_X, batch_targets)
             optimizer.zero_grad()
             losses = criterion(model(batch_X), batch_targets)
             loss = losses["total"]
@@ -481,6 +530,7 @@ def train_trading_model() -> None:
         val_loss = 0.0
         with torch.no_grad():
             for batch_X, batch_targets in val_loader:
+                batch_X, batch_targets = move_batch(batch_X, batch_targets)
                 val_loss += criterion(model(batch_X), batch_targets)["total"].item()
 
         avg_val_loss = val_loss / len(val_loader)
@@ -498,16 +548,17 @@ def train_trading_model() -> None:
             f"LR: {current_lr:.6f}"
         )
 
-        # ── Val metrics every 5 epochs ──
+        val_pred = _predict(model, X_val, device)
+        metrics = _classification_metrics(y_val, val_pred["probs"])
+
+        # ── Detailed val metrics every 5 epochs ──
         if (epoch + 1) % 5 == 0:
-            val_pred = _predict(model, X_val, device)
-            metrics = _classification_metrics(y_val, val_pred["probs"])
             pred_labels = np.argmax(val_pred["probs"], axis=1)
             cm = confusion_matrix(y_val, pred_labels, labels=[0, 1, 2])
             logger.info(
                 f"  Val Metrics | Acc: {metrics['accuracy']:.3f} | "
                 f"Long F1: {metrics['long_f1']:.3f} | Short F1: {metrics['short_f1']:.3f} | "
-                f"Macro F1: {metrics['macro_f1']:.3f}"
+                f"Macro F1: {metrics['macro_f1']:.3f} | ROC-AUC: {metrics['roc_auc_ovr']:.3f}"
             )
             logger.info("  Confusion Matrix (rows=true, cols=pred) [L/N/S]:")
             logger.info(f"    LONG:    {cm[0]}")
@@ -535,8 +586,13 @@ def train_trading_model() -> None:
     np.save(os.path.join("models", "scaler_scale.npy"), scaler.scale_)
 
     # Threshold search results are now purely for logging; we use config.py for execution
+    if val_pred is None:
+        val_pred = _predict(model, X_val, device)
     best_thr = _threshold_search(y_val, y_tp_v, y_sl_v, val_pred["probs"])["best"]
-    logger.info(f"Recommended Thresholds (Manual override): Long: {best_thr['long_margin']:.2f}, Short: {best_thr['short_margin']:.2f}")
+    logger.info(
+        f"Recommended Thresholds (Manual override): "
+        f"Long: {best_thr['long_margin']:.2f}, Short: {best_thr['short_margin']:.2f}"
+    )
 
     logger.info("Training complete. Model and artifacts saved in models/")
 
