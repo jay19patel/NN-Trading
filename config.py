@@ -30,18 +30,18 @@ class NNModelConfig:
 
     # --- Data Source ---
     SYMBOLS: list[str] = field(default_factory=lambda: ["ETHUSD"])
-    INTERVAL: str = "1h"           # Shifted to 1h to eliminate HFT noise and boost PnL
+    INTERVAL: str = "15m"          # 15-minute for better signal quality (was 5m - too noisy)
     CACHE_VALID_MINS: int = 0      # 0 = always fetch fresh data
 
     # --- Transformer Architecture ---
     HIDDEN_DIM: int = 128          # Model width (was 64 — now bigger for more capacity)
     NUM_LAYERS: int = 3            # Encoder depth (was 2)
     NUM_HEADS: int = 4             # Attention heads (HIDDEN_DIM must be divisible by NUM_HEADS)
-    DROPOUT: float = 0.30          # Uniform dropout across all layers
+    DROPOUT: float = 0.20          # Lower dropout for 5m data (noisier, less regularization needed)
     MAX_SEQ_LEN: int = 256         # Positional encoding max length
 
     # --- Sequence Window ---
-    WINDOW_SIZE: int = 96          # Past candles fed to model (96 × 1h = 4 days of context)
+    WINDOW_SIZE: int = 96          # Past candles fed to model (96 × 15m = 24 hours of context)
 
 
 # ---------------------------------------------------------------------------
@@ -52,11 +52,11 @@ class NNModelConfig:
 @dataclass
 class TradeBoundsConfig:
     """Shared constraints used by both Oracle Labeler and Backtester."""
-    MIN_ATR_STOP_PCT: float = 0.30   # Min SL as % of price
-    MAX_ATR_STOP_PCT: float = 2.00   # Max SL as % of price
-    MIN_ATR_TARGET_PCT: float = 0.50 # Min TP as % of price
-    MAX_ATR_TARGET_PCT: float = 6.00 # Max TP as % of price
-    LOOKAHEAD_BARS: int = 24         # Max bars to hold a position (24 = 1 day)
+    MIN_ATR_STOP_PCT: float = 0.20   # Min SL as % of price (15m sweet spot)
+    MAX_ATR_STOP_PCT: float = 0.80   # Max SL as % of price (15m sweet spot)
+    MIN_ATR_TARGET_PCT: float = 0.40 # Min TP as % of price (15m sweet spot)
+    MAX_ATR_TARGET_PCT: float = 1.50 # Max TP as % of price (15m sweet spot)
+    LOOKAHEAD_BARS: int = 16         # Max bars to hold a position (16 × 15m = 4 hours)
 
 @dataclass
 class TrainingConfig(TradeBoundsConfig):
@@ -68,28 +68,27 @@ class TrainingConfig(TradeBoundsConfig):
     """
 
     # --- Data Volume (Days) ---
-    TRAINING_DATA_DAYS: int = 500
-    VALIDATION_DATA_DAYS: int = 100
-    TEST_DATA_DAYS: int = 100
+    TRAINING_DATA_DAYS: int = 300
+    VALIDATION_DATA_DAYS: int = 60
+    TEST_DATA_DAYS: int = 60
 
     # --- Leakage Prevention ---
-    PURGE_BARS: int = 24           # Gap between train/val/test splits
+    PURGE_BARS: int = 32           # Gap between train/val/test splits (2× LOOKAHEAD_BARS)
 
-    # --- Oracle Labeling (Balanced 1:1 Risk:Reward Strategy) ---
-    # Equal targets and stops. Because we use a Macro Trend Filter, the win-rate
-    # will stay above 50%, ensuring mathematically guaranteed long-term positive PnL.
-    TP_ATR_MULTIPLIERS: tuple[float, ...] = (1.2, 1.5, 2.0)
-    SL_ATR_MULTIPLIERS: tuple[float, ...] = (1.0, 1.2, 1.5)
+    # --- Oracle Labeling (Scalping-optimized targets) ---
+    # Tighter ATR multipliers for smaller scalping moves
+    TP_ATR_MULTIPLIERS: tuple[float, ...] = (0.8, 1.0, 1.2)  # Wider targets for better RR
+    SL_ATR_MULTIPLIERS: tuple[float, ...] = (0.3, 0.4, 0.5)
     ATR_LENGTH: int = 14
-    ORACLE_MIN_RR: float = 1   # STRICT 1:1 RR ratio
+    ORACLE_MIN_RR: float = 2.0   # Higher minimum RR for scalping quality (was 1.5)
 
     # --- Training Hyperparams ---
     BATCH_SIZE: int = 128
     EPOCHS: int = 50               # High max; early stopping prevents overfit
     LR: float = 0.0001             # Lower LR to prevent model collapse
     EARLY_STOP_PATIENCE: int = 10   # Epochs without val improvement before stopping
-    FOCAL_GAMMA: float = 3.0       # Higher gamma focus on harder, clear patterns
-    FOCAL_NEUTRAL_VIOLATION_SCALE: float = 2.0  # Penalty when model wrongly trades on NEUTRAL
+    FOCAL_GAMMA: float = 4.0       # Higher gamma focus on harder, clear patterns (was 3.0)
+    FOCAL_NEUTRAL_VIOLATION_SCALE: float = 3.0  # Stronger penalty for wrong trades (was 2.0)
 
     # --- Threshold Search ---
     THRESHOLD_MIN_TRADES: int = 30  # Min trades required for a threshold to be considered valid
@@ -97,7 +96,10 @@ class TrainingConfig(TradeBoundsConfig):
     # --- Cache Versioning ---
     # Bump this number whenever any labeling/feature param above changes.
     # This forces train.py to rebuild the parquet cache instead of using stale data.
-    FEATURE_CACHE_VERSION: int = 114
+    # v115: Converted to 5m scalping system with microstructure features and SMA20 filter
+    # v116: Improved Oracle RR ratio (2.0) and wider TP targets for better win rate
+    # v117: Switch to 15m interval - better signal/noise ratio than 5m
+    FEATURE_CACHE_VERSION: int = 117
 
 
 # ---------------------------------------------------------------------------
@@ -116,29 +118,29 @@ class TestingConfig(TradeBoundsConfig):
 
     # --- Capital, Margin & Leverage ---
     INITIAL_CAPITAL_USD: float = 100.0
-    MARGIN_PER_TRADE_PCT_OF_EQUITY: float = 5.0
-    LEVERAGE: float = 20
-    ROUND_TRIP_FEE_PCT: float = 0.10             # Total fee for entry + exit
-    SLIPPAGE_PCT: float = 0.03                   # Per-leg slippage estimate
+    MARGIN_PER_TRADE_PCT_OF_EQUITY: float = 5.0  # Base margin (overridden by dynamic sizing)
+    LEVERAGE: float = 5                          # Lower leverage for 5m scalping (was 20)
+    ROUND_TRIP_FEE_PCT: float = 0.05             # Total fee for entry + exit (maker orders)
+    SLIPPAGE_PCT: float = 0.01                   # Per-leg slippage estimate (tighter for 5m)
 
-    # --- Signal Filtering (NEW APPROACH: margin-based, not absolute threshold) ---
+    # --- Signal Filtering (margin-based) ---
     # A trade signal fires when the model's leading class probability beats neutral
-    # by at least SIGNAL_MARGIN_THRESHOLD.  This is far more meaningful than a
-    # raw probability floor because the model tends to output ~50% for everything.
-    #
-    # Example: prob_long=0.48, prob_neutral=0.33, prob_short=0.19
-    #   margin = 0.48 - 0.33 = 0.15 → FIRES
-    SIGNAL_MARGIN_THRESHOLD: float = 0.20        # Require a clear edge over NEUTRAL
-    AI_CONFIDENCE_THRESHOLD: float = 0.75        # Trade only high-confidence signals
-    USE_TREND_FILTER: bool = True               # Strictly trade with macro trend
-    AI_TARGET_DISCOUNT_FACTOR: float = 0.80     # Scale down AI targets for conservative exits (1.0 = No discount)
+    # by at least SIGNAL_MARGIN_THRESHOLD.
+    SIGNAL_MARGIN_THRESHOLD: float = 0.20        # Higher threshold for quality (was 0.10)
+    AI_CONFIDENCE_THRESHOLD: float = 0.60        # Higher absolute floor for quality (was 0.45)
+    USE_TREND_FILTER: bool = True                # Enable SMA20 trend filter
+    AI_TARGET_DISCOUNT_FACTOR: float = 1.0       # No discount for 5m (was 0.80)
+
+    # --- Dynamic Position Sizing (Pattern Confidence Engine) ---
+    BASE_MARGIN_PCT: float = 2.0                 # Minimum margin for low-confidence trades
+    MAX_MARGIN_PCT: float = 8.0                  # Maximum margin for high-confidence trades
 
     # --- Execution Guards ---
     PARALLEL_SLOTS: int = 1
-    MAX_DAILY_TRADES: int = 2
-    COOLDOWN_BARS: int = 6
-    MAX_CONSECUTIVE_LOSSES: int = 10
-    DAILY_STOP_LOSS_PCT: float = 10.0
+    MAX_DAILY_TRADES: int = 20                   # Higher limit for scalping (was 2)
+    COOLDOWN_BARS: int = 3                       # Shorter cooldown for 5m (was 6)
+    MAX_CONSECUTIVE_LOSSES: int = 5              # Tighter stop for scalping (was 10)
+    DAILY_STOP_LOSS_PCT: float = 3.0             # Tighter daily stop for scalping (was 10.0)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +181,9 @@ def _validate_config(c: TradingConfig) -> None:
     assert c.training.PURGE_BARS >= c.training.LOOKAHEAD_BARS, (
         "PURGE_BARS should be >= LOOKAHEAD_BARS to prevent label-to-feature leakage"
     )
+    assert c.training.PURGE_BARS >= c.training.LOOKAHEAD_BARS * 2, (
+        "PURGE_BARS should be >= 2x LOOKAHEAD_BARS to prevent label leakage"
+    )
     assert 0.0 <= c.testing.ROUND_TRIP_FEE_PCT <= 1.0, "Fee must be 0-1%"
     assert c.testing.LEVERAGE >= 1.0, "Leverage must be >= 1"
     assert c.model.HIDDEN_DIM > 0 and c.model.NUM_LAYERS > 0
@@ -193,5 +198,5 @@ _validate_config(cfg)
 
 def bars_per_day(interval: str) -> int:
     """Return the number of OHLCV bars per calendar day for a given interval string."""
-    mapping = {"15m": 96, "1h": 24, "1d": 1}
+    mapping = {"5m": 288, "15m": 96, "1h": 24, "1d": 1}
     return mapping.get(interval, 96)

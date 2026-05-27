@@ -85,14 +85,17 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
     feature_data = (feature_data - mean) / (scale + 1e-8)
 
     window_size = cfg.model.WINDOW_SIZE
-    if len(feature_data) < window_size:
+    if len(feature_data) < window_size + 1:
         console.print("[red]Not enough data for window size.[/red]")
         return
 
+    # CRITICAL FIX: Use [:-1] to create windows that predict the NEXT bar
+    # This prevents same-bar leakage (using bar t's data to predict bar t)
     from numpy.lib.stride_tricks import sliding_window_view
-    X_seq = sliding_window_view(feature_data, (window_size, feature_data.shape[1])).squeeze(1)
+    X_seq = sliding_window_view(feature_data[:-1], (window_size, feature_data.shape[1])).squeeze(1)
 
     probs_list, sizing_list, mag_list, time_list = [], [], [], []
+    model.eval()  # Ensure eval mode — disables dropout for deterministic inference
     with torch.no_grad():
         for i in range(0, len(X_seq), 1024):
             batch = torch.from_numpy(X_seq[i : i + 1024].copy()).float().to(device)
@@ -107,8 +110,9 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
     magnitude = np.concatenate(mag_list, axis=0)
     time_pred = np.concatenate(time_list, axis=0)
 
-    # Pad the first (window_size - 1) rows with zeros
-    pad_len = window_size - 1
+    # Pad with WINDOW_SIZE zeros at the start (no predictions for first window_size bars)
+    # Now predictions align correctly: window[0:95] predicts row 96, etc.
+    pad_len = window_size
     probs = np.vstack([np.zeros((pad_len, 3)), probs])
     sizing = np.vstack([np.zeros((pad_len, 3)), sizing])
     magnitude = np.vstack([np.zeros((pad_len, 1)), magnitude])
@@ -168,8 +172,8 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
     logger.info(f"Signals generated — LONG: {long_count}, SHORT: {short_count}, NEUTRAL: {(~long_signal & ~short_signal).sum()}")
 
     # ── 8. Run backtester ─────────────────────────────────────────────────
-    bars_per_interval = 24 if cfg.model.INTERVAL == "1h" else 96
-    test_bars = int(cfg.training.TEST_DATA_DAYS * bars_per_interval)
+    from config import bars_per_day
+    test_bars = int(cfg.training.TEST_DATA_DAYS * bars_per_day(cfg.model.INTERVAL))
     df_test = df_features.iloc[-test_bars:].copy()
     eligible_rows = max(len(df_features) - window_size + 1, 0)
 
@@ -181,6 +185,36 @@ def run_backtest(symbol: str = "ETHUSD") -> None:
         leverage=cfg.testing.LEVERAGE,
         round_trip_fee_pct=cfg.testing.ROUND_TRIP_FEE_PCT,
     )
+    # Calculate additional metrics
+    initial = cfg.testing.INITIAL_CAPITAL_USD
+    pnl = summary.get("total_pnl_net_usd", 0)
+    roi_pct = (pnl / initial) * 100.0 if initial > 0 else 0
+
+    # Calculate CAGR (Compound Annual Growth Rate)
+    if summary.get("duration_days", 0) > 0:
+        years = summary["duration_days"] / 365.0
+        final_equity = initial + pnl
+        cagr = ((final_equity / initial) ** (1 / years) - 1) * 100
+        summary["cagr_pct"] = round(cagr, 2)
+    else:
+        summary["cagr_pct"] = 0.0
+
+    # Calculate Buy & Hold benchmark
+    if not df_test.empty and len(df_test) > 1:
+        buy_hold_return = ((df_test["Close"].iloc[-1] - df_test["Close"].iloc[0]) / df_test["Close"].iloc[0]) * 100
+        summary["buy_hold_return_pct"] = round(buy_hold_return, 2)
+        summary["excess_return_vs_buy_hold"] = round(roi_pct - buy_hold_return, 2)
+    else:
+        summary["buy_hold_return_pct"] = 0.0
+        summary["excess_return_vs_buy_hold"] = 0.0
+
+    # Calculate Calmar Ratio (Return / Max Drawdown)
+    max_dd = abs(summary.get("max_drawdown_pct", 0))
+    if max_dd > 0:
+        summary["calmar_ratio"] = round(abs(roi_pct / max_dd), 2)
+    else:
+        summary["calmar_ratio"] = 0.0
+
     summary.update({
         "raw_rows": len(df),
         "feature_rows": len(df_features),
@@ -264,6 +298,24 @@ def _print_professional_backtest_summary(symbol: str, summary: dict, trades: lis
         "ROI (%)",
         f"[green]{roi_pct:+.2f}%[/]" if roi_pct >= 0 else f"[red]{roi_pct:+.2f}%[/]",
     )
+    # NEW: CAGR metric
+    cagr = summary.get("cagr_pct", 0)
+    perf_table.add_row(
+        "CAGR (%)",
+        f"[green]{cagr:+.2f}%[/]" if cagr >= 0 else f"[red]{cagr:+.2f}%[/]",
+    )
+    # NEW: Buy & Hold comparison
+    buy_hold = summary.get("buy_hold_return_pct", 0)
+    perf_table.add_row(
+        "Buy & Hold (%)",
+        f"[green]{buy_hold:+.2f}%[/]" if buy_hold >= 0 else f"[red]{buy_hold:+.2f}%[/]",
+    )
+    # NEW: Excess return
+    excess = summary.get("excess_return_vs_buy_hold", 0)
+    perf_table.add_row(
+        "Excess Return (%)",
+        f"[green]{excess:+.2f}%[/]" if excess >= 0 else f"[red]{excess:+.2f}%[/]",
+    )
     perf_table.add_row("Total Trades", str(summary.get("trade_count", 0)))
     perf_table.add_row("  └─ Long Trades", f"[cyan]{long_trades}[/]")
     perf_table.add_row("  └─ Short Trades", f"[magenta]{short_trades}[/]")
@@ -290,6 +342,8 @@ def _print_professional_backtest_summary(symbol: str, summary: dict, trades: lis
     analytics_table.add_row("Trades / Day", f"{summary.get('trades_per_day', 0):.2f}")
     analytics_table.add_row("Max Drawdown", f"[red]{summary.get('max_drawdown_pct', 0):.2f}%[/]")
     analytics_table.add_row("Sharpe", f"{summary.get('sharpe_ratio', 0):.2f}")
+    # NEW: Calmar Ratio
+    analytics_table.add_row("Calmar Ratio", f"{summary.get('calmar_ratio', 0):.2f}")
 
     # ── Direction breakdown table ────────────────────────────────────────
     direction_table = Table(

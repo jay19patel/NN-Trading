@@ -51,7 +51,7 @@ def _add_directional_indicators(df: pd.DataFrame, high: pd.Series, low: pd.Serie
         df[f"{prefix}dmn"] = 0.0
 
 
-def _add_ema_stack(df: pd.DataFrame, close: pd.Series, prefix: str = "", lengths: tuple[int, ...] = (9, 21, 50, 200)) -> None:
+def _add_ema_stack(df: pd.DataFrame, close: pd.Series, prefix: str = "", lengths: tuple[int, ...] = (9, 21, 50)) -> None:
     emas: dict[int, pd.Series] = {}
     for length in lengths:
         ema = ta.ema(close, length=length)
@@ -62,8 +62,6 @@ def _add_ema_stack(df: pd.DataFrame, close: pd.Series, prefix: str = "", lengths
         df[f"{prefix}ema_9_21_spread"] = _safe_div(emas[9] - emas[21], emas[21])
     if 21 in emas and 50 in emas:
         df[f"{prefix}ema_21_50_spread"] = _safe_div(emas[21] - emas[50], emas[50])
-    if 50 in emas and 200 in emas:
-        df[f"{prefix}ema_50_200_spread"] = _safe_div(emas[50] - emas[200], emas[200])
 
     if 21 in emas:
         df[f"{prefix}trend_regime"] = np.sign(close - emas[21])
@@ -127,6 +125,37 @@ def _higher_timeframe_features(df: pd.DataFrame, rule: str, prefix: str, ema_len
     return features.shift(1).reindex(df.index, method="ffill")
 
 
+def _add_scalping_microstructure(df: pd.DataFrame, close: pd.Series, high: pd.Series, low: pd.Series, open_: pd.Series, volume: pd.Series) -> None:
+    """
+    Microstructure features specifically useful for 5m scalping.
+    These capture short-term momentum and candle quality signals that
+    the model uses to identify high-probability small moves.
+    """
+    candle_range = (high - low).replace(0, np.nan)
+
+    # Short-term momentum (key for scalping)
+    df["roc_3"] = close.pct_change(3)    # 15-min momentum
+    df["roc_6"] = close.pct_change(6)    # 30-min momentum
+    df["roc_12"] = close.pct_change(12)  # 1-hour momentum
+
+    # Volume confirmation for entry quality
+    df["volume_ratio_5"] = _safe_div(volume, volume.rolling(5).mean())
+    df["volume_ratio_10"] = _safe_div(volume, volume.rolling(10).mean())
+
+    # Candle quality score (clean directional bars = better entries)
+    df["candle_directional_score"] = _safe_div(
+        (close - open_).abs(), candle_range
+    )
+
+    # Price position within recent micro-range (5m context)
+    high_6 = high.rolling(6).max()
+    low_6 = low.rolling(6).min()
+    df["micro_position_6"] = _safe_div(close - low_6, high_6 - low_6)
+
+    # SMA20 for oracle-consistent trend filter
+    df["sma_20"] = close.rolling(20).mean().fillna(close)
+
+
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add compact, trader-oriented features for the neural network.
@@ -168,8 +197,12 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         df["supertrend"] = supertrend["SUPERT_10_3"]
     else:
         df["supertrend"] = close.rolling(10).mean()
-    df["trend_strength"] = _safe_div((close - df["supertrend"]).abs(), close)
+    # REMOVED: trend_strength (redundant with dist_ema features)
+    # df["trend_strength"] = _safe_div((close - df["supertrend"]).abs(), close)
     df["momentum_slope"] = df["log_return_1"].rolling(5).mean() - df["log_return_1"].rolling(20).mean()
+
+    # Scalping microstructure features
+    _add_scalping_microstructure(df, close, high, low, open_, volume)
 
     # Candle shape and local structure
     candle_range = (high - low).replace(0, np.nan)
@@ -205,6 +238,29 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["range_compression_10_50"] = _safe_div(candle_range.rolling(10).mean(), candle_range.rolling(50).mean())
     df["surprise_20"] = _safe_div(simple_return_1 - simple_return_1.rolling(20).mean(), simple_return_1.rolling(20).std())
     df["shock_elasticity_12"] = _safe_div(simple_return_1.abs(), df["realized_vol_12"])
+
+    # ── NEW HIGH-IMPACT FEATURES ──────────────────────────────────────────
+    # 1. Price Rate of Change (ROC) - direct % change
+    df["roc_12"] = ((close - close.shift(12)) / close.shift(12)) * 100.0
+    df["roc_24"] = ((close - close.shift(24)) / close.shift(24)) * 100.0
+
+    # 2. Volume-Weighted Momentum (institutional flow detection)
+    df["volume_momentum"] = (close.pct_change() * volume).rolling(10).sum()
+    df["volume_momentum_norm"] = _safe_div(df["volume_momentum"], df["volume_momentum"].rolling(50).std())
+
+    # 3. Close position within bar (order flow proxy)
+    df["close_position_in_bar"] = _safe_div(close - low, high - low)
+    df["avg_close_pos_10"] = df["close_position_in_bar"].rolling(10).mean()
+
+    # 4. Bollinger Band squeeze (volatility breakout predictor)
+    bb_width_norm = _safe_div(df["bb_width"], df["bb_width"].rolling(50).mean())
+    df["bb_squeeze"] = (bb_width_norm < 0.5).astype(float)
+
+    # 5. Volatility regime percentile
+    df["vol_percentile_100"] = df["realized_vol_24"].rolling(100).apply(
+        lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x) > 0 else 0.5, raw=False
+    )
+    # ──────────────────────────────────────────────────────────────────────
 
     # Time/session features from the candle timestamp if available.
     idx = pd.to_datetime(df.index, errors="coerce")
@@ -244,10 +300,16 @@ def get_feature_columns():
 
         # 1h trend and momentum
         "rsi_7", "rsi_14", "rsi_21", "rsi_slope_7_21", "stochrsi_k",
-        "dist_ema_9", "dist_ema_21", "dist_ema_50", "dist_ema_200",
-        "ema_9_21_spread", "ema_21_50_spread", "ema_50_200_spread", "trend_regime",
+        "dist_ema_9", "dist_ema_21", "dist_ema_50",
+        "ema_9_21_spread", "ema_21_50_spread", "trend_regime",
         "macd", "macd_hist", "adx",
-        "bb_width", "bb_position", "trend_strength", "momentum_slope",
+        "bb_width", "bb_position", "momentum_slope",
+
+        # Scalping microstructure
+        "roc_3", "roc_6", "roc_12",
+        "volume_ratio_5", "volume_ratio_10",
+        "candle_directional_score",
+        "micro_position_6",
 
         # 1h candle, structure, volume, and time
         "body_pct_range", "buy_pressure", "wick_imbalance", "candle_vs_atr",
@@ -255,6 +317,13 @@ def get_feature_columns():
         "price_to_vwap", "vol_ratio_20", "volume_surprise_50", "vol_trend_5_20", "obv_slope_20",
         "efficiency_ratio_10", "range_compression_10_50", "surprise_20",
         "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+
+        # NEW: High-impact features
+        "roc_24",
+        "volume_momentum_norm",
+        "avg_close_pos_10",
+        "bb_squeeze",
+        "vol_percentile_100",
 
         # 4h regime context
         "mtf_4h_log_return_1", "mtf_4h_natr",

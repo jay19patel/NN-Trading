@@ -6,6 +6,22 @@ import numpy as np
 import pandas as pd
 from config import cfg
 
+def _confidence_to_margin_pct(confidence: float, base_pct: float, max_pct: float) -> float:
+    """
+    Map model confidence (0-1) to a position margin percentage using sqrt scaling.
+
+    sqrt scaling avoids over-betting on high-confidence signals since models
+    can be overconfident.
+
+    Examples (base=2%, max=8%):
+      confidence=0.45 → ~3.7%
+      confidence=0.60 → ~4.6%
+      confidence=0.80 → ~5.4%
+      confidence=1.00 → 8.0%
+    """
+    confidence = float(np.clip(confidence, 0.0, 1.0))
+    return base_pct + (max_pct - base_pct) * (confidence ** 0.5)
+
 @dataclass
 class PaperTradeRecord:
     symbol: str
@@ -38,6 +54,8 @@ class PaperTradeRecord:
     mfe_pct: float = 0.0
     max_price_reached: float = 0.0
     min_price_reached: float = 0.0
+    pattern_confidence: float = 0.0
+    dynamic_margin_pct: float = 5.0
 
 def compute_position_size_for_margin_budget(
     equity_usd: float,
@@ -79,6 +97,10 @@ def run_paper_portfolio_on_signals(
     daily_start_equity = equity_usd
     trading_locked_for_day = False
 
+    # Load PatternConfidenceEngine for dynamic position sizing (optional — graceful fallback)
+    from neural_engine.pattern_confidence import PatternConfidenceEngine, PATTERN_FEATURES
+    _pattern_engine = PatternConfidenceEngine.load_or_none()
+
     for i in range(len(working_frame)):
         equity_by_bar.append(equity_usd)
         row = working_frame.iloc[i]
@@ -118,10 +140,10 @@ def run_paper_portfolio_on_signals(
 
                 if curr_low <= t["liq_price"]:
                     hit_liq, exit_price = True, t["liq_price"]
-                elif curr_high >= t["tp_price"]:
-                    hit_tp, exit_price = True, t["tp_price"]
                 elif curr_low <= t["sl_price"]:
                     hit_sl, exit_price = True, t["sl_price"]
+                elif curr_high >= t["tp_price"]:
+                    hit_tp, exit_price = True, t["tp_price"]
             else: # SHORT
                 curr_mfe = ((t["entry_price"] - curr_low) / t["entry_price"]) * 100.0
                 curr_mae = ((t["entry_price"] - curr_high) / t["entry_price"]) * 100.0
@@ -194,55 +216,83 @@ def run_paper_portfolio_on_signals(
                     max_price_reached=t["max_price"], min_price_reached=t["min_price"]
                 ))
                 finished_trades_indices.append(idx)
-                
+
                 # Update execution guards based on exit
-                cooldown_bars_left = cfg.testing.COOLDOWN_BARS
+                # FIX: Only apply cooldown after FAILED trades (not after wins)
                 if outcome == "FAILED":
                     consecutive_losses += 1
+                    cooldown_bars_left = cfg.testing.COOLDOWN_BARS
                 elif outcome == "SUCCESS":
                     consecutive_losses = 0
+                    # No cooldown after wins - allow taking good opportunities
 
         for idx in sorted(finished_trades_indices, reverse=True):
             active_trades.pop(idx)
 
-        # 2. Check for New Signal
+        # 2. Check for New Signal (execute on NEXT bar)
         can_trade = (
-            not trading_locked_for_day and 
-            cooldown_bars_left == 0 and 
-            consecutive_losses < cfg.testing.MAX_CONSECUTIVE_LOSSES and 
+            not trading_locked_for_day and
+            cooldown_bars_left == 0 and
+            consecutive_losses < cfg.testing.MAX_CONSECUTIVE_LOSSES and
             daily_trade_count < cfg.testing.MAX_DAILY_TRADES
         )
 
-        if len(active_trades) < max_slots and can_trade:
+        # CRITICAL FIX: Only process signals if we have a NEXT bar to enter on
+        # This prevents entering at the same bar's close (impossible in live trading)
+        if len(active_trades) < max_slots and can_trade and i < len(working_frame) - 1:
             verdict = int(row["ai_verdict"])
             if verdict != 1:
                 side = "LONG" if verdict == 0 else "SHORT"
                 confidence = float(row.get("ai_confidence", 0.0))
-                if confidence < cfg.testing.AI_CONFIDENCE_THRESHOLD: continue
+                # BUG FIX #1: Use nested if instead of continue to avoid skipping daily_trade_count increment
+                if confidence >= cfg.testing.AI_CONFIDENCE_THRESHOLD:
+                    tp_pct = float(row["ai_take_profit_pct"]) * cfg.testing.AI_TARGET_DISCOUNT_FACTOR
+                    sl_pct = float(row["ai_stop_loss_pct"])
 
-                tp_pct = float(row["ai_take_profit_pct"]) * cfg.testing.AI_TARGET_DISCOUNT_FACTOR
-                sl_pct = float(row["ai_stop_loss_pct"])
-                
-                entry_price = curr_price * (1 + slippage_fraction if side == "LONG" else 1 - slippage_fraction)
-                tp_price = entry_price * (1 + tp_pct / 100.0) if side == "LONG" else entry_price * (1 - tp_pct / 100.0)
-                sl_price = entry_price * (1 - sl_pct / 100.0) if side == "LONG" else entry_price * (1 + sl_pct / 100.0)
-                
-                # Liquidation calculation based on leverage
-                liq_price = entry_price * (1 - (1.0 / leverage)) if side == "LONG" else entry_price * (1 + (1.0 / leverage))
+                    # CRITICAL FIX: Enter on NEXT bar's open (earliest realistic entry point)
+                    # Signal generated at bar i (after close), enter on bar i+1 open
+                    next_row = working_frame.iloc[i + 1]
+                    next_open = float(next_row["Open"])
+                    entry_price = next_open * (1 + slippage_fraction if side == "LONG" else 1 - slippage_fraction)
 
-                quantity, notional_usd = compute_position_size_for_margin_budget(
-                    equity_usd, entry_price, margin_fraction, leverage
-                )
+                    tp_price = entry_price * (1 + tp_pct / 100.0) if side == "LONG" else entry_price * (1 - tp_pct / 100.0)
+                    sl_price = entry_price * (1 - sl_pct / 100.0) if side == "LONG" else entry_price * (1 + sl_pct / 100.0)
 
-                if quantity > 0:
-                    active_trades.append({
-                        "symbol": symbol, "side": side, "entry_price": entry_price, "tp_price": tp_price, "sl_price": sl_price,
-                        "liq_price": liq_price, "sl_price_initial": sl_price, "tp_pct": tp_pct, "sl_pct": sl_pct, "quantity": quantity,
-                        "notional_usd": notional_usd, "entry_time": curr_time, "entry_index": i,
-                        "confidence": confidence, "qty_ratio": 1.0, "capital_before": equity_usd, "bars_held": 0,
-                        "mae_pct": 0.0, "mfe_pct": 0.0, "max_price": curr_high, "min_price": curr_low
-                    })
-                    daily_trade_count += 1
+                    # Liquidation calculation based on leverage
+                    liq_price = entry_price * (1 - (1.0 / leverage)) if side == "LONG" else entry_price * (1 + (1.0 / leverage))
+
+                    # BUG FIX #3: Pattern-based confidence for dynamic position sizing
+                    pattern_conf = confidence  # fallback: use model confidence
+                    if _pattern_engine is not None:
+                        # Extract pattern features for current bar
+                        live_features = {
+                            feat: float(row.get(feat, 0.0))
+                            for feat in PATTERN_FEATURES
+                            if feat in row.index
+                        }
+                        if live_features:
+                            pattern_conf = _pattern_engine.get_confidence(live_features, side)
+
+                    dynamic_margin_pct = _confidence_to_margin_pct(
+                        pattern_conf,
+                        base_pct=cfg.testing.BASE_MARGIN_PCT,
+                        max_pct=cfg.testing.MAX_MARGIN_PCT,
+                    )
+                    dynamic_margin_fraction = dynamic_margin_pct / 100.0
+                    quantity, notional_usd = compute_position_size_for_margin_budget(
+                        equity_usd, entry_price, dynamic_margin_fraction, leverage
+                    )
+
+                    if quantity > 0:
+                        active_trades.append({
+                            "symbol": symbol, "side": side, "entry_price": entry_price, "tp_price": tp_price, "sl_price": sl_price,
+                            "liq_price": liq_price, "sl_price_initial": sl_price, "tp_pct": tp_pct, "sl_pct": sl_pct, "quantity": quantity,
+                            "notional_usd": notional_usd, "entry_time": str(next_row.name), "entry_index": i + 1,  # Note: entry at i+1
+                            "confidence": confidence, "pattern_confidence": pattern_conf, "dynamic_margin_pct": dynamic_margin_pct,
+                            "qty_ratio": 1.0, "capital_before": equity_usd, "bars_held": 0,
+                            "mae_pct": 0.0, "mfe_pct": 0.0, "max_price": float(next_row["High"]), "min_price": float(next_row["Low"])
+                        })
+                        daily_trade_count += 1
 
     working_frame["paper_equity_curve"] = equity_by_bar
     summary = summarize_trade_feedback(trade_records)

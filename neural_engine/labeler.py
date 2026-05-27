@@ -138,7 +138,7 @@ def _compute_oracle_labels_jit(
     max_target_pct: float,
     min_stop_pct: float,
     max_stop_pct: float,
-    sma50: np.ndarray,
+    sma20: np.ndarray,
     atr_ratio: np.ndarray,
 ):
     """
@@ -191,11 +191,11 @@ def _compute_oracle_labels_jit(
                     continue
 
                 # Volatility Filter: Skip if current ATR is much higher than average (noisy regime)
-                if atr_ratio[row_index] > 1.5:
+                if atr_ratio[row_index] > 2.0:
                     continue
 
-                # Test LONG (Only if Price > SMA50)
-                if close_prices[row_index] > sma50[row_index]:
+                # Test LONG (Only if Price > SMA20 — faster filter for 5m)
+                if close_prices[row_index] > sma20[row_index]:
                     l_code, l_pnl, l_time = _simulate_trade_path(
                         close_prices, high_prices, low_prices,
                         row_index, lookahead, tp_pct, sl_pct, True, entry_long,
@@ -205,8 +205,8 @@ def _compute_oracle_labels_jit(
                         best_label, best_tp, best_sl = 0, tp_pct, sl_pct
                         best_net_return, best_time, best_magnitude = l_net, float(l_time), tp_pct
 
-                # Test SHORT (Only if Price < SMA50)
-                if close_prices[row_index] < sma50[row_index]:
+                # Test SHORT (Only if Price < SMA20 — faster filter for 5m)
+                if close_prices[row_index] < sma20[row_index]:
                     s_code, s_pnl, s_time = _simulate_trade_path(
                         close_prices, high_prices, low_prices,
                         row_index, lookahead, tp_pct, sl_pct, False, entry_short,
@@ -283,7 +283,7 @@ class OracleLabeler:
             training.MAX_ATR_TARGET_PCT,
             training.MIN_ATR_STOP_PCT,
             training.MAX_ATR_STOP_PCT,
-            df["sma_50"].values if "sma_50" in df.columns else df["Close"].rolling(50).mean().fillna(df["Close"]).values,
+            df["sma_20"].values if "sma_20" in df.columns else df["Close"].rolling(20).mean().fillna(df["Close"]).values,
             (df["atr"] / df["atr"].rolling(100).mean()).fillna(1.0).values,
         )
 

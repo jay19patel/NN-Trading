@@ -45,9 +45,38 @@ from neural_engine.model import MultiHeadTradingModel, TradingLoss
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Bars to drop at the start of each dataframe before training.
-# Covers daily multi-timeframe indicator warmup before training rows are used.
-INDICATOR_WARMUP_BARS = 35 * 24
+
+class InferenceExportWrapper(torch.nn.Module):
+    """Return tuple outputs so TorchScript inference does not need project classes."""
+
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model
+
+    def forward(self, window_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out = self.model(window_features)
+        return out["direction"], out["sizing"], out["magnitude"], out["time"]
+
+
+def export_scripted_model(model_path: str, output_path: str, input_dim: int) -> None:
+    """Export best trained weights as a standalone TorchScript model."""
+    export_device = "cpu"
+    model = MultiHeadTradingModel(input_dim=input_dim).to(export_device)
+    try:
+        state_dict = torch.load(model_path, map_location=export_device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(model_path, map_location=export_device)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    wrapper = InferenceExportWrapper(model).eval()
+    example = torch.zeros(1, cfg.model.WINDOW_SIZE, input_dim, dtype=torch.float32)
+
+    with torch.no_grad():
+        scripted = torch.jit.trace(wrapper, example, strict=False)
+        scripted.save(output_path)
+
+    logger.info(f"Standalone TorchScript model exported: {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +170,9 @@ def _prepare_symbol_frame(
         df = labeler.generate_labels(df.copy())
 
         # Drop the warmup window to avoid NaN-polluted rows from slow indicators
-        df = df.iloc[INDICATOR_WARMUP_BARS:]
+        # Scale warmup by interval: 35 days worth of bars
+        warmup = 35 * bars_per_day(interval)
+        df = df.iloc[warmup:]
 
         missing_features = [c for c in feature_cols if c not in df.columns]
         if missing_features:
@@ -584,6 +615,43 @@ def train_trading_model() -> None:
     # ── Step 8: Save scaler ────────────────────────────────────────────────
     np.save(os.path.join("models", "scaler_mean.npy"), scaler.mean_)
     np.save(os.path.join("models", "scaler_scale.npy"), scaler.scale_)
+    export_scripted_model(
+        model_path=best_model_path,
+        output_path=os.path.join("models", "trading_model_scripted.pt"),
+        input_dim=len(feature_cols),
+    )
+
+    # ── Step 9: Fit and save PatternConfidenceEngine ──────────────────────
+    try:
+        from neural_engine.pattern_confidence import PatternConfidenceEngine
+        logger.info("Fitting PatternConfidenceEngine on training data...")
+
+        # Use first training symbol's data
+        # Re-load the processed df for the first symbol to get oracle labels
+        first_symbol = symbols[0]
+        df_for_patterns = _prepare_symbol_frame(first_symbol, total_days, interval, feature_cols)
+        if not df_for_patterns.empty and "direction_label" in df_for_patterns.columns:
+            # Use only the training portion (same split as model training)
+            train_df_for_patterns = raw_splits["train"][0] if raw_splits["train"] else df_for_patterns
+
+            # PatternConfidenceEngine needs features + oracle label columns
+            oracle_cols = ["direction_label", "expected_return_pct"]
+            available_oracle = [c for c in oracle_cols if c in train_df_for_patterns.columns]
+
+            if len(available_oracle) == 2:
+                pattern_engine = PatternConfidenceEngine(n_neighbors=20)
+                pattern_engine.fit(
+                    df_features=train_df_for_patterns,
+                    oracle_labels=train_df_for_patterns[available_oracle],
+                )
+                pattern_engine.save()
+                logger.info("PatternConfidenceEngine saved to models/pattern_confidence_db.pkl")
+            else:
+                logger.warning("Oracle columns missing — PatternConfidenceEngine not fitted.")
+        else:
+            logger.warning("No training data for PatternConfidenceEngine fitting.")
+    except Exception as e:
+        logger.warning(f"PatternConfidenceEngine fitting failed (non-critical): {e}")
 
     # Threshold search results are now purely for logging; we use config.py for execution
     if val_pred is None:
@@ -596,7 +664,15 @@ def train_trading_model() -> None:
 
     logger.info("Training complete. Model and artifacts saved in models/")
 
-    # ── Step 10: Auto-run backtest ─────────────────────────────────────────
+    # ── Step 10: Export to multiple formats ────────────────────────────────
+    try:
+        from neural_engine.export_model import export_all_formats
+        logger.info("Exporting model to ONNX and standalone formats...")
+        export_all_formats(model_dir="models", input_dim=len(feature_cols))
+    except Exception as e:
+        logger.warning(f"Model export failed (optional): {e}")
+
+    # ── Step 11: Auto-run backtest ─────────────────────────────────────────
     run_backtest(symbol=cfg.model.SYMBOLS[0])
 
 
