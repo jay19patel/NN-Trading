@@ -55,10 +55,14 @@ MA_SPECS = (
     ("sma20", "sma", 20),
     ("sma50", "sma", 50),
     ("sma200", "sma", 200),
+    ("ema5", "ema", 5),
     ("ema9", "ema", 9),
     ("ema20", "ema", 20),
     ("ema50", "ema", 50),
     ("ema200", "ema", 200),
+    ("hma9", "hma", 9),
+    ("hma21", "hma", 21),
+    ("hma50", "hma", 50),
 )
 MA_STATUS_COLUMNS = tuple(f"price_above_{name}" for name, _, _ in MA_SPECS)
 TECHNICAL_CONDITION_COLUMNS = (
@@ -85,9 +89,17 @@ TECHNICAL_CONDITION_COLUMNS = (
     "condition_roc3_positive",
     "condition_roc3_negative",
     "condition_ema9_above_ema21",
+    "condition_ema5_above_ema20",
+    "condition_ema5_cross_above_ema20",
+    "condition_ema5_cross_below_ema20",
     "condition_ema21_above_ema50",
     "condition_ema50_above_ema200",
     "condition_sma50_above_sma200",
+    "condition_price_above_hma9",
+    "condition_price_below_hma9",
+    "condition_hma9_above_hma21",
+    "condition_hma9_cross_above_hma21",
+    "condition_hma9_cross_below_hma21",
     "condition_trend_regime_up",
     "condition_trend_regime_down",
     "condition_rsi_rising",
@@ -133,6 +145,14 @@ LABEL_COLUMNS: tuple[str, ...] = (
     "entry_mode",
     "rr_ratio",
     "label_valid",
+    "oracle_direction_label",
+    "oracle_direction_name",
+    "confirmation_score",
+    "confirmation_bull_score",
+    "confirmation_bear_score",
+    "confirmation_edge",
+    "confirmation_filter_used",
+    "label_filter_reason",
 )
 
 _RAW_OHLCV: frozenset[str] = frozenset({"Open", "High", "Low", "Close", "Volume"})
@@ -179,6 +199,21 @@ def _causal_sma(df: pd.DataFrame, length: int = 20) -> np.ndarray:
     return df["Close"].rolling(length).mean().fillna(df["Close"]).to_numpy(dtype=np.float64)
 
 
+def _weighted_moving_average(series: pd.Series, length: int) -> pd.Series:
+    weights = np.arange(1, length + 1, dtype=np.float64)
+    return series.rolling(length, min_periods=length).apply(
+        lambda values: float(np.dot(values, weights) / weights.sum()),
+        raw=True,
+    )
+
+
+def _hma(series: pd.Series, length: int) -> pd.Series:
+    half_length = max(int(length / 2), 1)
+    sqrt_length = max(int(np.sqrt(length)), 1)
+    raw_hma = 2.0 * _weighted_moving_average(series, half_length) - _weighted_moving_average(series, length)
+    return _weighted_moving_average(raw_hma, sqrt_length)
+
+
 def _atr_ratio(df: pd.DataFrame, atr_pct: np.ndarray) -> np.ndarray:
     """Volatility ratio used by the existing oracle filter."""
     if "atr" in df.columns:
@@ -202,8 +237,10 @@ def _add_moving_average_status_columns(df: pd.DataFrame) -> pd.DataFrame:
         if name not in out.columns:
             if ma_type == "sma":
                 out[name] = close.rolling(period, min_periods=period).mean()
-            else:
+            elif ma_type == "ema":
                 out[name] = close.ewm(span=period, adjust=False, min_periods=period).mean()
+            else:
+                out[name] = _hma(close, period)
 
         out[f"price_above_{name}"] = (close > out[name]).fillna(False).astype(bool)
 
@@ -354,16 +391,41 @@ def _add_technical_signal_features(df: pd.DataFrame) -> pd.DataFrame:
     out["stochrsi_k"] = _safe_div(out["rsi_14"] - rsi_min, rsi_max - rsi_min) * 100.0
     out["stochrsi_d"] = out["stochrsi_k"].rolling(3).mean()
 
+    ema5 = close.ewm(span=5, adjust=False, min_periods=5).mean()
     ema9 = close.ewm(span=9, adjust=False, min_periods=9).mean()
     ema12 = close.ewm(span=12, adjust=False, min_periods=12).mean()
+    ema20 = close.ewm(span=20, adjust=False, min_periods=20).mean()
     ema21 = close.ewm(span=21, adjust=False, min_periods=21).mean()
     ema26 = close.ewm(span=26, adjust=False, min_periods=26).mean()
     ema50 = close.ewm(span=50, adjust=False, min_periods=50).mean()
+    ema200 = close.ewm(span=200, adjust=False, min_periods=200).mean()
+    sma50 = close.rolling(50, min_periods=50).mean()
+    sma200 = close.rolling(200, min_periods=200).mean()
+    hma9 = _hma(close, 9)
+    hma21 = _hma(close, 21)
+    hma50 = _hma(close, 50)
+    out["ema5"] = ema5
+    out["ema9"] = ema9
+    out["ema20"] = ema20
+    out["ema21"] = ema21
+    out["ema50"] = ema50
+    out["ema200"] = ema200
+    out["sma50"] = sma50
+    out["sma200"] = sma200
+    out["hma9"] = hma9
+    out["hma21"] = hma21
+    out["hma50"] = hma50
+    out["dist_ema_5"] = _safe_div(close - ema5, ema5)
     out["dist_ema_9"] = _safe_div(close - ema9, ema9)
+    out["dist_ema_20"] = _safe_div(close - ema20, ema20)
     out["dist_ema_21"] = _safe_div(close - ema21, ema21)
     out["dist_ema_50"] = _safe_div(close - ema50, ema50)
+    out["dist_hma_9"] = _safe_div(close - hma9, hma9)
+    out["dist_hma_21"] = _safe_div(close - hma21, hma21)
+    out["ema_5_20_spread"] = _safe_div(ema5 - ema20, ema20)
     out["ema_9_21_spread"] = _safe_div(ema9 - ema21, ema21)
     out["ema_21_50_spread"] = _safe_div(ema21 - ema50, ema50)
+    out["hma_9_21_spread"] = _safe_div(hma9 - hma21, hma21)
     out["trend_regime"] = np.sign(close - ema21)
     out["macd"] = ema12 - ema26
     out["macd_signal"] = out["macd"].ewm(span=9, adjust=False, min_periods=9).mean()
@@ -472,9 +534,17 @@ def _add_technical_signal_features(df: pd.DataFrame) -> pd.DataFrame:
         "condition_roc3_negative": out["roc_3"] < 0.0,
         # ── EMA / SMA trend stack (directional — like price_above_ema*) ──────
         "condition_ema9_above_ema21": out["ema_9_21_spread"] > 0.0,
+        "condition_ema5_above_ema20": out["ema_5_20_spread"] > 0.0,
+        "condition_ema5_cross_above_ema20": (ema5 > ema20) & (ema5.shift(1) <= ema20.shift(1)),
+        "condition_ema5_cross_below_ema20": (ema5 < ema20) & (ema5.shift(1) >= ema20.shift(1)),
         "condition_ema21_above_ema50": out["ema_21_50_spread"] > 0.0,
-        "condition_ema50_above_ema200": out["ema50"] > out["ema200"],
-        "condition_sma50_above_sma200": out["sma50"] > out["sma200"],
+        "condition_ema50_above_ema200": ema50 > ema200,
+        "condition_sma50_above_sma200": sma50 > sma200,
+        "condition_price_above_hma9": close > hma9,
+        "condition_price_below_hma9": close < hma9,
+        "condition_hma9_above_hma21": out["hma_9_21_spread"] > 0.0,
+        "condition_hma9_cross_above_hma21": (hma9 > hma21) & (hma9.shift(1) <= hma21.shift(1)),
+        "condition_hma9_cross_below_hma21": (hma9 < hma21) & (hma9.shift(1) >= hma21.shift(1)),
         # ── Trend regime ────────────────────────────────────────────────────
         "condition_trend_regime_up": out["trend_regime"] > 0.0,
         "condition_trend_regime_down": out["trend_regime"] < 0.0,
@@ -757,6 +827,134 @@ def _profit_factor(returns: pd.Series) -> float:
     return float(wins / abs(losses))
 
 
+BULLISH_CONFIRMATION_COLUMNS: tuple[str, ...] = (
+    "price_above_ema5",
+    "price_above_ema9",
+    "price_above_ema20",
+    "price_above_hma9",
+    "condition_ema5_above_ema20",
+    "condition_ema5_cross_above_ema20",
+    "condition_ema9_above_ema21",
+    "condition_hma9_above_hma21",
+    "condition_hma9_cross_above_hma21",
+    "condition_trend_regime_up",
+    "condition_macd_bullish",
+    "condition_macd_hist_positive",
+    "condition_dmp_above_dmn",
+    "condition_rsi_rising",
+    "condition_momentum_up",
+    "condition_roc3_positive",
+    "condition_roc12_positive",
+    "condition_above_vwap",
+    "condition_obv_rising",
+    "condition_mtf_4h_trend_up",
+    "condition_mtf_4h_rsi_bullish",
+)
+BULLISH_REQUIRED_COLUMNS: tuple[str, ...] = ()
+BEARISH_CONFIRMATION_COLUMNS: tuple[str, ...] = (
+    "price_above_ema5",
+    "price_above_ema9",
+    "price_above_ema20",
+    "price_above_hma9",
+    "condition_ema5_above_ema20",
+    "condition_ema5_cross_below_ema20",
+    "condition_hma9_cross_below_hma21",
+    "condition_trend_regime_down",
+    "condition_macd_bearish",
+    "condition_macd_hist_negative",
+    "condition_dmn_above_dmp",
+    "condition_rsi_falling",
+    "condition_momentum_down",
+    "condition_roc3_negative",
+    "condition_roc12_negative",
+    "condition_below_vwap",
+    "condition_obv_falling",
+    "condition_mtf_4h_trend_down",
+    "condition_mtf_4h_rsi_bearish",
+)
+BEARISH_REQUIRED_COLUMNS: tuple[str, ...] = ()
+
+
+def _sum_true_columns(df: pd.DataFrame, columns: tuple[str, ...], invert: frozenset[str] = frozenset()) -> pd.Series:
+    score = pd.Series(0.0, index=df.index)
+    for column in columns:
+        if column not in df.columns:
+            continue
+        values = df[column].fillna(False).astype(bool)
+        if column in invert:
+            values = ~values
+        score += values.astype(float)
+    return score
+
+
+def _apply_confirmation_filter(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    training = cfg.training
+    use_filter = bool(training.USE_TECHNICAL_CONFIRMATION_FILTER)
+
+    bearish_invert = frozenset({"price_above_ema5", "price_above_ema9", "price_above_ema20", "price_above_hma9", "condition_ema5_above_ema20"})
+    bull_score = _sum_true_columns(out, BULLISH_CONFIRMATION_COLUMNS)
+    bear_score = _sum_true_columns(out, BEARISH_CONFIRMATION_COLUMNS, invert=bearish_invert)
+    edge = (bull_score - bear_score).abs()
+
+    out["oracle_direction_label"] = out["direction_label"].astype(int)
+    out["oracle_direction_name"] = out["direction_name"]
+    out["confirmation_bull_score"] = bull_score
+    out["confirmation_bear_score"] = bear_score
+    out["confirmation_score"] = np.where(out["direction_label"] == LONG, bull_score, np.where(out["direction_label"] == SHORT, bear_score, 0.0))
+    out["confirmation_edge"] = edge
+    out["confirmation_filter_used"] = use_filter
+    out["label_filter_reason"] = np.where(out["direction_label"] == NEUTRAL, "oracle_neutral", "confirmed")
+
+    if not use_filter:
+        out.loc[out["direction_label"] != NEUTRAL, "label_filter_reason"] = "filter_disabled"
+        return out
+
+    long_required = pd.Series(True, index=out.index)
+    for column in BULLISH_REQUIRED_COLUMNS:
+        if column in out.columns:
+            long_required &= out[column].fillna(False).astype(bool)
+
+    short_required = pd.Series(True, index=out.index)
+    for column in BEARISH_REQUIRED_COLUMNS:
+        if column not in out.columns:
+            continue
+        values = out[column].fillna(False).astype(bool)
+        if column in bearish_invert:
+            values = ~values
+        short_required &= values
+
+    is_trade = out["direction_label"].isin([LONG, SHORT])
+    weak = is_trade & (out["confirmation_score"] < float(training.MIN_CONFIRMATION_SCORE))
+    conflicted = is_trade & (out["confirmation_edge"] < float(training.MIN_CONFIRMATION_EDGE))
+    missing_required = (
+        ((out["direction_label"] == LONG) & ~long_required)
+        | ((out["direction_label"] == SHORT) & ~short_required)
+    )
+    non_positive_return = is_trade & (out["net_return_pct"] <= float(training.MIN_CONFIRMED_RETURN_PCT))
+    invalid = is_trade & ~out["label_valid"].astype(bool)
+
+    filters = [
+        (invalid, "invalid_lookahead_window"),
+        (non_positive_return, "non_positive_return"),
+        (missing_required, "missing_required_trend_confirmation"),
+        (weak, "weak_confirmation"),
+        (conflicted, "conflicting_confirmation"),
+    ]
+    reject = pd.Series(False, index=out.index)
+    for mask, reason in filters:
+        active = mask & ~reject
+        out.loc[active, "label_filter_reason"] = reason
+        reject |= mask
+
+    out.loc[reject, ["direction_label", "take_profit_pct", "stop_loss_pct", "expected_return_pct", "magnitude_label", "bars_to_exit", "trade_return_pct", "gross_return_pct", "net_return_pct", "rr_ratio"]] = 0
+    out.loc[reject, "direction_label"] = NEUTRAL
+    out.loc[reject, "direction_name"] = LABEL_NAMES[NEUTRAL]
+    out.loc[reject, "exit_reason"] = EXIT_REASON_NAMES[EXIT_NONE]
+    out.loc[reject, ["entry_price", "exit_price"]] = np.nan
+    return out
+
+
 class OracleLabeler:
     """Generate trading labels and compare label quality without ML training."""
 
@@ -864,6 +1062,7 @@ class OracleLabeler:
         label_valid = np.ones(len(df), dtype=bool)
         label_valid[-lookahead:] = False
         df["label_valid"] = label_valid
+        df = _apply_confirmation_filter(df)
         return df
 
     def compare_sma_filter_stats(

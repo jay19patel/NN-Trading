@@ -12,7 +12,8 @@ class TrainingConfig:
     # Labeling behavior
     LABELING_MODE: str = "fixed_rule"
     ENTRY_MODE: str = "next_open"
-    USE_SMA_FILTER: bool = True
+    USE_SMA_FILTER: bool = False
+    USE_TECHNICAL_CONFIRMATION_FILTER: bool = True
 
     # Oracle labeler look-ahead window (bars)
     LOOKAHEAD_BARS: int = 20
@@ -36,6 +37,13 @@ class TrainingConfig:
     MAX_ATR_TARGET_PCT: float = 5.0
     MIN_ATR_STOP_PCT: float = 0.1
     MAX_ATR_STOP_PCT: float = 3.0
+
+    # Post-label confirmation filter.
+    # Oracle labels are first generated from future trade outcome, then only
+    # labels confirmed by causal indicators on the signal candle are retained.
+    MIN_CONFIRMATION_SCORE: float = 4.0
+    MIN_CONFIRMATION_EDGE: float = 2.0
+    MIN_CONFIRMED_RETURN_PCT: float = 0.0
 
 
 @dataclass

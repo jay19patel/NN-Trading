@@ -164,7 +164,7 @@ def _print_signal_conditions_combined(ma_stats: pd.DataFrame, tech_stats: pd.Dat
     table.add_column("SELL Trades", justify="right")
     table.add_column("SELL Net", justify="right")
 
-    order = ["sma20", "sma50", "sma200", "ema9", "ema20", "ema50", "ema200"]
+    order = ["sma20", "sma50", "sma200", "ema5", "ema9", "ema20", "ema50", "ema200", "hma9", "hma21", "hma50"]
     rows: list[tuple[int, int, str]] = []
     for ma_index, ma_name in enumerate(order):
         rows.append((ma_index, 0, f"price_above_{ma_name}"))
@@ -210,6 +210,39 @@ def _print_signal_conditions_combined(ma_stats: pd.DataFrame, tech_stats: pd.Dat
     console.print(table)
 
 
+def _print_confirmation_summary(df: pd.DataFrame) -> dict:
+    reason_counts = df["label_filter_reason"].value_counts().to_dict()
+    oracle_trades = int(df["oracle_direction_label"].isin([0, 2]).sum())
+    confirmed_trades = int(df["direction_label"].isin([0, 2]).sum())
+    rejected_trades = max(oracle_trades - confirmed_trades, 0)
+
+    summary = {
+        "oracle_trades": oracle_trades,
+        "confirmed_trades": confirmed_trades,
+        "rejected_trades": rejected_trades,
+        "confirmed_pct": (confirmed_trades / oracle_trades * 100.0) if oracle_trades else 0.0,
+        "reasons": {str(k): int(v) for k, v in reason_counts.items()},
+        "avg_confirmation_score": float(df.loc[df["direction_label"].isin([0, 2]), "confirmation_score"].mean() or 0.0),
+        "avg_confirmation_edge": float(df.loc[df["direction_label"].isin([0, 2]), "confirmation_edge"].mean() or 0.0),
+    }
+
+    table = Table(
+        title="[bold cyan]Confirmation Filter[/bold cyan]",
+        box=box.ROUNDED,
+        show_lines=True,
+    )
+    table.add_column("Metric", style="bold", min_width=28)
+    table.add_column("Value", justify="right", min_width=18)
+    table.add_row("Oracle trades", str(oracle_trades))
+    table.add_row("Confirmed trades", str(confirmed_trades))
+    table.add_row("Rejected trades", str(rejected_trades))
+    table.add_row("Confirmed %", f"{summary['confirmed_pct']:.1f}%")
+    table.add_row("Avg confirmation score", f"{summary['avg_confirmation_score']:.2f}")
+    table.add_row("Avg confirmation edge", f"{summary['avg_confirmation_edge']:.2f}")
+    console.print(table)
+    return summary
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -249,6 +282,9 @@ def main() -> None:
             fixed_sl_atr_multiplier=cfg.training.FIXED_SL_ATR_MULTIPLIER,
         )
 
+    confirmation_summary = _print_confirmation_summary(df)
+    result.add("confirmation_filter", confirmation_summary)
+
     # 4. Print statistics
     label_stats = _print_symbol_stats(SYMBOL, df)
     result.add("label_stats", label_stats)
@@ -276,7 +312,7 @@ def main() -> None:
     result.add("backtest_summary", stats)
 
     with console.status("  Per-condition breakdown..."):
-        bd = condition_breakdown(trades)
+        bd = condition_breakdown(df, capital=INITIAL_CAPITAL)
 
     print_condition_breakdown(bd)
     result.add_df("condition_breakdown", bd)

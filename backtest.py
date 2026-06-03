@@ -10,17 +10,12 @@ What this does:
   - Produces:
       1. Overall equity summary
       2. Per-condition P&L breakdown ($ weighted) sorted by discrimination power
-      3. ML feature guide — which columns to use vs exclude
+      3. Direction guide — which conditions are stronger for BUY vs SELL
 
 Key insight:
   separation_score = |BUY% - SELL%| for a condition.
-  High score → condition separates BUY from SELL → useful for ML.
-  Low score  → condition fires equally on both sides → skip for ML.
-
-  CAUTION: price_above_sma20 has a perfect score of 100 but ONLY because
-  the labeling filter forces all BUY labels to have price > SMA20. It is a
-  label-definition artifact, NOT a market signal. Treat it as a hard regime
-  rule, not a learnable feature.
+  High score → condition separates BUY from SELL clearly.
+  Low score  → condition fires similarly on both sides.
 
 Usage:
     uv run python backtest.py
@@ -33,6 +28,7 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from config import cfg
 from set_label import (
     LONG,
     MA_STATUS_COLUMNS,
@@ -45,11 +41,9 @@ from set_label import (
 INITIAL_CAPITAL: float = 100.0
 CSV_PATH: str = "data/labeled_BTCUSD_15m.csv"
 
-# Conditions that are artifacts of the SMA labeling filter.
-# Their perfect discrimination score is tautological — the label rule says
-# "only LONG when price > SMA20", so price_above_sma20 is always True for
-# BUY labels. DO NOT use as a learnable feature.
-SMA_FILTER_ARTIFACTS: frozenset[str] = frozenset({"price_above_sma20"})
+# Labeling no longer uses SMA/EMA/HMA as hard direction gates, so conditions
+# are compared as normal signal-candle evidence.
+LABEL_RULE_ARTIFACTS: frozenset[str] = frozenset()
 
 console = Console()
 
@@ -137,64 +131,258 @@ def run_backtest(
     return pd.DataFrame(records), equity_curve
 
 
-# ── Per-condition breakdown ───────────────────────────────────────────────────
+# ── Per-condition strategy backtest ───────────────────────────────────────────
 
-def condition_breakdown(trades: pd.DataFrame) -> pd.DataFrame:
-    """
-    For every indicator condition, compute:
-      - How many BUY / SELL trades fired while condition was True
-      - Total dollar P&L
-      - Win rate
-      - Separation score = |BUY% - SELL%|
-        High score → condition discriminates direction → USE for ML
-        Low score  → fires equally on both sides → SKIP for ML
-    """
-    if trades.empty:
-        return pd.DataFrame()
+def _condition_atr_pct(df: pd.DataFrame) -> np.ndarray:
+    if "natr" in df.columns:
+        return df["natr"].replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).to_numpy(dtype=np.float64)
+    if "atr" in df.columns:
+        return (df["atr"] / df["Close"] * 100.0).replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).to_numpy(dtype=np.float64)
 
+    prev_close = df["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - prev_close).abs(),
+            (df["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(alpha=1.0 / cfg.training.ATR_LENGTH, adjust=False, min_periods=cfg.training.ATR_LENGTH).mean()
+    return (atr / df["Close"] * 100.0).replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0).to_numpy(dtype=np.float64)
+
+
+def _clip_pct(value: float, min_value: float, max_value: float) -> float:
+    return max(min(value, max_value), min_value)
+
+
+def _simulate_fixed_trade(
+    close_prices: np.ndarray,
+    high_prices: np.ndarray,
+    low_prices: np.ndarray,
+    row_index: int,
+    lookahead: int,
+    take_profit_pct: float,
+    stop_loss_pct: float,
+    direction_name: str,
+    entry_price: float,
+) -> tuple[str, float, int]:
+    if direction_name == "BUY":
+        tp_price = entry_price * (1.0 + take_profit_pct / 100.0)
+        sl_price = entry_price * (1.0 - stop_loss_pct / 100.0)
+    else:
+        tp_price = entry_price * (1.0 - take_profit_pct / 100.0)
+        sl_price = entry_price * (1.0 + stop_loss_pct / 100.0)
+
+    max_exit_index = min(row_index + lookahead, len(close_prices) - 1)
+    for step in range(1, lookahead + 1):
+        bar_index = row_index + step
+        if bar_index >= len(close_prices):
+            break
+        high = high_prices[bar_index]
+        low = low_prices[bar_index]
+
+        if direction_name == "BUY":
+            hit_sl = low <= sl_price
+            hit_tp = high >= tp_price
+        else:
+            hit_sl = high >= sl_price
+            hit_tp = low <= tp_price
+
+        if hit_sl:
+            return "SL", -stop_loss_pct, step
+        if hit_tp:
+            return "TP", take_profit_pct, step
+
+    exit_price = close_prices[max_exit_index]
+    if direction_name == "BUY":
+        gross_return_pct = (exit_price - entry_price) / entry_price * 100.0
+    else:
+        gross_return_pct = (entry_price - exit_price) / entry_price * 100.0
+    return "TIMEOUT", gross_return_pct, max(lookahead, 1)
+
+
+def _run_condition_side_backtest(
+    df: pd.DataFrame,
+    condition: str,
+    direction_name: str,
+    capital: float = INITIAL_CAPITAL,
+) -> dict[str, float | int | str]:
+    training = cfg.training
+    lookahead = int(training.LOOKAHEAD_BARS)
+    trade_cost_pct = cfg.testing.ROUND_TRIP_FEE_PCT + 2.0 * cfg.testing.SLIPPAGE_PCT
+    slippage_fraction = cfg.testing.SLIPPAGE_PCT / 100.0
+
+    open_prices = df["Open"].to_numpy(dtype=np.float64)
+    close_prices = df["Close"].to_numpy(dtype=np.float64)
+    high_prices = df["High"].to_numpy(dtype=np.float64)
+    low_prices = df["Low"].to_numpy(dtype=np.float64)
+    atr_pct = _condition_atr_pct(df)
+    condition_values = df[condition].fillna(False).astype(bool).to_numpy()
+    valid_values = (
+        df["label_valid"].fillna(False).astype(bool).to_numpy()
+        if "label_valid" in df.columns
+        else np.ones(len(df), dtype=bool)
+    )
+
+    equity = float(capital)
+    peak = equity
+    max_dd = 0.0
+    busy_until = -1
+    trades = 0
+    wins = 0
+    tp_hits = 0
+    sl_hits = 0
+    timeout_hits = 0
+    total_return_pct = 0.0
+    total_bars = 0
+    tp_values: list[float] = []
+    sl_values: list[float] = []
+
+    for row_index in range(len(df) - lookahead):
+        if row_index <= busy_until or not valid_values[row_index] or not condition_values[row_index]:
+            continue
+
+        current_atr = float(atr_pct[row_index])
+        if current_atr <= 0.0:
+            continue
+
+        if training.ENTRY_MODE == "next_open":
+            entry_bar_index = row_index + 1
+            if entry_bar_index >= len(df):
+                continue
+            base_entry = open_prices[entry_bar_index]
+        else:
+            base_entry = close_prices[row_index]
+
+        tp_pct = _clip_pct(
+            current_atr * float(training.FIXED_TP_ATR_MULTIPLIER),
+            float(training.MIN_ATR_TARGET_PCT),
+            float(training.MAX_ATR_TARGET_PCT),
+        )
+        sl_pct = _clip_pct(
+            current_atr * float(training.FIXED_SL_ATR_MULTIPLIER),
+            float(training.MIN_ATR_STOP_PCT),
+            float(training.MAX_ATR_STOP_PCT),
+        )
+        entry_price = base_entry * (1.0 + slippage_fraction if direction_name == "BUY" else 1.0 - slippage_fraction)
+
+        reason, gross_pct, bars = _simulate_fixed_trade(
+            close_prices=close_prices,
+            high_prices=high_prices,
+            low_prices=low_prices,
+            row_index=row_index,
+            lookahead=lookahead,
+            take_profit_pct=tp_pct,
+            stop_loss_pct=sl_pct,
+            direction_name=direction_name,
+            entry_price=entry_price,
+        )
+        net_pct = gross_pct - trade_cost_pct
+        pnl = equity * net_pct / 100.0
+        equity += pnl
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = min(max_dd, (equity / peak - 1.0) * 100.0)
+
+        trades += 1
+        wins += int(net_pct > 0.0)
+        tp_hits += int(reason == "TP")
+        sl_hits += int(reason == "SL")
+        timeout_hits += int(reason == "TIMEOUT")
+        total_return_pct += net_pct
+        total_bars += int(bars)
+        tp_values.append(tp_pct)
+        sl_values.append(sl_pct)
+        busy_until = row_index + max(int(bars), 1)
+
+    total_ret_pct = (equity / capital - 1.0) * 100.0 if capital else 0.0
+    return {
+        "trades": trades,
+        "end_capital": equity,
+        "pnl_dollar": equity - capital,
+        "total_return_pct": total_ret_pct,
+        "win_rate_pct": wins / trades * 100.0 if trades else 0.0,
+        "avg_net_return_pct": total_return_pct / trades if trades else 0.0,
+        "tp_hits": tp_hits,
+        "sl_hits": sl_hits,
+        "timeout_hits": timeout_hits,
+        "max_dd_pct": max_dd,
+        "avg_bars": total_bars / trades if trades else 0.0,
+        "avg_tp_pct": float(np.mean(tp_values)) if tp_values else 0.0,
+        "avg_sl_pct": float(np.mean(sl_values)) if sl_values else 0.0,
+    }
+
+
+def condition_breakdown(df: pd.DataFrame, capital: float = INITIAL_CAPITAL) -> pd.DataFrame:
+    """
+    For every condition, run two independent strategies:
+      - BUY whenever this condition is true
+      - SELL whenever this condition is true
+
+    This is intentionally separate from the oracle-label summary. It tests
+    whether the condition itself is useful as an entry trigger.
+    """
     all_conds = [
         c for c in list(MA_STATUS_COLUMNS) + list(TECHNICAL_CONDITION_COLUMNS)
-        if c in trades.columns
+        if c in df.columns
     ]
-    buy_df  = trades[trades["direction"] == LONG]
-    sell_df = trades[trades["direction"] == SHORT]
-    n_buy   = len(buy_df)
-    n_sell  = len(sell_df)
+    if not all_conds:
+        return pd.DataFrame()
 
     rows: list[dict] = []
     for cond in all_conds:
-        buy_sub  = buy_df[buy_df[cond] == True]
-        sell_sub = sell_df[sell_df[cond] == True]
+        buy = _run_condition_side_backtest(df, cond, "BUY", capital=capital)
+        sell = _run_condition_side_backtest(df, cond, "SELL", capital=capital)
+        buy_return = float(buy["total_return_pct"])
+        sell_return = float(sell["total_return_pct"])
+        edge = abs(buy_return - sell_return)
+        if buy_return > sell_return:
+            best_for = "BUY"
+            best_return = buy_return
+        elif sell_return > buy_return:
+            best_for = "SELL"
+            best_return = sell_return
+        else:
+            best_for = "NEUTRAL"
+            best_return = buy_return
 
-        buy_pct  = len(buy_sub)  / n_buy  * 100.0 if n_buy  else 0.0
-        sell_pct = len(sell_sub) / n_sell * 100.0 if n_sell else 0.0
-        sep      = abs(buy_pct - sell_pct)
+        coverage_pct = max(int(buy["trades"]), int(sell["trades"])) / max(len(df), 1) * 100.0
+        confidence_score = edge * min(max(int(buy["trades"]), int(sell["trades"])) / 100.0, 1.0)
 
-        for dir_val, dir_name, subset, n_dir in (
-            (LONG,  "BUY",  buy_sub,  n_buy),
-            (SHORT, "SELL", sell_sub, n_sell),
-        ):
-            n   = len(subset)
-            pnl = float(subset["pnl_dollar"].sum())              if n else 0.0
-            wr  = float((subset["pnl_dollar"] > 0).mean() * 100) if n else 0.0
-            avg = float(subset["net_return_pct"].mean())          if n else 0.0
-            pct = float(n / n_dir * 100.0)                        if n_dir else 0.0
-
-            rows.append({
-                "condition":        cond,
-                "direction":        dir_name,
-                "trades":           n,
-                "pct_of_direction": pct,
-                "pnl_dollar":       pnl,
-                "win_rate_pct":     wr,
-                "avg_return_pct":   avg,
-                "separation_score": sep,
-                "is_artifact":      cond in SMA_FILTER_ARTIFACTS,
-            })
+        rows.append({
+            "condition": cond,
+            "best_for": best_for,
+            "edge": edge,
+            "return_edge_pct": edge,
+            "confidence_score": confidence_score,
+            "coverage_pct": coverage_pct,
+            "total_trades": max(int(buy["trades"]), int(sell["trades"])),
+            "best_return_pct": best_return,
+            "buy_trades": int(buy["trades"]),
+            "buy_pnl_dollar": float(buy["pnl_dollar"]),
+            "buy_return_pct": buy_return,
+            "buy_win_rate_pct": float(buy["win_rate_pct"]),
+            "buy_tp_hits": int(buy["tp_hits"]),
+            "buy_sl_hits": int(buy["sl_hits"]),
+            "buy_timeout_hits": int(buy["timeout_hits"]),
+            "buy_max_dd_pct": float(buy["max_dd_pct"]),
+            "sell_trades": int(sell["trades"]),
+            "sell_pnl_dollar": float(sell["pnl_dollar"]),
+            "sell_return_pct": sell_return,
+            "sell_win_rate_pct": float(sell["win_rate_pct"]),
+            "sell_tp_hits": int(sell["tp_hits"]),
+            "sell_sl_hits": int(sell["sl_hits"]),
+            "sell_timeout_hits": int(sell["timeout_hits"]),
+            "sell_max_dd_pct": float(sell["max_dd_pct"]),
+            "avg_tp_pct": (float(buy["avg_tp_pct"]) + float(sell["avg_tp_pct"])) / 2.0,
+            "avg_sl_pct": (float(buy["avg_sl_pct"]) + float(sell["avg_sl_pct"])) / 2.0,
+            "is_artifact": cond in LABEL_RULE_ARTIFACTS,
+        })
 
     return (
         pd.DataFrame(rows)
-        .sort_values("separation_score", ascending=False)
+        .sort_values(["confidence_score", "edge", "total_trades"], ascending=False)
         .reset_index(drop=True)
     )
 
@@ -286,65 +474,98 @@ def _sep_color(sep: float) -> str:
     return "red"
 
 
-def _ml_note(row: "pd.Series") -> str:
+def _direction_note(row: "pd.Series") -> str:
     if bool(row["is_artifact"]):
-        return "[dim]⚠ Label filter artifact — tautological[/dim]"
-    sep = float(row["separation_score"])
-    direction = row["direction"]
+        return "[dim]Label rule artifact, ignore for direction choice[/dim]"
+    sep = float(row["edge"])
+    dominant = str(row["best_for"])
+    buy_return = float(row["buy_return_pct"])
+    sell_return = float(row["sell_return_pct"])
+    lead = f"{dominant}: BUY {buy_return:+.1f}% | SELL {sell_return:+.1f}%"
     if sep >= 60:
-        bias = "BUY" if direction == "BUY" else "SELL"
-        return f"[green]Strong {bias} discriminator → USE for ML[/green]"
+        return f"[green]Best for {lead}[/green]"
     if sep >= 30:
-        return "[yellow]Moderate signal → useful context feature[/yellow]"
-    return "[red]Weak — both directions similar → SKIP[/red]"
+        return f"[yellow]Moderate for {lead}[/yellow]"
+    return f"[red]Weak compare: BUY {buy_return:+.1f}% | SELL {sell_return:+.1f}%[/red]"
+
+
+def _best_for_cell(row: "pd.Series") -> str:
+    if bool(row["is_artifact"]):
+        return "[dim]ARTIFACT[/dim]"
+    dominant = str(row["best_for"])
+    if dominant == "BUY":
+        color = "green"
+    elif dominant == "SELL":
+        color = "red"
+    else:
+        color = "yellow"
+    return f"[{color}]{dominant}[/{color}]"
 
 
 def print_condition_breakdown(bd: pd.DataFrame) -> None:
     if bd.empty:
         return
+    training = cfg.training
+    rr = float(training.FIXED_TP_ATR_MULTIPLIER) / max(float(training.FIXED_SL_ATR_MULTIPLIER), 1e-9)
+    cost = cfg.testing.ROUND_TRIP_FEE_PCT + 2.0 * cfg.testing.SLIPPAGE_PCT
 
     t = Table(
-        title="[bold cyan]Per-Condition Performance[/bold cyan]  ($ weighted, sorted by separation score)",
+        title=(
+            "[bold cyan]Per-Condition Strategy Backtest[/bold cyan]  "
+            f"capital=${INITIAL_CAPITAL:.0f}, TP={training.FIXED_TP_ATR_MULTIPLIER:g}xATR, "
+            f"SL={training.FIXED_SL_ATR_MULTIPLIER:g}xATR, RR={rr:.2f}, "
+            f"lookahead={training.LOOKAHEAD_BARS}, cost={cost:.2f}%"
+        ),
         box=box.ROUNDED, show_lines=True,
     )
     t.add_column("Condition",   style="bold", no_wrap=True, min_width=32)
-    t.add_column("Dir",         no_wrap=True, min_width=5)
-    t.add_column("Trades",      justify="right", min_width=7)
-    t.add_column("% of Dir",    justify="right", min_width=9)
-    t.add_column("P&L ($)",     justify="right", min_width=10)
-    t.add_column("Win %",       justify="right", min_width=7)
-    t.add_column("Avg Ret %",   justify="right", min_width=9)
-    t.add_column("Sep Score",   justify="right", min_width=9)
-    t.add_column("ML Note",     min_width=42)
+    t.add_column("Best For",     justify="center", min_width=8)
+    t.add_column("Score",        justify="right", min_width=7)
+    t.add_column("Coverage",     justify="right", min_width=8)
+    t.add_column("BUY Trades",   justify="right", min_width=10)
+    t.add_column("BUY P&L",      justify="right", min_width=9)
+    t.add_column("BUY Ret",      justify="right", min_width=8)
+    t.add_column("BUY Win",      justify="right", min_width=7)
+    t.add_column("BUY TP/SL/T",   justify="right", min_width=10)
+    t.add_column("BUY DD",       justify="right", min_width=7)
+    t.add_column("SELL Trades",  justify="right", min_width=11)
+    t.add_column("SELL P&L",     justify="right", min_width=9)
+    t.add_column("SELL Ret",     justify="right", min_width=8)
+    t.add_column("SELL Win",     justify="right", min_width=8)
+    t.add_column("SELL TP/SL/T",  justify="right", min_width=11)
+    t.add_column("SELL DD",      justify="right", min_width=7)
+    t.add_column("Edge",        justify="right", min_width=7)
+    t.add_column("Compare",     min_width=28)
 
-    prev_cond: str | None = None
     for _, row in bd.iterrows():
-        cond = row["condition"]
-        if prev_cond is not None and cond != prev_cond:
-            t.add_section()
-        prev_cond = cond
+        sep = float(row["edge"])
+        sc = _sep_color(sep)
+        label = row["condition"] + (" [dim]⚠[/dim]" if row["is_artifact"] else "")
 
-        sep     = float(row["separation_score"])
-        sc      = _sep_color(sep)
-        pnl     = float(row["pnl_dollar"])
-        pnl_str = (
-            f"[green]${pnl:+.2f}[/green]"
-            if pnl >= 0 else
-            f"[red]${pnl:+.2f}[/red]"
-        )
-        dir_col = "green" if row["direction"] == "BUY" else "red"
-        label   = cond + (" [dim]⚠[/dim]" if row["is_artifact"] else "")
+        buy_pnl = float(row["buy_pnl_dollar"])
+        sell_pnl = float(row["sell_pnl_dollar"])
+        buy_pnl_str = f"[green]${buy_pnl:+.2f}[/green]" if buy_pnl >= 0 else f"[red]${buy_pnl:+.2f}[/red]"
+        sell_pnl_str = f"[green]${sell_pnl:+.2f}[/green]" if sell_pnl >= 0 else f"[red]${sell_pnl:+.2f}[/red]"
 
         t.add_row(
             label,
-            f"[{dir_col}]{row['direction']}[/{dir_col}]",
-            str(int(row["trades"])),
-            f"{row['pct_of_direction']:.1f}%",
-            pnl_str,
-            f"{row['win_rate_pct']:.1f}%",
-            f"{row['avg_return_pct']:.3f}%",
+            _best_for_cell(row),
+            f"{row['confidence_score']:.1f}",
+            f"{row['coverage_pct']:.1f}%",
+            str(int(row["buy_trades"])),
+            buy_pnl_str,
+            f"{row['buy_return_pct']:+.1f}%",
+            f"{row['buy_win_rate_pct']:.1f}%",
+            f"{int(row['buy_tp_hits'])}/{int(row['buy_sl_hits'])}/{int(row['buy_timeout_hits'])}",
+            f"{row['buy_max_dd_pct']:.1f}%",
+            str(int(row["sell_trades"])),
+            sell_pnl_str,
+            f"{row['sell_return_pct']:+.1f}%",
+            f"{row['sell_win_rate_pct']:.1f}%",
+            f"{int(row['sell_tp_hits'])}/{int(row['sell_sl_hits'])}/{int(row['sell_timeout_hits'])}",
+            f"{row['sell_max_dd_pct']:.1f}%",
             f"[{sc}]{sep:.1f}[/{sc}]",
-            _ml_note(row),
+            _direction_note(row),
         )
 
     console.print(t)
@@ -371,7 +592,7 @@ def main() -> None:
 
     # ── Per-condition breakdown ───────────────────────────────────────────────
     with console.status("Computing per-condition breakdown..."):
-        bd = condition_breakdown(trades)
+        bd = condition_breakdown(df, capital=INITIAL_CAPITAL)
 
     print_condition_breakdown(bd)
 
