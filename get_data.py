@@ -11,21 +11,13 @@ def fetch_data(symbol: str = "ADAUSD", total_days: int = 100, interval: str = "1
     os.makedirs(data_dir, exist_ok=True)
     filename = os.path.join(data_dir, f"data_{symbol}_{interval}.csv")
 
-    # Caching Logic
+    # Cache-first: if local data exists, use it. Download only when missing.
     if os.path.exists(filename):
         try:
             df_cached = pd.read_csv(filename, index_col=0, parse_dates=True)
             if not df_cached.empty:
-                last_ts = df_cached.index[-1]
-                first_ts = df_cached.index[0]
-                now = datetime.now(last_ts.tzinfo)
-                
-                start_date_needed = now - timedelta(days=total_days)
-                if first_ts <= start_date_needed and (now - last_ts).total_seconds() < 3600:
-                    print(f"✅ Using cached data for {symbol} ({len(df_cached)} bars)")
-                    return df_cached.sort_index()
-                
-                print(f"Cache for {symbol} is stale or insufficient. Updating...")
+                print(f"✅ Using cached data for {symbol} ({len(df_cached)} bars)")
+                return df_cached.sort_index()
         except Exception as e:
             print(f"Failed to load cache: {e}. Fetching fresh...")
 
@@ -73,7 +65,7 @@ def fetch_data(symbol: str = "ADAUSD", total_days: int = 100, interval: str = "1
                         df_chunk["DateTime"] = pd.to_datetime(df_chunk["time"], unit="s", utc=True)
                         df_chunk["DateTime"] = df_chunk["DateTime"].dt.tz_convert("Asia/Kolkata")
                         df_chunk.set_index("DateTime", inplace=True)
-                        all_dfs.append(df_chunk)
+                        all_dfs.append(df_chunk.drop(columns=["time"]))
                         break
                 time.sleep(1)
             except Exception as e:
