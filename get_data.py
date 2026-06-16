@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import requests
 import time
 
@@ -11,21 +11,29 @@ def fetch_data(symbol: str = "ADAUSD", total_days: int = 100, interval: str = "1
     os.makedirs(data_dir, exist_ok=True)
     filename = os.path.join(data_dir, f"data_{symbol}_{interval}.csv")
 
-    # Cache-first: if local data exists, use it. Download only when missing.
+    # ISSUE 9.1+9.2: timezone-aware now + interval-aware staleness
+    end_date = datetime.now(timezone.utc)
+    _secs    = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1D": 86400}
+    stale_after = _secs.get(interval, 900) * 4
+
     if os.path.exists(filename):
         try:
             df_cached = pd.read_csv(filename, index_col=0, parse_dates=True)
             if not df_cached.empty:
-                print(f"✅ Using cached data for {symbol} ({len(df_cached)} bars)")
-                return df_cached.sort_index()
+                last_ts = df_cached.index[-1]
+                if getattr(last_ts, "tzinfo", None) is None:
+                    last_ts = last_ts.tz_localize("UTC")
+                age_secs = (end_date - last_ts.tz_convert("UTC")).total_seconds()
+                if age_secs < stale_after:
+                    print(f"✅ Using cached data for {symbol} ({len(df_cached)} bars)")
+                    return df_cached.sort_index()
         except Exception as e:
-            print(f"Failed to load cache: {e}. Fetching fresh...")
+            print(f"Cache load failed: {e}. Fetching fresh...")
 
     print(f"Fetching fresh data from API for {symbol}...")
 
-    api_url = "https://api.india.delta.exchange/v2/history/candles"
-    headers = {'Accept': 'application/json'}
-    end_date = datetime.utcnow()
+    api_url    = "https://api.india.delta.exchange/v2/history/candles"
+    headers    = {"Accept": "application/json"}
     start_date = end_date - timedelta(days=total_days)
 
     date_ranges = pd.date_range(start=start_date, end=end_date, freq="7D")

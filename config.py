@@ -61,6 +61,12 @@ class TestingConfig:
     # One-way slippage estimate (%)
     SLIPPAGE_PCT: float = 0.05
 
+    # Signal firing thresholds (ISSUE 10.4)
+    # best-class prob must beat NEUTRAL by at least this margin
+    SIGNAL_MARGIN_THRESHOLD: float = 0.08
+    # absolute floor on best-class probability
+    AI_CONFIDENCE_THRESHOLD: float = 0.40
+
 
 @dataclass
 class MLTrainingConfig:
