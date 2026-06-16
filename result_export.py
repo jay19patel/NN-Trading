@@ -11,8 +11,8 @@ Usage:
 
     rb = ResultBuilder(symbol="BTCUSD", interval="15m", days=60)
     rb.add("label_stats", symbol_label_stats(...))
-    rb.add("backtest_summary", stats)
-    rb.add_df("condition_breakdown", bd)
+    rb.add("signal_conditions", {...})
+    rb.add_df("trades", trades)
     rb.save("result.json")
 """
 from __future__ import annotations

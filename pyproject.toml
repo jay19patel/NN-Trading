@@ -10,4 +10,5 @@ dependencies = [
     "requests>=2.28",
     "numba>=0.59",
     "rich>=13.0",
+    "torch>=2.12.0",
 ]

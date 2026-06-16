@@ -13,21 +13,17 @@ from rich import box
 from get_data import fetch_data
 from set_label import OracleLabeler, TECHNICAL_CONDITION_COLUMNS
 from config import cfg
-from backtest import (
-    run_backtest,
-    condition_breakdown,
-    equity_stats,
-    print_backtest_summary,
-    print_condition_breakdown,
-    INITIAL_CAPITAL,
-)
 from result_export import ResultBuilder
+
+# Starting capital shown in the labeling snapshot (the real backtest lives in
+# model_backtest.py and reads cfg.ml_backtest.INITIAL_CAPITAL).
+INITIAL_CAPITAL = cfg.ml_backtest.INITIAL_CAPITAL
 
 console = Console()
 
 # ── Symbol & fetch parameters ─────────────────────────────────────────────────
 SYMBOL = "BTCUSD"
-DAYS = 60
+DAYS = 365
 INTERVAL = "15m"
 
 
@@ -157,6 +153,7 @@ def _print_signal_conditions_combined(ma_stats: pd.DataFrame, tech_stats: pd.Dat
         box=box.ROUNDED,
         show_lines=True,
     )
+    table.add_column("#", style="dim", justify="right", no_wrap=True)
     table.add_column("Type", style="dim", no_wrap=True)
     table.add_column("Condition", style="bold", no_wrap=True)
     table.add_column("BUY Trades", justify="right")
@@ -183,8 +180,19 @@ def _print_signal_conditions_combined(ma_stats: pd.DataFrame, tech_stats: pd.Dat
         color = "green" if pct_value >= 50.0 else "red"
         return f"[{color}]{trades} ({pct_value:.1f}%)[/{color}]"
 
+    def keep_condition(by_key: dict, condition: str) -> bool:
+        """Keep a row only if at least one side trades >= 50% of its direction."""
+        buy_pct = metric(by_key, "BUY", condition, "trade_pct_of_direction")
+        sell_pct = metric(by_key, "SELL", condition, "trade_pct_of_direction")
+        return buy_pct >= 50.0 or sell_pct >= 50.0
+
+    serial = 0
     for _, _, condition in rows:
+        if not keep_condition(ma_by_key, condition):
+            continue
+        serial += 1
         table.add_row(
+            str(serial),
             "MA",
             condition,
             trade_cell(ma_by_key, "BUY", condition),
@@ -198,7 +206,11 @@ def _print_signal_conditions_combined(ma_stats: pd.DataFrame, tech_stats: pd.Dat
     conditions = list(TECHNICAL_CONDITION_COLUMNS)
 
     for condition in conditions:
+        if not keep_condition(tech_by_key, condition):
+            continue
+        serial += 1
         table.add_row(
+            str(serial),
             "TECH",
             condition.replace("condition_", ""),
             trade_cell(tech_by_key, "BUY", condition),
@@ -302,35 +314,10 @@ def main() -> None:
         "technical": signal_stats,
     })
 
-    # 6. Backtest — $100 starting capital, one trade at a time
-    console.rule("[bold blue]Backtest Analytics[/bold blue]")
-    with console.status("  Running backtest..."):
-        trades, equity_curve = run_backtest(df, capital=INITIAL_CAPITAL)
-
-    stats = equity_stats(trades, equity_curve)
-    print_backtest_summary(stats)
-    result.add("backtest_summary", stats)
-
-    with console.status("  Per-condition breakdown..."):
-        bd = condition_breakdown(df, capital=INITIAL_CAPITAL)
-
-    print_condition_breakdown(bd)
-    result.add_df("condition_breakdown", bd)
-
-    # 7. Save trade log alongside labeled CSV
-    if not trades.empty:
-        log_path = f"data/trade_log_{SYMBOL}_{INTERVAL}.csv"
-        trades.to_csv(log_path, index=False)
-        console.print(f"  [dim]Trade log saved → {log_path}[/dim]")
-        # JSON keeps only the core trade fields — the per-condition boolean
-        # columns are dropped here (they duplicate `condition_breakdown`).
-        trade_core_cols = [
-            "bar_index", "timestamp", "direction_name", "net_return_pct",
-            "pnl_dollar", "exit_reason", "bars_held", "equity_after",
-        ]
-        result.add_df("trades", trades[trade_core_cols])
-
-    # 8. Write the single shareable JSON snapshot of everything above.
+    # 6. Write the single shareable JSON snapshot of everything above.
+    #    ML training + backtesting are separate stages — run them next:
+    #      uv run python train_model.py      (train + save the model)
+    #      uv run python model_backtest.py   (real-world backtest)
     result_path = result.save("result.json")
     console.print(f"  [dim]Shareable JSON saved → {result_path}[/dim]")
 
