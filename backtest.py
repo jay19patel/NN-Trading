@@ -267,6 +267,13 @@ def main() -> None:
 
     device = torch.device("mps") if torch.backends.mps.is_available() else \
              torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    # Restore architecture from bundle so model always matches the saved checkpoint.
+    cfg.nn.HIDDEN_DIM = int(bundle.get("hidden_dim", cfg.nn.HIDDEN_DIM))
+    cfg.nn.NUM_LAYERS = int(bundle.get("num_layers", cfg.nn.NUM_LAYERS))
+    cfg.nn.NUM_HEADS  = int(bundle.get("num_heads",  cfg.nn.NUM_HEADS))
+    cfg.nn.DROPOUT    = float(bundle.get("dropout",  cfg.nn.DROPOUT))
+
     model  = QuantileTradingModel(input_dim=bundle["input_dim"]).to(device)
     model.load_state_dict(bundle["state_dict"])
     model.temperature.fill_(temperature)

@@ -63,9 +63,9 @@ class TestingConfig:
 
     # Signal firing thresholds
     # best-class prob must beat NEUTRAL by at least this margin
-    SIGNAL_MARGIN_THRESHOLD: float = 0.12
+    SIGNAL_MARGIN_THRESHOLD: float = 0.08
     # absolute floor on best-class probability
-    AI_CONFIDENCE_THRESHOLD: float = 0.48
+    AI_CONFIDENCE_THRESHOLD: float = 0.40
 
 
 @dataclass
