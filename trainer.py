@@ -96,13 +96,31 @@ class WindowDataset(Dataset):
 # ── Loss ──────────────────────────────────────────────────────────────────────
 
 class TwoTaskLoss(nn.Module):
-    """CE(direction) + Pinball(move_q). No class weights. Masked by label_valid."""
+    """
+    Focal-CE(direction, class-weighted) + Pinball(move_q). Masked by label_valid.
 
-    def __init__(self, label_smoothing: float = 0.05, w_dir: float = 1.0, w_move: float = 0.4):
+    Focal loss (gamma > 0) down-weights easy examples so the model focuses on
+    hard LONG / SHORT bars instead of collapsing to NEUTRAL predictions.
+    Class weights correct for the residual class imbalance in the training split.
+    """
+
+    def __init__(
+        self,
+        class_weights: torch.Tensor | None = None,
+        label_smoothing: float = 0.10,
+        w_dir: float = 1.0,
+        w_move: float = 0.3,
+        focal_gamma: float = 1.5,
+    ):
         super().__init__()
         self.label_smoothing = label_smoothing
-        self.w_dir  = w_dir
-        self.w_move = w_move
+        self.w_dir       = w_dir
+        self.w_move      = w_move
+        self.focal_gamma = focal_gamma
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights)
+        else:
+            self.class_weights = None
 
     def forward(self, pred: dict, tgt: dict) -> dict:
         device = pred["direction"].device
@@ -110,9 +128,18 @@ class TwoTaskLoss(nn.Module):
         valid  = tgt["label_valid"].float().to(device)
         n_val  = valid.sum().clamp(min=1.0)
 
-        ce = F.cross_entropy(pred["direction"], y_dir,
-                             label_smoothing=self.label_smoothing, reduction="none")
-        dir_loss  = (ce * valid).sum() / n_val
+        weights = self.class_weights.to(device) if self.class_weights is not None else None
+        ce = F.cross_entropy(
+            pred["direction"], y_dir,
+            weight=weights,
+            label_smoothing=self.label_smoothing,
+            reduction="none",
+        )
+        # Focal modulation: (1 - p_t)^gamma downweights easy examples.
+        # detach() keeps the modulating factor out of the gradient graph.
+        p_t   = torch.exp(-ce.detach())
+        focal = (1.0 - p_t) ** self.focal_gamma * ce
+        dir_loss  = (focal * valid).sum() / n_val
         move_loss = self._pinball(pred["move_q"], tgt["mfe_pct"].float().to(device), valid, n_val)
 
         total = self.w_dir * dir_loss + self.w_move * move_loss
@@ -229,10 +256,25 @@ def main() -> None:
     train_loader = _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, train_pos, cfg.nn.WINDOW_SIZE, True)
     val_loader   = _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, val_pos,   cfg.nn.WINDOW_SIZE, False)
 
+    # Class weights from training labels — inverse-frequency, normalised so mean=1.
+    train_labels = y_dir[train_pos]
+    counts       = np.bincount(train_labels, minlength=3).astype(np.float32)
+    cw_np        = len(train_labels) / (3.0 * counts)            # inv-freq
+    cw_tensor    = torch.tensor(cw_np / cw_np.mean(), dtype=torch.float32).to(device)
+    console.print(
+        f"  [dim]Class weights — LONG: {cw_tensor[0]:.3f}  "
+        f"NEUTRAL: {cw_tensor[1]:.3f}  SHORT: {cw_tensor[2]:.3f}[/dim]"
+    )
+
     model     = QuantileTradingModel(input_dim=len(features)).to(device)
-    criterion = TwoTaskLoss(label_smoothing=cfg.nn.LABEL_SMOOTHING).to(device)
-    optim     = torch.optim.AdamW(model.parameters(), lr=cfg.nn.LR, weight_decay=cfg.nn.WEIGHT_DECAY)
-    sched     = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="max", factor=0.5, patience=3)
+    criterion = TwoTaskLoss(
+        class_weights=cw_tensor,
+        label_smoothing=cfg.nn.LABEL_SMOOTHING,
+    ).to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=cfg.nn.LR, weight_decay=cfg.nn.WEIGHT_DECAY)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim, mode="max", factor=0.5, patience=6, min_lr=5e-6
+    )
 
     best_f1, best_state, patience = -1.0, None, 0
 

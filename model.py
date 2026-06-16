@@ -170,5 +170,5 @@ class QuantileTradingModel(nn.Module):
 
         opt.step(closure)
         with torch.no_grad():
-            self.temperature.copy_(T.clamp(min=0.3, max=5.0))
+            self.temperature.copy_(T.clamp(min=0.3, max=10.0))
         return float(self.temperature.item())

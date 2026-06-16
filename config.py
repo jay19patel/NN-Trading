@@ -61,11 +61,11 @@ class TestingConfig:
     # One-way slippage estimate (%)
     SLIPPAGE_PCT: float = 0.05
 
-    # Signal firing thresholds (ISSUE 10.4)
+    # Signal firing thresholds
     # best-class prob must beat NEUTRAL by at least this margin
-    SIGNAL_MARGIN_THRESHOLD: float = 0.08
+    SIGNAL_MARGIN_THRESHOLD: float = 0.12
     # absolute floor on best-class probability
-    AI_CONFIDENCE_THRESHOLD: float = 0.40
+    AI_CONFIDENCE_THRESHOLD: float = 0.48
 
 
 @dataclass
@@ -109,20 +109,20 @@ class NNConfig:
     edge the single-bar sklearn model could not capture.
     """
     # Architecture
-    HIDDEN_DIM: int = 128       # model width (must be divisible by NUM_HEADS)
-    NUM_LAYERS: int = 3         # transformer encoder depth
+    HIDDEN_DIM: int = 192       # model width (must be divisible by NUM_HEADS)
+    NUM_LAYERS: int = 4         # transformer encoder depth
     NUM_HEADS: int = 4          # attention heads
-    DROPOUT: float = 0.1
+    DROPOUT: float = 0.25
     WINDOW_SIZE: int = 96       # past candles fed to the model (96×15m = 24h)
     MAX_SEQ_LEN: int = 256      # positional-encoding capacity (>= WINDOW_SIZE)
 
     # Training
-    EPOCHS: int = 40
-    LR: float = 3e-4
-    WEIGHT_DECAY: float = 1e-4
+    EPOCHS: int = 80
+    LR: float = 2e-4
+    WEIGHT_DECAY: float = 1e-3
     BATCH_SIZE: int = 256
-    EARLY_STOP_PATIENCE: int = 8   # epochs without val macro-F1 gain → stop
-    LABEL_SMOOTHING: float = 0.05
+    EARLY_STOP_PATIENCE: int = 12  # epochs without val macro-F1 gain → stop
+    LABEL_SMOOTHING: float = 0.10
     RANDOM_STATE: int = 42
 
     # Reuses the chronological split + confidence gating from the other ML
