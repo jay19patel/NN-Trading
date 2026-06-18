@@ -122,7 +122,7 @@ class NNConfig:
     WEIGHT_DECAY: float = 2e-3
     BATCH_SIZE: int = 512
     EARLY_STOP_PATIENCE: int = 20  # epochs without val macro-F1 gain → stop
-    LABEL_SMOOTHING: float = 0.10
+    LABEL_SMOOTHING: float = 0.0
     RANDOM_STATE: int = 42
 
     # Reuses the chronological split + confidence gating from the other ML
