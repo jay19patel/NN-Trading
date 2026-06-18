@@ -117,11 +117,10 @@ class QuantileTradingModel(nn.Module):
         x    = self.input_norm(x)
         x    = self.input_dropout(x)
         x    = self.pos_encoding(x)
-        # Causal mask: each timestep attends only to itself and the past.
         causal_mask = nn.Transformer.generate_square_subsequent_mask(
             x.size(1), device=x.device
         )
-        x      = self.encoder(x, mask=causal_mask)
+        x = self.encoder(x, mask=causal_mask, is_causal=True)
         pooled = self.pool_norm(x[:, -1, :])
         trunk  = self.shared_drop(F.gelu(self.shared_norm(self.shared(pooled))))
         return pooled + trunk                        # residual

@@ -11,7 +11,7 @@ from rich.table import Table
 from rich import box
 
 from get_data import fetch_data
-from set_label import OracleLabeler, TECHNICAL_CONDITION_COLUMNS
+from set_label import OracleLabeler
 from config import cfg
 from result_export import ResultBuilder
 
@@ -23,7 +23,7 @@ console = Console()
 
 # ── Symbol & fetch parameters ─────────────────────────────────────────────────
 SYMBOL = "BTCUSD"
-DAYS = 365
+DAYS = 365*2
 INTERVAL = "15m"
 
 
@@ -147,81 +147,6 @@ def _print_symbol_stats(symbol: str, df: pd.DataFrame) -> dict:
     return s
 
 
-def _print_signal_conditions_combined(ma_stats: pd.DataFrame, tech_stats: pd.DataFrame) -> None:
-    table = Table(
-        title="[bold cyan]Signal Conditions[/bold cyan]",
-        box=box.ROUNDED,
-        show_lines=True,
-    )
-    table.add_column("#", style="dim", justify="right", no_wrap=True)
-    table.add_column("Type", style="dim", no_wrap=True)
-    table.add_column("Condition", style="bold", no_wrap=True)
-    table.add_column("BUY Trades", justify="right")
-    table.add_column("BUY Net", justify="right")
-    table.add_column("SELL Trades", justify="right")
-    table.add_column("SELL Net", justify="right")
-
-    order = ["sma20", "sma50", "sma200", "ema5", "ema9", "ema20", "ema50", "ema200", "hma9", "hma21", "hma50"]
-    rows: list[tuple[int, int, str]] = []
-    for ma_index, ma_name in enumerate(order):
-        rows.append((ma_index, 0, f"price_above_{ma_name}"))
-        rows.append((ma_index, 1, f"price_below_{ma_name}"))
-
-    ma_by_key = {(row["direction"], row["condition"]): row for _, row in ma_stats.iterrows()}
-    tech_by_key = {(row["direction"], row["condition"]): row for _, row in tech_stats.iterrows()}
-
-    def metric(by_key: dict, direction: str, condition: str, column: str) -> float:
-        row = by_key.get((direction, condition))
-        return float(row[column]) if row is not None else 0.0
-
-    def trade_cell(by_key: dict, direction: str, condition: str) -> str:
-        trades = int(metric(by_key, direction, condition, "total_trades"))
-        pct_value = metric(by_key, direction, condition, "trade_pct_of_direction")
-        color = "green" if pct_value >= 50.0 else "red"
-        return f"[{color}]{trades} ({pct_value:.1f}%)[/{color}]"
-
-    def keep_condition(by_key: dict, condition: str) -> bool:
-        """Keep a row only if at least one side trades >= 50% of its direction."""
-        buy_pct = metric(by_key, "BUY", condition, "trade_pct_of_direction")
-        sell_pct = metric(by_key, "SELL", condition, "trade_pct_of_direction")
-        return buy_pct >= 50.0 or sell_pct >= 50.0
-
-    serial = 0
-    for _, _, condition in rows:
-        if not keep_condition(ma_by_key, condition):
-            continue
-        serial += 1
-        table.add_row(
-            str(serial),
-            "MA",
-            condition,
-            trade_cell(ma_by_key, "BUY", condition),
-            f"{metric(ma_by_key, 'BUY', condition, 'net_return_pct'):.4f}",
-            trade_cell(ma_by_key, "SELL", condition),
-            f"{metric(ma_by_key, 'SELL', condition, 'net_return_pct'):.4f}",
-        )
-
-    # Show every technical condition the labeler defines (stays in sync
-    # automatically when new conditions are added in set_label.py).
-    conditions = list(TECHNICAL_CONDITION_COLUMNS)
-
-    for condition in conditions:
-        if not keep_condition(tech_by_key, condition):
-            continue
-        serial += 1
-        table.add_row(
-            str(serial),
-            "TECH",
-            condition.replace("condition_", ""),
-            trade_cell(tech_by_key, "BUY", condition),
-            f"{metric(tech_by_key, 'BUY', condition, 'net_return_pct'):.4f}",
-            trade_cell(tech_by_key, "SELL", condition),
-            f"{metric(tech_by_key, 'SELL', condition, 'net_return_pct'):.4f}",
-        )
-
-    console.print(table)
-
-
 def _print_confirmation_summary(df: pd.DataFrame) -> dict:
     reason_counts = df["label_filter_reason"].value_counts().to_dict()
     oracle_trades = int(df["oracle_direction_label"].isin([0, 2]).sum())
@@ -255,73 +180,79 @@ def _print_confirmation_summary(df: pd.DataFrame) -> dict:
     return summary
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Pipeline stages ───────────────────────────────────────────────────────────
 
-def main() -> None:
-    console.rule("[bold blue]Hudu — Oracle Labeler Pipeline[/bold blue]")
-
-    # 1. Fetch OHLC data
-    console.print(f"\n[bold]Fetching {DAYS}d of {INTERVAL} candles for {SYMBOL}[/bold]")
+def _run_data_and_labeling() -> None:
+    """Stage 1: Fetch OHLC → Oracle-label → Save CSV + stats."""
+    console.print(f"\n[bold]Fetching {DAYS}d of {INTERVAL} candles for {SYMBOL}...[/bold]")
     df = fetch_data(SYMBOL, DAYS, INTERVAL)
-
     if df.empty:
         console.print("[red]No data fetched. Exiting.[/red]")
-        return
+        raise SystemExit(1)
 
     labeler = OracleLabeler()
-
-    # Collects every console block into one shareable JSON file.
-    result = ResultBuilder(
-        symbol=SYMBOL,
-        interval=INTERVAL,
-        days=DAYS,
-        initial_capital=INITIAL_CAPITAL,
-    )
+    result  = ResultBuilder(symbol=SYMBOL, interval=INTERVAL,
+                            days=DAYS, initial_capital=INITIAL_CAPITAL)
 
     console.print(f"\n[bold cyan]► {SYMBOL}[/bold cyan]  ({len(df)} bars)")
-
-    # 2. Add indicator columns required by the labeler
     df = _add_indicators(df)
 
-    # 3. Apply Oracle labels
     with console.status(f"  Labeling {SYMBOL}..."):
         df = labeler.generate_labels(
             df,
-            labeling_mode=cfg.training.LABELING_MODE,
-            use_sma_filter=cfg.training.USE_SMA_FILTER,
-            entry_mode=cfg.training.ENTRY_MODE,
-            fixed_tp_atr_multiplier=cfg.training.FIXED_TP_ATR_MULTIPLIER,
-            fixed_sl_atr_multiplier=cfg.training.FIXED_SL_ATR_MULTIPLIER,
+            labeling_mode            = cfg.training.LABELING_MODE,
+            use_sma_filter           = cfg.training.USE_SMA_FILTER,
+            entry_mode               = cfg.training.ENTRY_MODE,
+            fixed_tp_atr_multiplier  = cfg.training.FIXED_TP_ATR_MULTIPLIER,
+            fixed_sl_atr_multiplier  = cfg.training.FIXED_SL_ATR_MULTIPLIER,
         )
 
-    confirmation_summary = _print_confirmation_summary(df)
-    result.add("confirmation_filter", confirmation_summary)
+    result.add("confirmation_filter", _print_confirmation_summary(df))
+    result.add("label_stats", _print_symbol_stats(SYMBOL, df))
 
-    # 4. Print statistics
-    label_stats = _print_symbol_stats(SYMBOL, df)
-    result.add("label_stats", label_stats)
-
-    # 5. Save labeled CSV
     out_path = f"data/labeled_{SYMBOL}_{INTERVAL}.csv"
     df.to_csv(out_path)
     console.print(f"  [dim]Saved -> {out_path}[/dim]")
 
-    ma_stats = labeler.moving_average_relationship_report(df)
+    ma_stats     = labeler.moving_average_relationship_report(df)
     signal_stats = labeler.technical_condition_report(df)
-    _print_signal_conditions_combined(ma_stats, signal_stats)
-    result.add("signal_conditions", {
-        "moving_average": ma_stats,
-        "technical": signal_stats,
-    })
+    # Signal conditions saved to JSON only — not printed to console
+    result.add("signal_conditions", {"moving_average": ma_stats, "technical": signal_stats})
 
-    # 6. Write the single shareable JSON snapshot of everything above.
-    #    ML training + backtesting are separate stages — run them next:
-    #      uv run python train_model.py      (train + save the model)
-    #      uv run python model_backtest.py   (real-world backtest)
     result_path = result.save("result.json")
     console.print(f"  [dim]Shareable JSON saved → {result_path}[/dim]")
 
-    console.rule("[bold green]Done[/bold green]")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """
+    Full pipeline:
+      Stage 1 — Fetch data & label
+      Stage 2 — Train model
+      Stage 3 — Backtest & virtual trading  ← comment out to skip
+
+    Each stage is independent. You can also run them separately:
+      uv run python app.py         # all stages
+      uv run python trainer.py     # train only
+      uv run python backtest.py    # backtest only
+    """
+    # ─── Stage 1: Data & Labeling ─────────────────────────────────────────
+    console.rule("[bold blue]Stage 1 / 3  —  Data & Labeling[/bold blue]")
+    _run_data_and_labeling()
+
+    # ─── Stage 2: Model Training ──────────────────────────────────────────
+    console.rule("[bold blue]Stage 2 / 3  —  Model Training[/bold blue]")
+    import trainer as _trainer
+    _trainer.main()
+
+    # ─── Stage 3: Backtest & Virtual Trading ──────────────────────────────
+    # To skip backtesting, comment out the next two lines:
+    console.rule("[bold blue]Stage 3 / 3  —  Backtest & Virtual Trading[/bold blue]")
+    import backtest as _backtest
+    _backtest.main()
+
+    console.rule("[bold green]Pipeline Complete[/bold green]")
 
 
 if __name__ == "__main__":

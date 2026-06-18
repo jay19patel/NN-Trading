@@ -26,7 +26,10 @@ from config import cfg
 from evaluator import evaluate_model, print_evaluation
 from horizon_labeler import HorizonLabeler, MAX_MFE_PCT
 from model import QuantileTradingModel
-from set_label import LABEL_NAMES, LONG, NEUTRAL, SHORT, get_feature_columns
+from set_label import (
+    LABEL_NAMES, LONG, NEUTRAL, SHORT, get_feature_columns,
+    _add_moving_average_status_columns,
+)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 CSV_PATH   = "data/labeled_BTCUSD_15m.csv"
@@ -159,6 +162,9 @@ def _load_and_label() -> tuple[pd.DataFrame, list[str]]:
     if not os.path.exists(CSV_PATH):
         raise FileNotFoundError(f"CSV not found: {CSV_PATH!r}. Run `uv run python app.py` first.")
     df_raw = pd.read_csv(CSV_PATH, index_col=0, parse_dates=True)
+    # Recompute MA columns so dist_*_pct features are always present,
+    # even if the CSV was generated before this feature was added.
+    df_raw = _add_moving_average_status_columns(df_raw)
 
     labeler = HorizonLabeler(
         lookahead_bars    = cfg.training.LOOKAHEAD_BARS,
@@ -201,9 +207,17 @@ def _build():
     return df, features, scaler, Xs, y_dir, y_mfe, y_valid, (train_pos, val_pos, test_pos)
 
 
-def _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, pos, window, shuffle):
+def _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, pos, window, shuffle, *, pin_memory=False):
     ds = WindowDataset(Xs_t, y_dir_t, y_mfe_t, y_valid_t, pos, window)
-    return DataLoader(ds, batch_size=cfg.nn.BATCH_SIZE, shuffle=shuffle, num_workers=0)
+    return DataLoader(
+        ds,
+        batch_size=cfg.nn.BATCH_SIZE,
+        shuffle=shuffle,
+        num_workers=4,
+        persistent_workers=True,
+        prefetch_factor=2,
+        pin_memory=pin_memory,
+    )
 
 
 @torch.no_grad()
@@ -211,7 +225,7 @@ def _predict_dir(model, loader, device):
     model.eval()
     all_probs, all_ys = [], []
     for xb, tgt in loader:
-        probs = model.calibrated_direction_probs(xb.to(device))
+        probs = model.calibrated_direction_probs(xb.to(device, non_blocking=True))
         all_probs.append(probs.cpu().numpy())
         all_ys.append(tgt["direction"].numpy())
     return np.concatenate(all_probs), np.concatenate(all_ys)
@@ -253,8 +267,9 @@ def main() -> None:
     y_mfe_t   = torch.from_numpy(y_mfe).float()
     y_valid_t = torch.from_numpy(y_valid).float()
 
-    train_loader = _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, train_pos, cfg.nn.WINDOW_SIZE, True)
-    val_loader   = _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, val_pos,   cfg.nn.WINDOW_SIZE, False)
+    pin = device.type == "cuda"
+    train_loader = _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, train_pos, cfg.nn.WINDOW_SIZE, True,  pin_memory=pin)
+    val_loader   = _loader(Xs_t, y_dir_t, y_mfe_t, y_valid_t, val_pos,   cfg.nn.WINDOW_SIZE, False, pin_memory=pin)
 
     # Class weights from training labels — inverse-frequency, normalised so mean=1.
     train_labels = y_dir[train_pos]
@@ -266,17 +281,33 @@ def main() -> None:
         f"NEUTRAL: {cw_tensor[1]:.3f}  SHORT: {cw_tensor[2]:.3f}[/dim]"
     )
 
-    model     = QuantileTradingModel(input_dim=len(features)).to(device)
+    model = QuantileTradingModel(input_dim=len(features)).to(device)
+    if hasattr(torch, "compile") and device.type == "cuda":
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            console.print("  [dim]torch.compile: enabled[/dim]")
+        except Exception:
+            console.print("  [dim]torch.compile: skipped[/dim]")
+    # Always use the underlying (uncompiled) module for state_dict / fit_temperature
+    # so checkpoint keys never get an _orig_mod. prefix from torch.compile.
+    _raw = getattr(model, "_orig_mod", model)
+
     criterion = TwoTaskLoss(
         class_weights=cw_tensor,
         label_smoothing=cfg.nn.LABEL_SMOOTHING,
+        focal_gamma=2.0,
     ).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.nn.LR, weight_decay=cfg.nn.WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optim, mode="max", factor=0.5, patience=6, min_lr=5e-6
+        optim, mode="max", factor=0.5, patience=12, min_lr=5e-6
     )
 
     best_f1, best_state, patience = -1.0, None, 0
+    # autocast: CUDA always OK; MPS only on PyTorch ≥ 2.1 (added in that release)
+    _mps_ok       = device.type == "mps" and tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (2, 1)
+    _use_autocast  = device.type == "cuda" or _mps_ok
+    _autocast_dtype = torch.bfloat16 if _use_autocast else torch.float32
+    console.print(f"  [dim]autocast: {'bfloat16' if _use_autocast else 'disabled (fp32)'}[/dim]")
 
     for epoch in range(1, cfg.nn.EPOCHS + 1):
         model.train()
@@ -284,10 +315,11 @@ def main() -> None:
         n_samples = 0
 
         for xb, tgt_b in train_loader:
-            xb    = xb.to(device)
-            tgt_b = {k: v.to(device) for k, v in tgt_b.items()}
-            optim.zero_grad()
-            losses = criterion(model(xb), tgt_b)
+            xb    = xb.to(device, non_blocking=True)
+            tgt_b = {k: v.to(device, non_blocking=True) for k, v in tgt_b.items()}
+            optim.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=_autocast_dtype, enabled=_use_autocast):
+                losses = criterion(model(xb), tgt_b)
             losses["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
@@ -312,7 +344,7 @@ def main() -> None:
 
         if macro > best_f1:
             best_f1, patience = macro, 0
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_state = {k: v.cpu().clone() for k, v in _raw.state_dict().items()}
         else:
             patience += 1
             if patience >= cfg.nn.EARLY_STOP_PATIENCE:
@@ -320,7 +352,7 @@ def main() -> None:
                 break
 
     if best_state is not None:
-        model.load_state_dict(best_state)
+        _raw.load_state_dict(best_state)
     model.to(device)
 
     # ── Temperature calibration ───────────────────────────────────────────────
@@ -328,8 +360,8 @@ def main() -> None:
     logits_list = []
     with torch.no_grad():
         for xb, _ in val_loader:
-            logits_list.append(model(xb.to(device))["direction"].cpu())
-    T = model.fit_temperature(torch.cat(logits_list).to(device), y_dir_t[val_pos].to(device))
+            logits_list.append(model(xb.to(device, non_blocking=True))["direction"].cpu())
+    T = _raw.fit_temperature(torch.cat(logits_list).to(device), y_dir_t[val_pos].to(device))
     console.print(f"  [dim]T = {T:.3f}  ({'softens' if T > 1 else 'sharpens'})[/dim]")
 
     # ── Evaluate on val + test ────────────────────────────────────────────────
@@ -339,14 +371,22 @@ def main() -> None:
         metrics = evaluate_model(
             model, X_seq, y_dir[pos], y_mfe[pos] * MAX_MFE_PCT, device, MAX_MFE_PCT
         )
-        console.print(f"\n  [bold]Evaluation — {split_name}[/bold]")
-        print_evaluation(metrics)
         with open(f"{MODEL_DIR}/eval_{split_name}.json", "w") as fh:
             json.dump(metrics, fh, indent=2)
+        if split_name == "val":
+            # Compact one-liner for validation (already used for model selection above)
+            console.print(
+                f"  [dim]Val   — dir_acc {metrics['dir_acc']*100:.1f}%  "
+                f"ECE {metrics['ece']:.4f}  "
+                f"signals {metrics['n_fired']:,}/{metrics['n_total']:,}[/dim]"
+            )
+        else:
+            console.print(f"\n  [bold]Test Evaluation[/bold]")
+            print_evaluation(metrics)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     torch.save({
-        "state_dict":     model.state_dict(),
+        "state_dict":     _raw.state_dict(),
         "features":       features,
         "classes":        list(CLASSES),
         "window":         cfg.nn.WINDOW_SIZE,

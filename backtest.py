@@ -18,8 +18,7 @@ from rich.console import Console
 from rich.table import Table
 
 from config import cfg
-from evaluator import evaluate_model, print_evaluation
-from horizon_labeler import HorizonLabeler, MAX_MFE_PCT
+from horizon_labeler import MAX_MFE_PCT
 from model import QuantileTradingModel
 from set_label import LONG, NEUTRAL, SHORT
 from trainer import CSV_PATH, MODEL_PATH, feature_matrix, split_bounds
@@ -92,12 +91,18 @@ def _summarize(trades: pd.DataFrame, equity: list[float], df_test: pd.DataFrame)
     bh   = (float(df_test["Close"].iloc[-1]) / float(df_test["Close"].iloc[0]) - 1.0) * 100.0
 
     bar_ret = pd.Series(equity).pct_change().dropna()
-    bpy     = {"1m": 1440, "5m": 288, "15m": 96, "1h": 24, "4h": 6, "1D": 1}.get("15m", 96) * 365
-    sharpe  = float(bar_ret.mean() / (bar_ret.std() + 1e-9) * (bpy ** 0.5))
+    bars_per_year = 96 * 365   # 15m bars
+    sharpe = float(bar_ret.mean() / (bar_ret.std() + 1e-9) * (bars_per_year ** 0.5))
+
+    # Annualised return (CAGR)
+    days = len(df_test) / 96.0   # trading days equivalent
+    years = days / 365.0
+    cagr = ((float(eq[-1]) / float(eq[0])) ** (1.0 / max(years, 1e-6)) - 1.0) * 100.0 if years > 0 else 0.0
 
     return {
         "start": float(eq[0]), "end": float(eq[-1]),
         "total_ret_pct": (float(eq[-1]) / eq[0] - 1.0) * 100.0,
+        "cagr_pct": cagr,
         "buy_hold_ret_pct": bh, "n_trades": n,
         "n_buy":  int((trades["direction"] == "BUY").sum())  if n else 0,
         "n_sell": int((trades["direction"] == "SELL").sum()) if n else 0,
@@ -111,36 +116,82 @@ def _summarize(trades: pd.DataFrame, equity: list[float], df_test: pd.DataFrame)
         "timeout_hits":int((trades["exit_reason"] == "TIMEOUT").sum()) if n else 0,
         "avg_bars":    float(trades["bars_held"].mean()) if n else 0.0,
         "test_bars":   len(df_test),
+        "test_days":   round(days, 1),
+        "equity_curve": eq.tolist(),
     }
 
 
 def _print_summary(s: dict) -> None:
-    t = Table(title="[bold cyan]Backtest Results[/bold cyan]", box=box.ROUNDED, show_lines=True)
-    t.add_column("Metric", style="bold", min_width=26)
-    t.add_column("Value",  justify="right", min_width=18)
+    t = Table(title="[bold cyan]Virtual Trading — $1,000 Simulation[/bold cyan]", box=box.ROUNDED, show_lines=True)
+    t.add_column("Metric", style="bold", min_width=28)
+    t.add_column("Value",  justify="right", min_width=20)
 
-    t.add_row("Test bars", str(s["test_bars"]))
-    t.add_row("Start capital", f"${s['start']:.2f}")
-    t.add_row("End equity",    f"${s['end']:.2f}")
+    t.add_row("Test period (bars)", f"{s['test_bars']:,}  ({s['test_days']:.0f} days)")
+    t.add_row("Start capital",  f"${s['start']:,.2f}")
+    t.add_row("End equity",     f"${s['end']:,.2f}")
+    pnl = s["end"] - s["start"]
+    pcol = "green" if pnl >= 0 else "red"
+    t.add_row("P&L (dollar)",   f"[{pcol}]{pnl:+,.2f}[/{pcol}]")
     col = "green" if s["total_ret_pct"] >= 0 else "red"
-    t.add_row("Strategy return",   f"[{col}]{s['total_ret_pct']:+.2f}%[/{col}]")
+    t.add_row("Total return",   f"[{col}]{s['total_ret_pct']:+.2f}%[/{col}]")
+    ccol = "green" if s["cagr_pct"] >= 0 else "red"
+    t.add_row("CAGR (annualised)", f"[{ccol}]{s['cagr_pct']:+.2f}%[/{ccol}]")
     bcol = "green" if s["buy_hold_ret_pct"] >= 0 else "red"
     t.add_row("Buy & Hold return", f"[{bcol}]{s['buy_hold_ret_pct']:+.2f}%[/{bcol}]")
     ecol = "green" if (s["total_ret_pct"] - s["buy_hold_ret_pct"]) >= 0 else "red"
-    t.add_row("Edge vs B&H", f"[{ecol}]{s['total_ret_pct']-s['buy_hold_ret_pct']:+.2f}%[/{ecol}]")
+    t.add_row("Alpha vs B&H",  f"[{ecol}]{s['total_ret_pct']-s['buy_hold_ret_pct']:+.2f}%[/{ecol}]")
     t.add_section()
-    t.add_row("Total trades", str(s["n_trades"]))
-    t.add_row("  BUY / SELL", f"{s['n_buy']} / {s['n_sell']}")
-    t.add_row("Win rate",     f"{s['win_rate_pct']:.1f}%")
+    t.add_row("Total trades",  str(s["n_trades"]))
+    t.add_row("  BUY / SELL",  f"{s['n_buy']} / {s['n_sell']}")
+    t.add_row("Win rate",      f"{s['win_rate_pct']:.1f}%")
     pf = s["profit_factor"]
-    t.add_row("Profit factor",  f"{pf:.3f}" if pf != float("inf") else "∞")
-    t.add_row("Max drawdown",   f"{s['max_dd_pct']:.2f}%")
-    t.add_row("Sharpe (bar)",   f"{s['sharpe']:.3f}")
-    t.add_row("Avg ret/trade",  f"{s['avg_ret_pct']:.3f}%")
-    t.add_row("Avg confidence", f"{s['avg_conf']:.3f}")
+    t.add_row("Profit factor", f"{pf:.3f}" if pf != float("inf") else "∞")
+    t.add_row("Max drawdown",  f"{s['max_dd_pct']:.2f}%")
+    t.add_row("Sharpe (ann.)", f"{s['sharpe']:.3f}")
+    t.add_row("Avg ret/trade", f"{s['avg_ret_pct']:.3f}%")
+    t.add_row("Avg confidence",f"{s['avg_conf']:.3f}")
     t.add_section()
     t.add_row("TP / SL / Timeout", f"{s['tp_hits']} / {s['sl_hits']} / {s['timeout_hits']}")
     t.add_row("Avg bars held",     f"{s['avg_bars']:.1f}")
+    console.print(t)
+
+
+def _print_trade_journal(trades: pd.DataFrame) -> None:
+    """Print each trade with running equity — the virtual trading journal."""
+    if trades.empty:
+        return
+    t = Table(title="[bold yellow]Trade Journal[/bold yellow]", box=box.SIMPLE_HEAD, show_lines=False)
+    t.add_column("#",        justify="right",  style="dim",   width=4)
+    t.add_column("Date",     justify="left",                  width=22)
+    t.add_column("Dir",      justify="center",                width=6)
+    t.add_column("Conf",     justify="right",                 width=6)
+    t.add_column("TP%",      justify="right",                 width=7)
+    t.add_column("SL%",      justify="right",                 width=7)
+    t.add_column("Exit",     justify="center",                width=8)
+    t.add_column("Net%",     justify="right",                 width=8)
+    t.add_column("P&L $",    justify="right",                 width=10)
+    t.add_column("Equity $", justify="right",                 width=11)
+
+    for i, row in trades.iterrows():
+        net = float(row["net_return_pct"])
+        pnl = float(row["pnl_dollar"])
+        eq  = float(row["equity_after"])
+        reason = str(row["exit_reason"])
+        direction = str(row["direction"])
+        color = "green" if net > 0 else "red"
+        exit_color = "green" if reason == "TP" else ("red" if reason == "SL" else "yellow")
+        t.add_row(
+            str(int(i) + 1),
+            str(row["timestamp"])[:19],
+            f"[cyan]{direction}[/cyan]",
+            f"{float(row['confidence']):.2f}",
+            f"{float(row['tp_pct']):.2f}",
+            f"{float(row['sl_pct']):.2f}",
+            f"[{exit_color}]{reason}[/{exit_color}]",
+            f"[{color}]{net:+.2f}%[/{color}]",
+            f"[{color}]{pnl:+.2f}[/{color}]",
+            f"${eq:,.2f}",
+        )
     console.print(t)
 
 
@@ -206,7 +257,7 @@ def _run_backtest(
 
         # ATR-based TP / SL
         tp_pct = float(np.clip(
-            natr[i] * cfg.training.FIXED_TP_ATR_MULTIPLIER * 0.80,
+            natr[i] * cfg.training.FIXED_TP_ATR_MULTIPLIER,
             cfg.training.MIN_ATR_TARGET_PCT, cfg.training.MAX_ATR_TARGET_PCT,
         ))
         sl_pct = float(np.clip(
@@ -216,13 +267,6 @@ def _run_backtest(
 
         entry_price = float(open_[entry_bar])
         q10, q50, q90 = float(move_q[i, 0]), float(move_q[i, 1]), float(move_q[i, 2])
-        sign = 1 if side == LONG else -1
-
-        console.print(
-            f"  {'LONG' if side==LONG else 'SHORT'} | conf={conf:.2f} | "
-            f"move [{sign*q10:+.2f}%, {sign*q50:+.2f}%, {sign*q90:+.2f}%] | "
-            f"TP={tp_pct:.2f}% SL={sl_pct:.2f}%"
-        )
 
         reason, gross, bars = _simulate_trade(
             high, low, close, entry_bar, entry_price, side, lookahead, tp_pct, sl_pct
@@ -245,6 +289,69 @@ def _run_backtest(
         equity.append(capital)
 
     return pd.DataFrame(records), equity
+
+
+# ── Verdict ───────────────────────────────────────────────────────────────────
+
+def _print_verdict(s: dict) -> None:
+    """Print a plain-language verdict on model + backtest quality."""
+    n = s["n_trades"]
+    ret = s["total_ret_pct"]
+    wr  = s["win_rate_pct"]
+    pf  = s["profit_factor"]
+    cagr = s["cagr_pct"]
+    bh   = s["buy_hold_ret_pct"]
+    alpha = ret - bh
+
+    # Grade each dimension
+    def _grade(val, good, ok):
+        if val >= good: return "[green]GOOD[/green]"
+        if val >= ok:   return "[yellow]OK[/yellow]"
+        return "[red]WEAK[/red]"
+
+    t = Table(title="[bold magenta]Model & Strategy Verdict[/bold magenta]", box=box.ROUNDED, show_lines=True)
+    t.add_column("Dimension",  style="bold", min_width=24)
+    t.add_column("Value",      justify="right", min_width=14)
+    t.add_column("Grade",      justify="center", min_width=8)
+    t.add_column("Comment",    min_width=32)
+
+    trade_grade = _grade(n, 20, 10)
+    t.add_row("Total trades",       str(n), trade_grade,
+              "Need 20+ for reliable stats" if n < 20 else "Sufficient sample")
+
+    wr_grade = _grade(wr, 45, 38)
+    t.add_row("Win rate",       f"{wr:.1f}%", wr_grade,
+              "Need >38% for 2:1 R:R break-even")
+
+    pf_grade = _grade(pf if pf != float("inf") else 99, 1.5, 1.0)
+    t.add_row("Profit factor", f"{pf:.3f}" if pf != float("inf") else "∞", pf_grade,
+              ">1.5 = consistent edge")
+
+    ret_grade = _grade(ret, 5.0, 0.0)
+    t.add_row("Total return",  f"{ret:+.2f}%", ret_grade,
+              f"Over {s['test_days']:.0f} days")
+
+    cagr_grade = _grade(cagr, 10.0, 0.0)
+    t.add_row("CAGR",          f"{cagr:+.2f}%", cagr_grade,
+              "Annualised return")
+
+    alpha_grade = _grade(alpha, 3.0, 0.0)
+    t.add_row("Alpha vs B&H",  f"{alpha:+.2f}%", alpha_grade,
+              "Edge over passive holding")
+
+    console.print(t)
+
+    # Plain-language summary
+    if n < 10:
+        verdict = "[yellow]INSUFFICIENT DATA[/yellow] — too few trades. Lower [bold]CONF_FLOOR[/bold] in config.py (try 0.35) to fire more signals."
+    elif pf >= 1.5 and wr >= 38 and alpha > 0:
+        verdict = "[green]POSITIVE EDGE[/green] — model shows consistent profit and beats Buy & Hold."
+    elif alpha > 0 and pf >= 1.0:
+        verdict = "[yellow]MARGINAL EDGE[/yellow] — model beats B&H but profit factor needs improvement."
+    else:
+        verdict = "[red]NO EDGE[/red] — strategy loses to Buy & Hold. Model direction accuracy too low (~30%); retrain or adjust features."
+
+    console.print(f"\n  Verdict: {verdict}\n")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -291,43 +398,31 @@ def main() -> None:
         probs, move_q = _predict(model, Xs, val_end, window, device, max_mfe_pct)
 
     trades, equity = _run_backtest(df_test, probs, move_q, lookahead)
-    _print_summary(_summarize(trades, equity, df_test))
-
-    # ── Model evaluation on test set ──────────────────────────────────────────
-    console.print("\n  [bold]Model evaluation on test set[/bold]")
-    df_raw = pd.read_csv(CSV_PATH, index_col=0, parse_dates=True)
-    labeler = HorizonLabeler(
-        lookahead_bars    = cfg.training.LOOKAHEAD_BARS,
-        tp_atr_multiplier = cfg.training.FIXED_TP_ATR_MULTIPLIER,
-        sl_atr_multiplier = cfg.training.FIXED_SL_ATR_MULTIPLIER,
-    )
-    df_aug  = labeler.generate(df_raw)
-    df_val  = df_aug[df_aug["horizon_label_valid"]]
-    _, ve2  = split_bounds(len(df_val))
-    df_te   = df_val.iloc[ve2:].copy()
-    test_positions = list(range(val_end, len(df)))
-    X_test_seq = np.stack([
-        Xs[t - window + 1 : t + 1] for t in test_positions if t >= window - 1
-    ])
-    n = min(len(X_test_seq), len(df_te))
-    metrics = evaluate_model(
-        model, X_test_seq[:n],
-        df_te["horizon_direction_label"].to_numpy()[:n],
-        df_te["mfe_pct"].to_numpy(dtype=np.float32)[:n],
-        device, max_mfe_pct,
-    )
-    print_evaluation(metrics)
+    stats = _summarize(trades, equity, df_test)
+    _print_summary(stats)
 
     if not trades.empty:
+        _print_trade_journal(trades.reset_index(drop=True))
+
+        # Save equity curve for charting
         os.makedirs("data", exist_ok=True)
+        eq_df = pd.DataFrame({
+            "timestamp": df_test.index,
+            "equity":    stats["equity_curve"][1:],  # [0] = initial capital, [1:] aligns bar-by-bar
+        })
+        eq_df.to_csv("data/equity_curve.csv", index=False)
+        console.print(f"  [dim]Equity curve → data/equity_curve.csv[/dim]")
+
+    if not trades.empty:
         trades.to_csv(TRADE_LOG_PATH, index=False)
         console.print(f"  [dim]Trade log → {TRADE_LOG_PATH}[/dim]")
     else:
         console.print(
-            f"\n  [yellow]No trades fired. Lower SIGNAL_MARGIN ({SIGNAL_MARGIN}) "
-            f"or CONF_FLOOR ({CONF_FLOOR}) in config.py.[/yellow]"
+            f"\n  [yellow]No trades fired. Lower CONF_FLOOR ({CONF_FLOOR}) "
+            f"or SIGNAL_MARGIN ({SIGNAL_MARGIN}) in config.py.[/yellow]"
         )
 
+    _print_verdict(stats)
     console.rule("[bold green]Done[/bold green]")
 
 

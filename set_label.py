@@ -165,14 +165,39 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     Excludes:
       - All future-derived label columns (LABEL_COLUMNS)
       - Raw OHLCV price columns
-    What remains are causal technical indicators computed from past/current
-    bars only — safe for supervised learning without look-ahead bias.
-
-    Usage:
-        features = df[get_feature_columns(df)]
-        labels   = df["direction_label"]
+      - Boolean price_above_* flags (replaced by continuous dist_*_pct features)
+      - Raw MA absolute values (sma20, ema5, …) — scale-dependent; dist_*_pct captures
+        the same info in a price-level-invariant form
     """
-    exclude = frozenset(LABEL_COLUMNS) | _RAW_OHLCV
+    _ma_names    = frozenset(name for name, _, _ in MA_SPECS)
+    _above_flags = frozenset(f"price_above_{name}" for name, _, _ in MA_SPECS)
+    # Old dist_ema_*/dist_hma_* are 100% correlated with dist_*_pct (same formula, ×100).
+    _dup_dists = frozenset({
+        "dist_ema_5", "dist_ema_9", "dist_ema_20", "dist_ema_50",
+        "dist_hma_9", "dist_hma_21",
+    })
+    # Slope features for slow MAs encode bull/bear regime; hurt generalisation.
+    _slope_feats = frozenset(f"slope_{name}_pct" for name, _, _ in MA_SPECS)
+    # Boolean condition flags are all 0/1 versions of existing continuous features
+    # (e.g. condition_macd_bullish = sign(macd_hist), condition_ema9_above_ema21 =
+    # sign(ema_9_21_spread)). They add noise without new information.
+    _cond_flags = frozenset(TECHNICAL_CONDITION_COLUMNS)
+    # Absolute prices / slow percentile that don't add unique information.
+    _low_value = frozenset({
+        "vwap",            # absolute price level — use price_to_vwap instead
+        "vol_percentile_100",  # very slow rolling percentile, ≈ volatility_regime_72
+        "ema21",           # absolute EMA21 price — use dist_ema_21 instead
+    })
+    exclude = (
+        frozenset(LABEL_COLUMNS)
+        | _RAW_OHLCV
+        | _ma_names
+        | _above_flags
+        | _dup_dists
+        | _slope_feats
+        | _cond_flags
+        | _low_value
+    )
     return [c for c in df.columns if c not in exclude]
 
 
@@ -243,6 +268,29 @@ def _add_moving_average_status_columns(df: pd.DataFrame) -> pd.DataFrame:
                 out[name] = _hma(close, period)
 
         out[f"price_above_{name}"] = (close > out[name]).fillna(False).astype(bool)
+
+        # Distance: positive = price above MA, negative = below.
+        # Captures direction + magnitude; scale-free.
+        out[f"dist_{name}_pct"] = (
+            (close - out[name]) / out[name].clip(lower=1e-9) * 100.0
+        ).fillna(0.0)
+
+        # Slope: is this MA itself rising or falling, and how fast?
+        # lookback = MA period / 4 so faster MAs get a tighter slope window.
+        lookback = max(1, period // 4)
+        prev_ma = out[name].shift(lookback)
+        out[f"slope_{name}_pct"] = (
+            (out[name] - prev_ma) / prev_ma.clip(lower=1e-9) * 100.0
+        ).fillna(0.0)
+
+    # SMA cross-spreads (EMA spreads already exist in _add_technical_signal_features).
+    # Positive = shorter MA above longer MA (bullish stack), negative = bearish.
+    sma20_col  = out["sma20"].clip(lower=1e-9)
+    sma50_col  = out["sma50"].clip(lower=1e-9)
+    sma200_col = out["sma200"].clip(lower=1e-9)
+    out["sma20_vs_sma50_pct"]   = ((out["sma20"]  - out["sma50"])  / sma50_col  * 100.0).fillna(0.0)
+    out["sma50_vs_sma200_pct"]  = ((out["sma50"]  - out["sma200"]) / sma200_col * 100.0).fillna(0.0)
+    out["ema50_vs_sma200_pct"]  = ((out["ema50"]  - out["sma200"]) / sma200_col * 100.0).fillna(0.0)
 
     return out
 
@@ -573,12 +621,98 @@ def _add_technical_signal_features(df: pd.DataFrame) -> pd.DataFrame:
     }
     out = pd.concat([out, pd.DataFrame(condition_data, index=out.index)], axis=1)
 
+    out = pd.concat([out, _add_market_structure_features(out)], axis=1)
+
     out = out.replace([np.inf, -np.inf], np.nan)
     bool_cols = list(MA_STATUS_COLUMNS) + list(TECHNICAL_CONDITION_COLUMNS)
     for col in bool_cols:
         if col in out.columns:
             out[col] = out[col].fillna(False).astype(bool)
     return out.ffill().fillna(0.0)
+
+
+def _add_market_structure_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Causal market structure features — Break of Structure, Higher High/Lower Low,
+    Change of Character, Fair Value Gap, and Premium/Discount zones.
+
+    All computations are strictly causal (only past + current bar data used).
+    These capture STRUCTURAL information not encoded by MAs or oscillators.
+    """
+    out = pd.DataFrame(index=df.index)
+    close = df["Close"]
+    high  = df["High"]
+    low   = df["Low"]
+
+    # ── Swing levels: rolling high/low over multiple horizons ─────────────
+    # These represent the "resistance / support" the market must break.
+    # A Break of Structure (BOS) is when close CROSSES above/below these levels.
+    for n in (5, 10, 20, 48):
+        sh = high.rolling(n, min_periods=n).max()  # recent swing high
+        sl = low.rolling(n, min_periods=n).min()   # recent swing low
+
+        # BOS event: the BAR where close first crosses the level (not continuous >/<)
+        # shift(1) = yesterday's swing level, so today's cross is fresh signal.
+        sh1 = sh.shift(1)
+        sl1 = sl.shift(1)
+        out[f"bos_bull_{n}"] = (
+            (close > sh1) & (close.shift(1) <= sh1.shift(1))
+        ).astype(float).fillna(0.0)
+        out[f"bos_bear_{n}"] = (
+            (close < sl1) & (close.shift(1) >= sl1.shift(1))
+        ).astype(float).fillna(0.0)
+
+    # ── Higher High / Higher Low / Lower High / Lower Low ─────────────────
+    # Compare current n-bar swing to the PREVIOUS n-bar swing.
+    # Bullish structure = HH + HL,  Bearish = LH + LL
+    for n in (20, 48):
+        sh = high.rolling(n, min_periods=n).max()
+        sl = low.rolling(n, min_periods=n).min()
+        sh_prev = sh.shift(n)
+        sl_prev = sl.shift(n)
+
+        hh = (sh > sh_prev).astype(float)   # Higher High
+        hl = (sl > sl_prev).astype(float)   # Higher Low
+        lh = (sh < sh_prev).astype(float)   # Lower High
+        ll = (sl < sl_prev).astype(float)   # Lower Low
+
+        out[f"struct_bullish_{n}"] = (hh * hl)   # both true = bullish structure
+        out[f"struct_bearish_{n}"] = (lh * ll)   # both true = bearish structure
+
+    # ── Change of Character (CHoCH) ───────────────────────────────────────
+    # Bullish CHoCH: a bullish BOS while market is in bearish structure → reversal signal
+    # Bearish CHoCH: a bearish BOS while market is in bullish structure → reversal signal
+    sh20 = high.rolling(20, min_periods=20).max()
+    sl20 = low.rolling(20, min_periods=20).min()
+    bear_struct = (sh20 < sh20.shift(20)).astype(float)  # LH = bearish structure
+    bull_struct = (sl20 > sl20.shift(20)).astype(float)  # HL = bullish structure
+    out["choch_bull"] = (out["bos_bull_20"] * bear_struct)
+    out["choch_bear"] = (out["bos_bear_20"] * bull_struct)
+
+    # ── Fair Value Gap (FVG) ──────────────────────────────────────────────
+    # Imbalance gaps the market tends to revisit.
+    # Bullish FVG: current low > 2-bar-ago high (price jumped up, left a gap below)
+    # Bearish FVG: current high < 2-bar-ago low (price dropped, left a gap above)
+    out["fvg_bull"]      = (low  > high.shift(2)).astype(float).fillna(0.0)
+    out["fvg_bear"]      = (high < low.shift(2)).astype(float).fillna(0.0)
+    # Gap size as % of price — larger gap = stronger imbalance
+    out["fvg_bull_size"] = ((low  - high.shift(2)).clip(lower=0.0) / close.clip(lower=1e-9) * 100.0).fillna(0.0)
+    out["fvg_bear_size"] = ((low.shift(2) - high).clip(lower=0.0) / close.clip(lower=1e-9) * 100.0).fillna(0.0)
+
+    # ── Displacement ──────────────────────────────────────────────────────
+    # A large candle that "displaces" price — often marks the start of a move.
+    candle_range = (high - low).replace(0.0, np.nan)
+    out["displacement"] = _safe_div(candle_range, candle_range.rolling(20).mean()).fillna(1.0)
+
+    # ── Premium / Discount zone ───────────────────────────────────────────
+    # Where is price in its recent range? 0 = discount (low), 1 = premium (high).
+    # Existing features cover 6-bar and 24-bar. Add longer-term context.
+    for n in (96, 192):
+        h_max = high.rolling(n, min_periods=n).max()
+        l_min = low.rolling(n, min_periods=n).min()
+        out[f"pd_zone_{n}"] = _safe_div(close - l_min, h_max - l_min).fillna(0.5)
+
+    return out.fillna(0.0)
 
 
 @numba.njit

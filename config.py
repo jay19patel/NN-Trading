@@ -61,11 +61,11 @@ class TestingConfig:
     # One-way slippage estimate (%)
     SLIPPAGE_PCT: float = 0.05
 
-    # Signal firing thresholds
-    # best-class prob must beat NEUTRAL by at least this margin
-    SIGNAL_MARGIN_THRESHOLD: float = 0.08
-    # absolute floor on best-class probability
-    AI_CONFIDENCE_THRESHOLD: float = 0.40
+    # Signal firing thresholds — only trade high-confidence setups.
+    # Model accuracy at conf≥0.40 is ~56%; at conf 0.30-0.40 it's ~30% (below random).
+    # Low thresholds generate many trades but all at random accuracy → guaranteed loss.
+    SIGNAL_MARGIN_THRESHOLD: float = 0.08   # best-class must beat NEUTRAL by this
+    AI_CONFIDENCE_THRESHOLD: float = 0.40   # absolute floor on best-class prob
 
 
 @dataclass
@@ -93,7 +93,7 @@ class MLTrainingConfig:
 @dataclass
 class MLBacktestConfig:
     """Controls the ML model backtest stage (model_backtest.py)."""
-    INITIAL_CAPITAL: float = 100.0
+    INITIAL_CAPITAL: float = 1000.0
 
     # Only trade when the winning TRADE-class probability is at least this high
     # AND beats NEUTRAL. Higher → fewer, higher-conviction trades.
@@ -109,19 +109,19 @@ class NNConfig:
     edge the single-bar sklearn model could not capture.
     """
     # Architecture
-    HIDDEN_DIM: int = 192       # model width (must be divisible by NUM_HEADS)
-    NUM_LAYERS: int = 4         # transformer encoder depth
+    HIDDEN_DIM: int = 128       # model width (must be divisible by NUM_HEADS)
+    NUM_LAYERS: int = 3         # transformer encoder depth
     NUM_HEADS: int = 4          # attention heads
-    DROPOUT: float = 0.25
+    DROPOUT: float = 0.35
     WINDOW_SIZE: int = 96       # past candles fed to the model (96×15m = 24h)
     MAX_SEQ_LEN: int = 256      # positional-encoding capacity (>= WINDOW_SIZE)
 
     # Training
     EPOCHS: int = 80
-    LR: float = 2e-4
-    WEIGHT_DECAY: float = 1e-3
-    BATCH_SIZE: int = 256
-    EARLY_STOP_PATIENCE: int = 12  # epochs without val macro-F1 gain → stop
+    LR: float = 1e-4
+    WEIGHT_DECAY: float = 2e-3
+    BATCH_SIZE: int = 512
+    EARLY_STOP_PATIENCE: int = 20  # epochs without val macro-F1 gain → stop
     LABEL_SMOOTHING: float = 0.10
     RANDOM_STATE: int = 42
 
