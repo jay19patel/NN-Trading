@@ -138,9 +138,16 @@ class TwoTaskLoss(nn.Module):
             label_smoothing=self.label_smoothing,
             reduction="none",
         )
-        # Focal modulation: (1 - p_t)^gamma downweights easy examples.
-        # detach() keeps the modulating factor out of the gradient graph.
-        p_t   = torch.exp(-ce.detach())
+        # Focal modulation: p_t must come from raw (unweighted) CE so the
+        # focal weight reflects the actual predicted probability, not the
+        # class-weight-inflated loss. Using weighted CE here causes NEUTRAL
+        # (weight≈0.31) to appear "easy" (p_t→1, focal→0) and get almost
+        # zero gradient, collapsing the model to LONG/SHORT-only predictions.
+        raw_ce = F.cross_entropy(
+            pred["direction"], y_dir,
+            reduction="none",
+        )
+        p_t   = torch.exp(-raw_ce.detach())
         focal = (1.0 - p_t) ** self.focal_gamma * ce
         dir_loss  = (focal * valid).sum() / n_val
         move_loss = self._pinball(pred["move_q"], tgt["mfe_pct"].float().to(device), valid, n_val)
@@ -295,7 +302,7 @@ def main() -> None:
     criterion = TwoTaskLoss(
         class_weights=cw_tensor,
         label_smoothing=cfg.nn.LABEL_SMOOTHING,
-        focal_gamma=2.0,
+        focal_gamma=1.0,
     ).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.nn.LR, weight_decay=cfg.nn.WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(

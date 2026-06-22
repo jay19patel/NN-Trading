@@ -26,8 +26,9 @@ from trainer import CSV_PATH, MODEL_PATH, feature_matrix, split_bounds
 console        = Console()
 TRADE_LOG_PATH = "data/trade_log.csv"
 
-SIGNAL_MARGIN = cfg.testing.SIGNAL_MARGIN_THRESHOLD
-CONF_FLOOR    = cfg.testing.AI_CONFIDENCE_THRESHOLD
+SIGNAL_MARGIN  = cfg.testing.SIGNAL_MARGIN_THRESHOLD
+CONF_FLOOR     = cfg.testing.AI_CONFIDENCE_THRESHOLD
+SPREAD_MIN     = cfg.testing.DIRECTION_SPREAD_MIN
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -251,7 +252,8 @@ def _run_backtest(
         side   = LONG if p_long >= p_short else SHORT
         margin = conf - p_neu
 
-        if margin < SIGNAL_MARGIN or conf < CONF_FLOOR:
+        long_short_spread = abs(p_long - p_short)
+        if margin < SIGNAL_MARGIN or conf < CONF_FLOOR or long_short_spread < SPREAD_MIN:
             equity.append(capital)
             continue
 
