@@ -22,10 +22,10 @@ class NNConfig:
     WINDOW_SIZE: int = 60       # past candles fed to model (60×15m = 15h context)
     MAX_SEQ_LEN: int = 256
 
-    EPOCHS: int = 50
+    EPOCHS: int = 5
     LR: float = 1e-4
     WEIGHT_DECAY: float = 2e-3
-    BATCH_SIZE: int = 512
+    BATCH_SIZE: int = 1024
     EARLY_STOP_PATIENCE: int = 30
     RANDOM_STATE: int = 42
 

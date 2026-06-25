@@ -263,7 +263,7 @@ def main() -> None:
     val_loader   = _loader(Xs_t, y_t, val_pos,   cfg.nn.WINDOW_SIZE, False, pin_memory=pin)
 
     model = ReturnPredictorModel(input_dim=len(FEATURE_NAMES)).to(device)
-    if hasattr(torch, "compile") and device.type == "cuda":
+    if hasattr(torch, "compile") and device.type in ("cuda", "mps"):
         try:
             model = torch.compile(model, mode="reduce-overhead")
         except Exception:
@@ -303,11 +303,10 @@ def main() -> None:
         val_preds, val_ys = [], []
         with torch.no_grad():
             for xb, yb in val_loader:
-                pred = model(xb.to(device, non_blocking=True)).cpu().numpy()
-                val_preds.append(pred)
-                val_ys.append(yb.numpy())
-        val_pred_np = np.concatenate(val_preds)
-        val_y_np    = np.concatenate(val_ys)
+                val_preds.append(model(xb.to(device, non_blocking=True)))
+                val_ys.append(yb)
+        val_pred_np = torch.cat(val_preds).cpu().numpy()
+        val_y_np    = torch.cat(val_ys).numpy()
         val_mae     = float(np.abs(val_pred_np - val_y_np).mean())
         sched.step(val_mae)
         lr = optim.param_groups[0]["lr"]
@@ -333,8 +332,10 @@ def main() -> None:
 
     # ── Evaluate on val + test ────────────────────────────────────────────────
     os.makedirs(MODEL_DIR, exist_ok=True)
+    W = cfg.nn.WINDOW_SIZE
     for split_name, pos in (("val", val_pos), ("test", test_pos)):
-        X_seq = np.stack([Xs[t - cfg.nn.WINDOW_SIZE + 1 : t + 1] for t in pos])
+        idx   = pos[:, None] - np.arange(W - 1, -1, -1)[None, :]   # (N, W)
+        X_seq = Xs[idx]                                              # (N, W, F) vectorized
         metrics = evaluate_model(model, X_seq, y[pos], device)
         saveable = {k: v for k, v in metrics.items() if not k.startswith("_")}
         with open(f"{MODEL_DIR}/eval_{split_name}.json", "w") as fh:
