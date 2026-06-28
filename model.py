@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Causal Transformer — max-return regression.
+Causal Transformer — volatility magnitude regression.
 
-Single output: predicted max_return for the next LOOKAHEAD_BARS candles (% signed).
-  +value = upside move expected
-  -value = downside move expected
+Single output: predicted move magnitude for the next LOOKAHEAD_BARS candles (% unsigned).
+  Always >= 0  (how much price will move, NOT which direction)
 
-Output is bounded to ±MAX_RETURN_PCT via Tanh scaling.
+Output bounded to [0, MAX_RETURN_PCT] via Sigmoid scaling.
 """
 from __future__ import annotations
 
@@ -37,10 +36,10 @@ class PositionalEncoding(nn.Module):
 
 class ReturnPredictorModel(nn.Module):
     """
-    Causal Transformer that predicts max_return for the next N candles.
+    Causal Transformer that predicts move magnitude for the next N candles.
 
     Input  : (B, T, F) — T past candle feature windows
-    Output : (B,)      — predicted max_return in %, range ±MAX_RETURN_PCT
+    Output : (B,)      — predicted magnitude in %, range [0, MAX_RETURN_PCT]
     """
 
     def __init__(self, input_dim: int) -> None:
@@ -73,14 +72,14 @@ class ReturnPredictorModel(nn.Module):
         self.shared_drop = nn.Dropout(dropout)
 
         # ── Regression head ───────────────────────────────────────────────────
-        # Tanh output → scaled to ±MAX_RETURN_PCT
+        # Sigmoid output → scaled to [0, MAX_RETURN_PCT]  (magnitude is always >= 0)
         self.return_head = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.LayerNorm(hidden // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden // 2, 1),
-            nn.Tanh(),
+            nn.Sigmoid(),
         )
 
         self._init_weights()
@@ -116,7 +115,7 @@ class ReturnPredictorModel(nn.Module):
 
         Returns
         -------
-        (B,) — predicted max_return in % (range ±MAX_RETURN_PCT)
+        (B,) — predicted magnitude in % (range [0, MAX_RETURN_PCT])
         """
         z = self._encode(window)
         return self.return_head(z).squeeze(-1) * self._max_return

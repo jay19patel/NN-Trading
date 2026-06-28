@@ -184,11 +184,15 @@ def _build():
     feats = _compute_features(df_valid)
     X     = feats[FEATURE_NAMES].to_numpy(dtype=np.float32)
 
-    # Target: max_return in %, clipped to ±MAX_RETURN_PCT
-    y = np.clip(
-        df_valid["max_return"].to_numpy(dtype=np.float32),
-        -MAX_RETURN_PCT, MAX_RETURN_PCT,
-    )
+    # Target: unsigned magnitude = max(upside, downside), always >= 0
+    upside_vals   = df_valid["upside_max_return"].to_numpy(dtype=np.float32)
+    downside_vals = df_valid["downside_max_return"].to_numpy(dtype=np.float32)
+    y = np.clip(np.maximum(upside_vals, downside_vals), 0.0, MAX_RETURN_PCT)
+
+    # Actual direction from labeled data (eval only, not used in training)
+    y_dir = np.sign(df_valid["max_return"].to_numpy(dtype=np.float32)).astype(np.float32)
+    # Simple momentum rule: sign of 6-bar ROC as baseline direction predictor
+    momentum_dir = np.sign(feats["roc_6"].to_numpy(dtype=np.float32)).astype(np.float32)
 
     train_end, val_end = split_bounds(len(df_valid))
     scaler = StandardScaler().fit(X[:train_end])
@@ -204,7 +208,7 @@ def _build():
         f"  [dim]Sequences — Train: {len(train_pos):,} | Val: {len(val_pos):,} | "
         f"Test: {len(test_pos):,} | Features: {len(FEATURE_NAMES)}[/dim]"
     )
-    return df_valid, scaler, Xs, y, (train_pos, val_pos, test_pos)
+    return df_valid, scaler, Xs, y, y_dir, momentum_dir, (train_pos, val_pos, test_pos)
 
 
 def _loader(Xs_t, y_t, pos, window, shuffle, *, pin_memory=False):
@@ -227,18 +231,18 @@ def _print_split(train_pos, val_pos, test_pos, y):
         title=f"[bold cyan]Dataset Split[/bold cyan]  (window={cfg.nn.WINDOW_SIZE}, lookahead={LOOKAHEAD_BARS})",
         box=box.ROUNDED, show_lines=True,
     )
-    t.add_column("Split",     style="bold")
-    t.add_column("Windows",   justify="right")
-    t.add_column("Mean target %", justify="right")
-    t.add_column("Upside bars",   justify="right")
-    t.add_column("Downside bars", justify="right")
+    t.add_column("Split",       style="bold")
+    t.add_column("Windows",     justify="right")
+    t.add_column("Mean vol %",  justify="right")
+    t.add_column(">0.5% bars",  justify="right")
+    t.add_column(">1.0% bars",  justify="right")
     for name, pos in (("Train", train_pos), ("Validation", val_pos), ("Test", test_pos)):
         yp = y[pos]
         t.add_row(
             name, str(len(pos)),
-            f"{yp.mean():+.3f}",
-            str(int((yp > 0).sum())),
-            str(int((yp < 0).sum())),
+            f"{yp.mean():.3f}",
+            str(int((yp > 0.5).sum())),
+            str(int((yp > 1.0).sum())),
         )
     console.print(t)
 
@@ -246,12 +250,12 @@ def _print_split(train_pos, val_pos, test_pos, y):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    console.rule("[bold blue]Max Return Predictor — Training[/bold blue]")
+    console.rule("[bold blue]Volatility Magnitude Predictor — Training[/bold blue]")
     torch.manual_seed(cfg.nn.RANDOM_STATE)
     device = _device()
     console.print(f"\n[bold]Device:[/bold] {device}")
 
-    df_valid, scaler, Xs, y, (train_pos, val_pos, test_pos) = _build()
+    df_valid, scaler, Xs, y, y_dir, momentum_dir, (train_pos, val_pos, test_pos) = _build()
 
     _print_split(train_pos, val_pos, test_pos, y)
 
@@ -265,6 +269,8 @@ def main() -> None:
     model = ReturnPredictorModel(input_dim=len(FEATURE_NAMES)).to(device)
     if hasattr(torch, "compile") and device.type in ("cuda", "mps"):
         try:
+            import logging as _log
+            _log.getLogger("torch._inductor").setLevel(_log.ERROR)
             model = torch.compile(model, mode="reduce-overhead")
         except Exception:
             pass
@@ -290,8 +296,11 @@ def main() -> None:
             yb = yb.to(device, non_blocking=True)
             optim.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=_autocast_dtype, enabled=_use_autocast):
-                pred = model(xb)
-                loss = F.huber_loss(pred, yb, delta=1.0)
+                pred        = model(xb)
+                loss_per    = F.huber_loss(pred, yb, delta=1.5, reduction="none")
+                # weight = 1 + magnitude: large moves (2%) get 3x weight vs tiny moves
+                weight      = (1.0 + yb).detach()
+                loss        = (loss_per * weight).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
@@ -336,13 +345,11 @@ def main() -> None:
     for split_name, pos in (("val", val_pos), ("test", test_pos)):
         idx   = pos[:, None] - np.arange(W - 1, -1, -1)[None, :]   # (N, W)
         X_seq = Xs[idx]                                              # (N, W, F) vectorized
-        metrics = evaluate_model(model, X_seq, y[pos], device)
+        metrics = evaluate_model(model, X_seq, y[pos], y_dir[pos], momentum_dir[pos], device)
         saveable = {k: v for k, v in metrics.items() if not k.startswith("_")}
         with open(f"{MODEL_DIR}/eval_{split_name}.json", "w") as fh:
             json.dump(saveable, fh, indent=2)
         if split_name == "test":
-            console.print(f"\n  [bold]Test Evaluation[/bold]")
-            print_data_stats(metrics["_y_true"], metrics["_y_pred"])
             print_evaluation(metrics)
             plot_predictions(metrics["_y_true"], metrics["_y_pred"])
 

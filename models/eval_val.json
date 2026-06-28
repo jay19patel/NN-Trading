@@ -1,34 +1,87 @@
 {
+  "mae": 0.6293959617614746,
+  "rmse": 0.8707168102264404,
+  "mean_actual_magnitude": 1.3605365753173828,
+  "mean_pred_magnitude": 1.427154541015625,
   "n_total": 10509,
-  "n_meaningful": 10509,
-  "n_actual_up": 5087,
-  "n_actual_down": 5422,
-  "direction_accuracy": 0.5011894566561994,
-  "mae": 1.3667724132537842,
-  "rmse": 1.7198961973190308,
-  "mean_actual_max_return": -0.095016710460186,
-  "mean_pred_max_return": -0.09187298268079758,
-  "n_correct": 5267,
-  "n_25": 664,
-  "n_50": 172,
-  "n_75": 53,
-  "n_100": 21,
-  "upside": {
-    "n": 10509,
-    "n_correct": 567,
-    "n_25": 1,
-    "n_50": 0,
-    "n_75": 0,
-    "n_100": 0,
-    "n_missed": 4520
-  },
-  "downside": {
-    "n": 10509,
-    "n_correct": 4700,
-    "n_25": 663,
-    "n_50": 172,
-    "n_75": 53,
-    "n_100": 21,
-    "n_missed": 722
+  "threshold_stats": [
+    {
+      "threshold": 0.5,
+      "n_actual": 8737,
+      "n_pred": 10493,
+      "n_tp": 8735,
+      "precision": 0.8324597350614695,
+      "recall": 0.9997710884743047,
+      "f1": 0.9084763390535621
+    },
+    {
+      "threshold": 1.0,
+      "n_actual": 5704,
+      "n_pred": 7575,
+      "n_tp": 5036,
+      "precision": 0.6648184818481848,
+      "recall": 0.8828892005610098,
+      "f1": 0.7584908502146247
+    },
+    {
+      "threshold": 1.5,
+      "n_actual": 3372,
+      "n_pred": 3843,
+      "n_tp": 2090,
+      "precision": 0.5438459536820193,
+      "recall": 0.6198102016607354,
+      "f1": 0.5793485793485793
+    },
+    {
+      "threshold": 2.0,
+      "n_actual": 2016,
+      "n_pred": 1630,
+      "n_tp": 821,
+      "precision": 0.503680981595092,
+      "recall": 0.4072420634920635,
+      "f1": 0.4503565551289084
+    }
+  ],
+  "direction_stats": {
+    "0.5": {
+      "n_hit": 8735,
+      "n_up": 4248,
+      "n_down": 4487,
+      "mom_correct": 4333,
+      "mom_correct_up": 2099,
+      "mom_correct_down": 2234,
+      "mom_wrong_up": 2149,
+      "mom_wrong_down": 2253
+    },
+    "1.0": {
+      "n_hit": 5036,
+      "n_up": 2455,
+      "n_down": 2581,
+      "mom_correct": 2519,
+      "mom_correct_up": 1217,
+      "mom_correct_down": 1302,
+      "mom_wrong_up": 1238,
+      "mom_wrong_down": 1279
+    },
+    "1.5": {
+      "n_hit": 2090,
+      "n_up": 1077,
+      "n_down": 1013,
+      "mom_correct": 1088,
+      "mom_correct_up": 537,
+      "mom_correct_down": 551,
+      "mom_wrong_up": 540,
+      "mom_wrong_down": 462
+    },
+    "2.0": {
+      "n_hit": 821,
+      "n_up": 445,
+      "n_down": 376,
+      "mom_correct": 460,
+      "mom_correct_up": 238,
+      "mom_correct_down": 222,
+      "mom_wrong_up": 207,
+      "mom_wrong_down": 154
+    }
   }
 }
