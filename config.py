@@ -46,6 +46,11 @@ class BacktestConfig:
     POSITION_FRACTION: float = 0.95     # fraction of equity deployed per trade
     MAX_HOLD_BARS: int = LOOKAHEAD_BARS # time exit after this many bars
 
+    # ── Breakout bracket mode (direction-less) ────────────────────────────────
+    BREAKOUT_MIN_MOVE: float = 1.00     # % — arm bracket only when predicted move >= this
+    BREAKOUT_ARM_FRACTION: float = 0.30 # trigger distance = predicted move × this (each side)
+    BREAKOUT_ARM_WINDOW: int = 8        # bars to wait for a trigger before cancelling
+
 
 @dataclass
 class AppConfig:
