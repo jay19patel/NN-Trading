@@ -1,87 +1,103 @@
 {
-  "mae": 0.6293959617614746,
-  "rmse": 0.8707168102264404,
-  "mean_actual_magnitude": 1.3605365753173828,
-  "mean_pred_magnitude": 1.427154541015625,
-  "n_total": 10509,
-  "threshold_stats": [
+  "direction": {
+    "n_total": 10489,
+    "accuracy": 0.49499475641147866,
+    "base_rate_up": 0.4907998855944323,
+    "n_pred_up": 2407,
+    "n_pred_up_correct": 1129,
+    "n_pred_down": 8082,
+    "n_pred_down_correct": 4063
+  },
+  "confidence": [
     {
-      "threshold": 0.5,
-      "n_actual": 8737,
-      "n_pred": 10493,
-      "n_tp": 8735,
-      "precision": 0.8324597350614695,
-      "recall": 0.9997710884743047,
-      "f1": 0.9084763390535621
+      "bucket": "0.50\u20130.55",
+      "n": 8287,
+      "pct_bars": 0.7900657832014492,
+      "accuracy": 0.48437311451671294
     },
     {
-      "threshold": 1.0,
-      "n_actual": 5704,
-      "n_pred": 7575,
-      "n_tp": 5036,
-      "precision": 0.6648184818481848,
-      "recall": 0.8828892005610098,
-      "f1": 0.7584908502146247
+      "bucket": "0.55\u20130.60",
+      "n": 2053,
+      "pct_bars": 0.1957288588044618,
+      "accuracy": 0.5377496346809547
     },
     {
-      "threshold": 1.5,
-      "n_actual": 3372,
-      "n_pred": 3843,
-      "n_tp": 2090,
-      "precision": 0.5438459536820193,
-      "recall": 0.6198102016607354,
-      "f1": 0.5793485793485793
+      "bucket": "0.60\u20130.65",
+      "n": 148,
+      "pct_bars": 0.014110020020974353,
+      "accuracy": 0.49324324324324326
     },
     {
-      "threshold": 2.0,
-      "n_actual": 2016,
-      "n_pred": 1630,
-      "n_tp": 821,
-      "precision": 0.503680981595092,
-      "recall": 0.4072420634920635,
-      "f1": 0.4503565551289084
+      "bucket": "0.65\u20131.00",
+      "n": 1,
+      "pct_bars": 9.533797311469158e-05,
+      "accuracy": 1.0
     }
   ],
-  "direction_stats": {
-    "0.5": {
-      "n_hit": 8735,
-      "n_up": 4248,
-      "n_down": 4487,
-      "mom_correct": 4333,
-      "mom_correct_up": 2099,
-      "mom_correct_down": 2234,
-      "mom_wrong_up": 2149,
-      "mom_wrong_down": 2253
+  "calibration": [
+    {
+      "bucket": "0.3\u20130.4",
+      "n": 112,
+      "mean_p_up": 0.3881790339946747,
+      "actual_up_rate": 0.5625
     },
-    "1.0": {
-      "n_hit": 5036,
-      "n_up": 2455,
-      "n_down": 2581,
-      "mom_correct": 2519,
-      "mom_correct_up": 1217,
-      "mom_correct_down": 1302,
-      "mom_wrong_up": 1238,
-      "mom_wrong_down": 1279
+    {
+      "bucket": "0.4\u20130.5",
+      "n": 7970,
+      "mean_p_up": 0.46547025442123413,
+      "actual_up_rate": 0.4963613550815558
     },
-    "1.5": {
-      "n_hit": 2090,
-      "n_up": 1077,
-      "n_down": 1013,
-      "mom_correct": 1088,
-      "mom_correct_up": 537,
-      "mom_correct_down": 551,
-      "mom_wrong_up": 540,
-      "mom_wrong_down": 462
+    {
+      "bucket": "0.5\u20130.6",
+      "n": 2370,
+      "mean_p_up": 0.5186262726783752,
+      "actual_up_rate": 0.46582278481012657
     },
-    "2.0": {
-      "n_hit": 821,
-      "n_up": 445,
-      "n_down": 376,
-      "mom_correct": 460,
-      "mom_correct_up": 238,
-      "mom_correct_down": 222,
-      "mom_wrong_up": 207,
-      "mom_wrong_down": 154
+    {
+      "bucket": "0.6\u20130.7",
+      "n": 37,
+      "mean_p_up": 0.611541211605072,
+      "actual_up_rate": 0.6756756756756757
     }
-  }
+  ],
+  "magnitude": [
+    {
+      "bucket": "0.0\u20130.5%",
+      "n": 1021,
+      "mean_predicted": 0.4457044005393982,
+      "median_achieved": 0.20065972208976746,
+      "mean_achieved": 0.2804655134677887,
+      "hit_full_pct": 0.1831537708129285,
+      "hit_80_pct": 0.2761998041136141
+    },
+    {
+      "bucket": "0.5\u20131.0%",
+      "n": 4425,
+      "mean_predicted": 0.7379475831985474,
+      "median_achieved": 0.45691248774528503,
+      "mean_achieved": 0.6787423491477966,
+      "hit_full_pct": 0.3096045197740113,
+      "hit_80_pct": 0.4088135593220339
+    },
+    {
+      "bucket": "1.0\u20131.5%",
+      "n": 3148,
+      "mean_predicted": 1.218299150466919,
+      "median_achieved": 0.781146228313446,
+      "mean_achieved": 1.0171281099319458,
+      "hit_full_pct": 0.31512071156289706,
+      "hit_80_pct": 0.41867852604828465
+    },
+    {
+      "bucket": "1.5\u2013\u221e%",
+      "n": 1895,
+      "mean_predicted": 1.9784425497055054,
+      "median_achieved": 1.0651806592941284,
+      "mean_achieved": 1.416353702545166,
+      "hit_full_pct": 0.25065963060686014,
+      "hit_80_pct": 0.3266490765171504
+    }
+  ],
+  "mae_up": 0.577843427658081,
+  "mae_down": 0.6779395937919617
 }

@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Volatility magnitude evaluation.
+Direction + magnitude evaluation.
 
-Model predicts: how much will price move in next LOOKAHEAD_BARS candles (% unsigned).
-Direction is evaluated separately using a simple momentum rule (sign of roc_6).
-
-Key metrics:
-  - MAE / RMSE on magnitude
-  - Threshold precision/recall: when model says >X%, what % actually moved >X%?
-  - Direction cross-analysis: on TP bars (model signalled big move AND it happened),
-    how well does momentum rule predict direction?
+Answers, in plain terms:
+  1. Model ne UP bola to kitni baar actually UP gaya? (direction accuracy)
+  2. Confidence jitna zyada, accuracy utni zyada hai ya nahi? (calibration)
+  3. Model ne "1% jayega" bola to actually kitna gaya? (magnitude achievement)
 """
 from __future__ import annotations
 
@@ -19,253 +15,296 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from rich import box
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+
+CONFIDENCE_BUCKETS = [(0.50, 0.55), (0.55, 0.60), (0.60, 0.65), (0.65, 1.01)]
+MAGNITUDE_BUCKETS  = [(0.0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, np.inf)]
 
 
-THRESHOLDS = [0.50, 1.00, 1.50, 2.00]
+# ── Inference ─────────────────────────────────────────────────────────────────
 
+def predict_batches(
+    model,
+    X: np.ndarray,            # (N, W, F) — already scaled
+    device: torch.device,
+    batch_size: int = 1024,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run the model over windows, return (p_up, up_mag, down_mag)."""
+    model.eval()
+    p_ups, ups, dns = [], [], []
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            batch = torch.from_numpy(X[i : i + batch_size]).float().to(device)
+            dir_logit, up_mag, dn_mag = model(batch)
+            p_ups.append(torch.sigmoid(dir_logit).cpu().numpy())
+            ups.append(up_mag.cpu().numpy())
+            dns.append(dn_mag.cpu().numpy())
+    return np.concatenate(p_ups), np.concatenate(ups), np.concatenate(dns)
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
 
 def evaluate_model(
     model,
-    X_test:       np.ndarray,   # (N, W, features) — already scaled
-    y_true:       np.ndarray,   # (N,) actual magnitude in % (always >= 0)
-    y_dir:        np.ndarray,   # (N,) actual direction: +1=UP, -1=DOWN, 0=equal
-    momentum_dir: np.ndarray,   # (N,) simple rule direction: sign(roc_6)
-    device:       torch.device,
-    batch_size:   int = 1024,
+    X_seq: np.ndarray,   # (N, W, F) — already scaled
+    y_up:  np.ndarray,   # (N,) actual max upside move %
+    y_dn:  np.ndarray,   # (N,) actual max downside move %
+    device: torch.device,
+    batch_size: int = 1024,
 ) -> dict:
-    model.eval()
-    preds: list[np.ndarray] = []
-    with torch.no_grad():
-        for i in range(0, len(X_test), batch_size):
-            batch = torch.from_numpy(X_test[i : i + batch_size]).float().to(device)
-            preds.append(model(batch).cpu().numpy())
-    y_pred = np.concatenate(preds)   # (N,) predicted magnitudes, always >= 0
+    p_up, up_pred, dn_pred = predict_batches(model, X_seq, device, batch_size)
 
-    mae  = float(np.abs(y_pred - y_true).mean())
-    rmse = float(np.sqrt(np.mean((y_pred - y_true) ** 2)))
+    actual_up  = y_up >= y_dn                 # actual dominant direction
+    pred_up    = p_up >= 0.5
+    correct    = pred_up == actual_up
+    confidence = np.maximum(p_up, 1.0 - p_up)
 
-    # ── Threshold precision / recall ──────────────────────────────────────────
-    threshold_stats = []
-    for t in THRESHOLDS:
-        actual_above = y_true >= t
-        pred_above   = y_pred >= t
-        n_actual = int(actual_above.sum())
-        n_pred   = int(pred_above.sum())
-        n_tp     = int((actual_above & pred_above).sum())
-        precision = n_tp / n_pred   if n_pred   > 0 else 0.0
-        recall    = n_tp / n_actual if n_actual > 0 else 0.0
-        f1        = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-        threshold_stats.append({
-            "threshold": t,
-            "n_actual":  n_actual,
-            "n_pred":    n_pred,
-            "n_tp":      n_tp,
-            "precision": precision,
-            "recall":    recall,
-            "f1":        f1,
+    n = len(y_up)
+
+    # ── Direction scorecard ───────────────────────────────────────────────────
+    n_pred_up   = int(pred_up.sum())
+    n_pred_down = n - n_pred_up
+    direction = {
+        "n_total":            n,
+        "accuracy":           float(correct.mean()),
+        "base_rate_up":       float(actual_up.mean()),
+        "n_pred_up":          n_pred_up,
+        "n_pred_up_correct":  int((pred_up & actual_up).sum()),
+        "n_pred_down":        n_pred_down,
+        "n_pred_down_correct": int((~pred_up & ~actual_up).sum()),
+    }
+
+    # ── Accuracy by confidence bucket ─────────────────────────────────────────
+    conf_stats = []
+    for lo, hi in CONFIDENCE_BUCKETS:
+        mask = (confidence >= lo) & (confidence < hi)
+        cnt  = int(mask.sum())
+        conf_stats.append({
+            "bucket":   f"{lo:.2f}–{min(hi, 1.0):.2f}",
+            "n":        cnt,
+            "pct_bars": cnt / n,
+            "accuracy": float(correct[mask].mean()) if cnt > 0 else None,
         })
 
-    # ── Direction cross-analysis at each threshold ────────────────────────────
-    dir_stats: dict[float, dict] = {}
-    for t in THRESHOLDS:
-        tp_mask = (y_pred >= t) & (y_true >= t)   # model signalled AND actually moved
-        n_hit   = int(tp_mask.sum())
-        if n_hit == 0:
-            dir_stats[t] = {"n_hit": 0}
+    # ── Calibration: predicted P(up) vs actual UP frequency ──────────────────
+    calib = []
+    bins  = np.linspace(0.0, 1.0, 11)
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (p_up >= lo) & (p_up < hi) if hi < 1.0 else (p_up >= lo)
+        cnt  = int(mask.sum())
+        if cnt < 20:
             continue
+        calib.append({
+            "bucket":         f"{lo:.1f}–{hi:.1f}",
+            "n":              cnt,
+            "mean_p_up":      float(p_up[mask].mean()),
+            "actual_up_rate": float(actual_up[mask].mean()),
+        })
 
-        hit_dir = y_dir[tp_mask]
-        hit_mom = momentum_dir[tp_mask]
-
-        actual_up   = hit_dir > 0
-        actual_down = hit_dir < 0
-        n_up   = int(actual_up.sum())
-        n_down = int(actual_down.sum())
-
-        mom_correct      = hit_mom == hit_dir
-        mom_correct_up   = int((actual_up   & mom_correct).sum())
-        mom_correct_down = int((actual_down & mom_correct).sum())
-        mom_wrong_up     = int((actual_up   & ~mom_correct).sum())
-        mom_wrong_down   = int((actual_down & ~mom_correct).sum())
-
-        dir_stats[t] = {
-            "n_hit":             n_hit,
-            "n_up":              n_up,
-            "n_down":            n_down,
-            "mom_correct":       int(mom_correct.sum()),
-            "mom_correct_up":    mom_correct_up,
-            "mom_correct_down":  mom_correct_down,
-            "mom_wrong_up":      mom_wrong_up,
-            "mom_wrong_down":    mom_wrong_down,
-        }
+    # ── Magnitude achievement in the PREDICTED direction ─────────────────────
+    # "Model ne X% bola tha, actual kitna mila?"
+    pred_mag     = np.where(pred_up, up_pred, dn_pred)
+    achieved_mag = np.where(pred_up, y_up, y_dn)
+    mag_stats = []
+    for lo, hi in MAGNITUDE_BUCKETS:
+        mask = (pred_mag >= lo) & (pred_mag < hi)
+        cnt  = int(mask.sum())
+        if cnt == 0:
+            mag_stats.append({"bucket": f"{lo:.1f}–{hi if np.isfinite(hi) else '+'}", "n": 0})
+            continue
+        pm, am = pred_mag[mask], achieved_mag[mask]
+        mag_stats.append({
+            "bucket":          f"{lo:.1f}–{f'{hi:.1f}' if np.isfinite(hi) else '∞'}%",
+            "n":               cnt,
+            "mean_predicted":  float(pm.mean()),
+            "median_achieved": float(np.median(am)),
+            "mean_achieved":   float(am.mean()),
+            "hit_full_pct":    float((am >= pm).mean()),          # achieved >= predicted
+            "hit_80_pct":      float((am >= 0.8 * pm).mean()),    # achieved >= 80% of predicted
+        })
 
     return {
-        "mae":                   mae,
-        "rmse":                  rmse,
-        "mean_actual_magnitude": float(y_true.mean()),
-        "mean_pred_magnitude":   float(y_pred.mean()),
-        "n_total":               len(y_true),
-        "threshold_stats":       threshold_stats,
-        "direction_stats":       {str(k): v for k, v in dir_stats.items()},
-        "_y_pred":               y_pred,
-        "_y_true":               y_true,
-        "_y_dir":                y_dir,
-        "_momentum_dir":         momentum_dir,
+        "direction":     direction,
+        "confidence":    conf_stats,
+        "calibration":   calib,
+        "magnitude":     mag_stats,
+        "mae_up":        float(np.abs(up_pred - y_up).mean()),
+        "mae_down":      float(np.abs(dn_pred - y_dn).mean()),
+        "_p_up":         p_up,
+        "_up_pred":      up_pred,
+        "_dn_pred":      dn_pred,
+        "_y_up":         y_up,
+        "_y_dn":         y_dn,
+        "_confidence":   confidence,
+        "_correct":      correct,
+        "_pred_mag":     pred_mag,
+        "_achieved_mag": achieved_mag,
+        "_pred_up":      pred_up,
+        "_actual_up":    actual_up,
     }
 
 
-def print_data_stats(y_true: np.ndarray, y_pred: np.ndarray) -> None:
-    pass  # merged into print_evaluation
+# ── Console report ────────────────────────────────────────────────────────────
+
+def _pct(x) -> str:
+    return f"{x*100:.1f}%" if x is not None else "—"
 
 
-def print_evaluation(metrics: dict) -> None:
-    n    = metrics["n_total"]
-    y_t  = metrics["_y_true"]
-    y_p  = metrics["_y_pred"]
-    sep  = "─" * 64
-    h    = "═" * 64
+def print_evaluation(metrics: dict, title: str = "EVALUATION") -> None:
+    d = metrics["direction"]
 
-    def _p(num, den):
-        return f"{num/den*100:.1f}%" if den > 0 else "  N/A"
+    console.rule(f"[bold cyan]{title}  ({d['n_total']:,} bars)[/bold cyan]")
 
-    print(f"\n{h}")
-    print(f"  VOLATILITY PREDICTOR — TEST RESULTS  ({n:,} bars)")
-    print(h)
+    # ── 1. Direction scorecard ────────────────────────────────────────────────
+    t = Table(title="[bold]1) DIRECTION — model ne bola vs actual kya hua[/bold]",
+              box=box.ROUNDED)
+    t.add_column("Model ne bola", style="bold")
+    t.add_column("Kitni baar bola", justify="right")
+    t.add_column("Kitni baar sahi", justify="right")
+    t.add_column("Accuracy", justify="right", style="bold")
+    t.add_row("UP ⬆",
+              f"{d['n_pred_up']:,}",
+              f"{d['n_pred_up_correct']:,}",
+              _pct(d['n_pred_up_correct'] / d['n_pred_up']) if d['n_pred_up'] else "—")
+    t.add_row("DOWN ⬇",
+              f"{d['n_pred_down']:,}",
+              f"{d['n_pred_down_correct']:,}",
+              _pct(d['n_pred_down_correct'] / d['n_pred_down']) if d['n_pred_down'] else "—")
+    t.add_row("[bold]OVERALL[/bold]", f"{d['n_total']:,}",
+              f"{d['n_pred_up_correct'] + d['n_pred_down_correct']:,}",
+              f"[bold]{_pct(d['accuracy'])}[/bold]")
+    console.print(t)
+    console.print(
+        f"  [dim]Base rate (hamesha UP bolne wala dummy): {_pct(max(d['base_rate_up'], 1-d['base_rate_up']))} "
+        f"— model isse upar hai to hi useful hai.[/dim]\n"
+    )
 
-    # ── Data snapshot ─────────────────────────────────────────────────────────
-    print(f"\n  DATA SNAPSHOT")
-    print(f"  {'Actual':12}  avg {y_t.mean():.3f}%   median {np.median(y_t):.3f}%   max {y_t.max():.2f}%")
-    print(f"  {'Predicted':12}  avg {y_p.mean():.3f}%   median {np.median(y_p):.3f}%   max {y_p.max():.2f}%")
+    # ── 2. Confidence buckets ────────────────────────────────────────────────
+    t = Table(title="[bold]2) CONFIDENCE — jitna sure, utna sahi?[/bold]", box=box.ROUNDED)
+    t.add_column("Confidence", style="bold")
+    t.add_column("Bars", justify="right")
+    t.add_column("% of all", justify="right")
+    t.add_column("Direction accuracy", justify="right", style="bold")
+    for s in metrics["confidence"]:
+        t.add_row(s["bucket"], f"{s['n']:,}", _pct(s["pct_bars"]), _pct(s["accuracy"]))
+    console.print(t)
+    console.print("  [dim]High-confidence bucket me accuracy zyada honi chahiye — tabhi confidence trustable hai.[/dim]\n")
 
-    # ── Regression error ──────────────────────────────────────────────────────
-    print(f"\n  ACCURACY")
-    print(f"  MAE  {metrics['mae']:.4f}%    RMSE  {metrics['rmse']:.4f}%")
+    # ── 3. Calibration ────────────────────────────────────────────────────────
+    t = Table(title="[bold]3) CALIBRATION — P(up) bola vs actually UP hua[/bold]", box=box.ROUNDED)
+    t.add_column("P(up) range", style="bold")
+    t.add_column("Bars", justify="right")
+    t.add_column("Avg P(up) predicted", justify="right")
+    t.add_column("Actually UP gaya", justify="right", style="bold")
+    for s in metrics["calibration"]:
+        t.add_row(s["bucket"], f"{s['n']:,}", _pct(s["mean_p_up"]), _pct(s["actual_up_rate"]))
+    console.print(t)
+    console.print("  [dim]Dono columns match karein = perfectly calibrated. (60% bola to 60% baar UP jana chahiye)[/dim]\n")
 
-    # ── Signal quality table ──────────────────────────────────────────────────
-    print(f"\n  SIGNAL QUALITY  (how often model correctly flags big moves)")
-    print(f"  Move >  │  Actual │ Flagged │ Precision │  Recall │    F1")
-    print(f"  {sep}")
-    for s in metrics["threshold_stats"]:
-        t = s["threshold"]
-        print(
-            f"  {t:5.2f}%  │ {s['n_actual']:>7,} │ {s['n_pred']:>7,} │ "
-            f"  {s['precision']*100:>5.1f}%   │  {s['recall']*100:>5.1f}% │ {s['f1']*100:>5.1f}%"
-        )
-
-    # ── Direction table ────────────────────────────────────────────────────────
-    print(f"\n  DIRECTION  (on confirmed big-move bars, momentum rule = sign of 6-bar ROC)")
-    print(f"  Threshold │  TP bars │    UP  │  DOWN  │ Mom accuracy")
-    print(f"  {sep}")
-    for t in THRESHOLDS:
-        ds    = metrics["direction_stats"].get(str(t), {})
-        n_hit = ds.get("n_hit", 0)
-        if n_hit == 0:
-            print(f"  >{t:.2f}%   │        — │     —  │    —   │     —")
+    # ── 4. Magnitude achievement ──────────────────────────────────────────────
+    t = Table(title="[bold]4) MAGNITUDE — kitna % move bola vs kitna mila (predicted direction me)[/bold]",
+              box=box.ROUNDED)
+    t.add_column("Predicted move", style="bold")
+    t.add_column("Bars", justify="right")
+    t.add_column("Avg predicted", justify="right")
+    t.add_column("Median achieved", justify="right")
+    t.add_column("Full target hit", justify="right")
+    t.add_column("80% target hit", justify="right", style="bold")
+    for s in metrics["magnitude"]:
+        if s["n"] == 0:
+            t.add_row(s["bucket"], "0", "—", "—", "—", "—")
             continue
-        n_up   = ds["n_up"]
-        n_down = ds["n_down"]
-        m_corr = ds["mom_correct"]
-        print(
-            f"  >{t:.2f}%   │  {n_hit:>6,} │ "
-            f"{_p(n_up, n_hit):>5}  │ {_p(n_down, n_hit):>5}  │  {_p(m_corr, n_hit):>5}"
+        t.add_row(
+            s["bucket"], f"{s['n']:,}",
+            f"{s['mean_predicted']:.2f}%",
+            f"{s['median_achieved']:.2f}%",
+            _pct(s["hit_full_pct"]),
+            _pct(s["hit_80_pct"]),
         )
+    console.print(t)
+    console.print(
+        f"  [dim]Magnitude MAE — upside: {metrics['mae_up']:.3f}%  |  downside: {metrics['mae_down']:.3f}%[/dim]\n"
+    )
 
-    print(f"\n{h}\n")
 
+# ── Plot ──────────────────────────────────────────────────────────────────────
 
-def plot_predictions(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    save_path: str = "models/prediction_analysis.png",
-) -> None:
+def plot_predictions(metrics: dict, save_path: str = "models/prediction_analysis.png") -> None:
     """
     4-panel figure:
-      1. Scatter: actual magnitude vs predicted magnitude
-      2. Distribution: histogram of actual vs predicted magnitudes
-      3. Time series: actual and predicted magnitudes (first 800 bars)
-      4. Precision curve: precision at each threshold
+      1. Calibration curve (predicted P(up) vs actual UP rate)
+      2. Direction accuracy by confidence bucket
+      3. Scatter: predicted vs achieved magnitude (predicted direction)
+      4. Distribution of achieved move: correct vs wrong direction calls
     """
-    fig = plt.figure(figsize=(18, 14), facecolor="#0e1117")
-    fig.suptitle("Volatility Magnitude — Actual vs Predicted", fontsize=16, color="white", fontweight="bold", y=0.98)
+    DARK, PANEL = "#0e1117", "#1a1f2e"
+    GREEN, RED, BLUE, ORANGE, GRAY = "#00d26a", "#ff4757", "#3d84ff", "#ffa502", "#8a8f9e"
 
+    fig = plt.figure(figsize=(18, 14), facecolor=DARK)
+    fig.suptitle("Direction + Magnitude — Model Quality", fontsize=16, color="white",
+                 fontweight="bold", y=0.98)
     gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.32)
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax3 = fig.add_subplot(gs[1, 0])
-    ax4 = fig.add_subplot(gs[1, 1])
+    axes = [fig.add_subplot(gs[i, j]) for i in range(2) for j in range(2)]
+    ax1, ax2, ax3, ax4 = axes
 
-    DARK   = "#0e1117"
-    PANEL  = "#1a1f2e"
-    GREEN  = "#00d26a"
-    RED    = "#ff4757"
-    BLUE   = "#3d84ff"
-    ORANGE = "#ffa502"
-    GRAY   = "#8a8f9e"
-
-    for ax in [ax1, ax2, ax3, ax4]:
+    for ax in axes:
         ax.set_facecolor(PANEL)
         ax.tick_params(colors=GRAY, labelsize=9)
         for spine in ax.spines.values():
             spine.set_edgecolor("#2a2f3e")
 
-    # ── Panel 1: Scatter ──────────────────────────────────────────────────────
-    err     = np.abs(y_pred - y_true)
-    err_pct = np.percentile(err, 60)
-    close   = err <= err_pct
-    ax1.scatter(y_true[close],  y_pred[close],  c=GREEN, alpha=0.35, s=5, label="Close pred")
-    ax1.scatter(y_true[~close], y_pred[~close], c=RED,   alpha=0.20, s=5, label="Off pred")
-    lim = max(y_true.max(), y_pred.max()) * 1.05
-    ax1.plot([0, lim], [0, lim], color=ORANGE, linewidth=0.8, linestyle=":", label="Perfect fit")
-    ax1.set_xlim(0, lim)
-    ax1.set_ylim(0, lim)
-    ax1.set_xlabel("Actual Magnitude %", color=GRAY, fontsize=10)
-    ax1.set_ylabel("Predicted Magnitude %", color=GRAY, fontsize=10)
-    ax1.set_title("Scatter: Actual vs Predicted Magnitude", color="white", fontsize=11, pad=8)
+    # ── Panel 1: Calibration ──────────────────────────────────────────────────
+    calib = metrics["calibration"]
+    if calib:
+        xs = [c["mean_p_up"] for c in calib]
+        ys = [c["actual_up_rate"] for c in calib]
+        ax1.plot([0, 1], [0, 1], color=GRAY, linestyle=":", linewidth=1, label="Perfect")
+        ax1.plot(xs, ys, color=GREEN, marker="o", linewidth=1.5, label="Model")
+    ax1.set_xlabel("Predicted P(up)", color=GRAY, fontsize=10)
+    ax1.set_ylabel("Actual UP rate", color=GRAY, fontsize=10)
+    ax1.set_title("Calibration", color="white", fontsize=11, pad=8)
     ax1.legend(fontsize=8, facecolor="#2a2f3e", edgecolor="none", labelcolor="white")
 
-    # ── Panel 2: Histogram ────────────────────────────────────────────────────
-    bins = np.linspace(0, max(y_true.max(), y_pred.max()), 60)
-    ax2.hist(y_true, bins=bins, color=BLUE,   alpha=0.6, label="Actual",    density=True)
-    ax2.hist(y_pred, bins=bins, color=ORANGE, alpha=0.6, label="Predicted", density=True)
-    ax2.set_xlabel("Magnitude %", color=GRAY, fontsize=10)
-    ax2.set_ylabel("Density",     color=GRAY, fontsize=10)
-    ax2.set_title("Distribution: Actual vs Predicted", color="white", fontsize=11, pad=8)
+    # ── Panel 2: Accuracy by confidence ───────────────────────────────────────
+    conf   = [c for c in metrics["confidence"] if c["accuracy"] is not None]
+    labels = [c["bucket"] for c in conf]
+    accs   = [c["accuracy"] * 100 for c in conf]
+    bars   = ax2.bar(labels, accs, color=BLUE, alpha=0.85)
+    for b, a in zip(bars, accs):
+        ax2.text(b.get_x() + b.get_width() / 2, a + 0.5, f"{a:.1f}%",
+                 ha="center", color="white", fontsize=9)
+    ax2.axhline(50, color=RED, linewidth=0.8, linestyle="--", label="Coin flip (50%)")
+    ax2.set_ylabel("Direction accuracy %", color=GRAY, fontsize=10)
+    ax2.set_xlabel("Confidence bucket", color=GRAY, fontsize=10)
+    ax2.set_title("Accuracy vs Confidence", color="white", fontsize=11, pad=8)
     ax2.legend(fontsize=8, facecolor="#2a2f3e", edgecolor="none", labelcolor="white")
 
-    # ── Panel 3: Time series ──────────────────────────────────────────────────
-    n_show = min(800, len(y_true))
-    idx    = np.arange(n_show)
-    ax3.plot(idx, y_true[:n_show], color=BLUE,   linewidth=0.8, alpha=0.85, label="Actual")
-    ax3.plot(idx, y_pred[:n_show], color=ORANGE, linewidth=0.8, alpha=0.85, label="Predicted")
-    ax3.fill_between(idx, y_true[:n_show], 0, alpha=0.12, color=BLUE)
-    ax3.set_xlabel("Bar Index",  color=GRAY, fontsize=10)
-    ax3.set_ylabel("Magnitude %", color=GRAY, fontsize=10)
-    ax3.set_title(f"Time Series (first {n_show} bars)", color="white", fontsize=11, pad=8)
+    # ── Panel 3: Predicted vs achieved magnitude ─────────────────────────────
+    pm, am, ok = metrics["_pred_mag"], metrics["_achieved_mag"], metrics["_correct"]
+    ax3.scatter(pm[ok],  am[ok],  c=GREEN, alpha=0.30, s=5, label="Direction correct")
+    ax3.scatter(pm[~ok], am[~ok], c=RED,   alpha=0.20, s=5, label="Direction wrong")
+    lim = max(pm.max(), np.percentile(am, 99)) * 1.05
+    ax3.plot([0, lim], [0, lim], color=ORANGE, linewidth=0.8, linestyle=":", label="Achieved = Predicted")
+    ax3.set_xlim(0, lim)
+    ax3.set_ylim(0, lim)
+    ax3.set_xlabel("Predicted move %", color=GRAY, fontsize=10)
+    ax3.set_ylabel("Achieved move % (predicted direction)", color=GRAY, fontsize=10)
+    ax3.set_title("Magnitude: Predicted vs Achieved", color="white", fontsize=11, pad=8)
     ax3.legend(fontsize=8, facecolor="#2a2f3e", edgecolor="none", labelcolor="white")
 
-    # ── Panel 4: Precision curve ──────────────────────────────────────────────
-    thresholds = np.linspace(0.1, min(y_true.max(), 5.0), 50)
-    precisions, recalls = [], []
-    for t in thresholds:
-        actual_above = y_true >= t
-        pred_above   = y_pred >= t
-        n_pred = pred_above.sum()
-        n_act  = actual_above.sum()
-        tp     = (actual_above & pred_above).sum()
-        precisions.append(tp / n_pred   if n_pred > 0 else 0.0)
-        recalls.append(   tp / n_act    if n_act  > 0 else 0.0)
-
-    ax4.plot(thresholds, precisions, color=GREEN,  linewidth=1.5, label="Precision")
-    ax4.plot(thresholds, recalls,    color=ORANGE, linewidth=1.5, label="Recall")
-    ax4.axhline(0.5, color=GRAY, linewidth=0.6, linestyle="--", alpha=0.5)
-    for t in THRESHOLDS:
-        ax4.axvline(t, color=RED, linewidth=0.5, linestyle=":", alpha=0.5)
-    ax4.set_xlabel("Threshold %", color=GRAY, fontsize=10)
-    ax4.set_ylabel("Score",       color=GRAY, fontsize=10)
-    ax4.set_title("Precision & Recall vs Threshold", color="white", fontsize=11, pad=8)
-    ax4.set_ylim(0, 1.05)
+    # ── Panel 4: Achieved move distribution ──────────────────────────────────
+    bins = np.linspace(0, np.percentile(am, 99), 50)
+    ax4.hist(am[ok],  bins=bins, color=GREEN, alpha=0.6, label="Correct calls",  density=True)
+    ax4.hist(am[~ok], bins=bins, color=RED,   alpha=0.6, label="Wrong calls", density=True)
+    ax4.set_xlabel("Achieved move % (predicted direction)", color=GRAY, fontsize=10)
+    ax4.set_ylabel("Density", color=GRAY, fontsize=10)
+    ax4.set_title("Move Distribution: Correct vs Wrong Direction", color="white", fontsize=11, pad=8)
     ax4.legend(fontsize=8, facecolor="#2a2f3e", edgecolor="none", labelcolor="white")
 
     plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=DARK)
     plt.close(fig)
-    print(f"\n  Graph saved → {save_path}\n")
+    console.print(f"  [dim]Graph → {save_path}[/dim]\n")

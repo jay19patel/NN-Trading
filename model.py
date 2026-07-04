@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Causal Transformer — volatility magnitude regression.
+Causal Transformer — direction + magnitude prediction.
 
-Single output: predicted move magnitude for the next LOOKAHEAD_BARS candles (% unsigned).
-  Always >= 0  (how much price will move, NOT which direction)
+Three outputs for the next LOOKAHEAD_BARS candles:
+  dir_logit — logit of P(upside move dominates downside move)
+  up_mag    — predicted max upside move  (%, range [0, MAX_RETURN_PCT])
+  down_mag  — predicted max downside move (%, range [0, MAX_RETURN_PCT])
 
-Output bounded to [0, MAX_RETURN_PCT] via Sigmoid scaling.
+At inference:
+  p_up       = sigmoid(dir_logit)          → direction probability
+  confidence = max(p_up, 1 - p_up)         → how sure the model is
+  magnitude  = up_mag if p_up >= 0.5 else down_mag
 """
 from __future__ import annotations
 
@@ -34,12 +39,12 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, : x.size(1), :]
 
 
-class ReturnPredictorModel(nn.Module):
+class DirectionMagnitudeModel(nn.Module):
     """
-    Causal Transformer that predicts move magnitude for the next N candles.
+    Causal Transformer with a shared encoder and three heads.
 
     Input  : (B, T, F) — T past candle feature windows
-    Output : (B,)      — predicted magnitude in %, range [0, MAX_RETURN_PCT]
+    Output : (dir_logit, up_mag, down_mag) — each (B,)
     """
 
     def __init__(self, input_dim: int) -> None:
@@ -71,16 +76,27 @@ class ReturnPredictorModel(nn.Module):
         self.shared_norm = nn.LayerNorm(hidden)
         self.shared_drop = nn.Dropout(dropout)
 
-        # ── Regression head ───────────────────────────────────────────────────
-        # Sigmoid output → scaled to [0, MAX_RETURN_PCT]  (magnitude is always >= 0)
-        self.return_head = nn.Sequential(
+        # ── Heads ─────────────────────────────────────────────────────────────
+        def _mag_head() -> nn.Sequential:
+            # Sigmoid output → scaled to [0, MAX_RETURN_PCT]
+            return nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.LayerNorm(hidden // 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden // 2, 1),
+                nn.Sigmoid(),
+            )
+
+        self.dir_head = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
             nn.LayerNorm(hidden // 2),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden // 2, 1),
-            nn.Sigmoid(),
         )
+        self.up_head   = _mag_head()
+        self.down_head = _mag_head()
 
         self._init_weights()
 
@@ -107,7 +123,7 @@ class ReturnPredictorModel(nn.Module):
         trunk  = self.shared_drop(F.gelu(self.shared_norm(self.shared(pooled))))
         return pooled + trunk
 
-    def forward(self, window: torch.Tensor) -> torch.Tensor:
+    def forward(self, window: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -115,7 +131,24 @@ class ReturnPredictorModel(nn.Module):
 
         Returns
         -------
-        (B,) — predicted magnitude in % (range [0, MAX_RETURN_PCT])
+        dir_logit : (B,) — logit of P(up)
+        up_mag    : (B,) — predicted upside move %  [0, MAX_RETURN_PCT]
+        down_mag  : (B,) — predicted downside move % [0, MAX_RETURN_PCT]
         """
         z = self._encode(window)
-        return self.return_head(z).squeeze(-1) * self._max_return
+        dir_logit = self.dir_head(z).squeeze(-1)
+        up_mag    = self.up_head(z).squeeze(-1)   * self._max_return
+        down_mag  = self.down_head(z).squeeze(-1) * self._max_return
+        return dir_logit, up_mag, down_mag
+
+    @torch.no_grad()
+    def predict(self, window: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Inference helper returning probabilities and magnitudes."""
+        dir_logit, up_mag, down_mag = self.forward(window)
+        p_up = torch.sigmoid(dir_logit)
+        return {
+            "p_up":       p_up,
+            "confidence": torch.maximum(p_up, 1.0 - p_up),
+            "up_mag":     up_mag,
+            "down_mag":   down_mag,
+        }
